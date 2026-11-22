@@ -1,0 +1,211 @@
+#include "ZenRHI/TestSupport/ScopedVulkanCall.h"
+#include "Vulkan/VulkanSynchronization.h"
+#include "Vulkan/VulkanTypes.h"
+#include <gtest/gtest.h>
+#include "Vulkan/VulkanQueue.h"
+#include "Vulkan/VulkanDevice.h"
+#include "Vulkan/VulkanExtension.h"
+#include "Vulkan/VulkanCommandList.h"
+#include "Vulkan/VulkanAccelerationStructure.h"
+#include <unordered_map>
+#include <vector>
+#include <type_traits>
+#include <cstring>
+
+TEST(VulkanSynchronizationTests, RayQueryEnumsMatchNativeValues)
+{
+    using namespace zen;
+    EXPECT_EQ(static_cast<VkPipelineStageFlags>(RHIPipelineStageFlagBits::eAccelerationStructureBuild),
+              VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+    EXPECT_EQ(static_cast<VkAccessFlags>(RHIAccessFlagBits::eAccelerationStructureRead),
+              VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+    EXPECT_EQ(static_cast<VkAccessFlags>(RHIAccessFlagBits::eAccelerationStructureWrite),
+              VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+    EXPECT_EQ(static_cast<VkBufferUsageFlags>(RHIBufferUsageFlagBits::eDeviceAddress),
+              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    EXPECT_EQ(static_cast<VkBufferUsageFlags>(RHIBufferUsageFlagBits::eAccelerationStructureInput),
+              VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR);
+    EXPECT_EQ(static_cast<VkBufferUsageFlags>(RHIBufferUsageFlagBits::eAccelerationStructureStorage),
+              VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR);
+    EXPECT_EQ(static_cast<VkAccelerationStructureTypeKHR>(RHIAccelerationStructureType::eTopLevel),
+              VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
+    EXPECT_EQ(static_cast<VkAccelerationStructureTypeKHR>(RHIAccelerationStructureType::eBottomLevel),
+              VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+    EXPECT_EQ(static_cast<VkGeometryInstanceFlagsKHR>(RHIAccelerationStructureInstanceFlagBits::eDisableTriangleCulling),
+              VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
+    EXPECT_EQ(static_cast<VkGeometryInstanceFlagsKHR>(RHIAccelerationStructureInstanceFlagBits::eReverseTriangleFacing),
+              VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR);
+    EXPECT_EQ(static_cast<VkGeometryInstanceFlagsKHR>(RHIAccelerationStructureInstanceFlagBits::eForceOpaque),
+              VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR);
+    EXPECT_EQ(static_cast<VkGeometryInstanceFlagsKHR>(RHIAccelerationStructureInstanceFlagBits::eForceNonOpaque),
+              VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR);
+
+    RHIAccelerationStructureInstance instance;
+    instance.transform[0][0] = instance.transform[1][1] = instance.transform[2][2] = 1.0f;
+    instance.customIndex                                                           = 7;
+    instance.mask                                                                  = 0xa5;
+    instance.flags.SetFlag(RHIAccelerationStructureInstanceFlagBits::eDisableTriangleCulling);
+    instance.transform[0][3]                        = 3.25f;
+    const VkAccelerationStructureInstanceKHR native = VulkanAccelerationStructure::EncodeInstance(instance, 4096);
+    EXPECT_EQ(native.instanceCustomIndex, 7u);
+    EXPECT_EQ(native.mask, 0xa5u);
+    EXPECT_EQ(native.instanceShaderBindingTableRecordOffset, 0u);
+    EXPECT_EQ(native.flags, VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR);
+    EXPECT_EQ(native.accelerationStructureReference, 4096u);
+    EXPECT_EQ(std::memcmp(native.transform.matrix, instance.transform, sizeof(native.transform.matrix)), 0);
+}
+
+TEST(VulkanSynchronizationTests, NativeBufferFlagsKeepBuildAndShaderAccessesDistinct)
+{
+    using namespace zen;
+    RHIFlags<RHIBufferUsageFlagBits> usage;
+    usage.SetFlags(RHIBufferUsageFlagBits::eTransferDstBuffer, RHIBufferUsageFlagBits::eStorageBuffer,
+                   RHIBufferUsageFlagBits::eAccelerationStructureInput, RHIBufferUsageFlagBits::eDeviceAddress);
+    EXPECT_EQ(usage, VkBufferUsageFlags(VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                        | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                                        | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
+    const RHIFlags<RHIBufferUsageFlagBits>   storage(RHIBufferUsageFlagBits::eStorageBuffer);
+    const RHIFlags<RHIPipelineStageFlagBits> build(RHIPipelineStageFlagBits::eAccelerationStructureBuild);
+    const RHIFlags<RHIPipelineStageFlagBits> compute(RHIPipelineStageFlagBits::eComputeShader);
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(storage, RHIAccessMode::eReadWrite, build),
+              VkAccessFlags(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR));
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(storage, RHIAccessMode::eReadWrite, compute),
+              VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT));
+    // A broad stage on an ordinary storage buffer must also work with RT disabled.
+    const RHIFlags<RHIPipelineStageFlagBits> allCommands(RHIPipelineStageFlagBits::eAllCommands);
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(storage, RHIAccessMode::eReadWrite, allCommands),
+              VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT));
+    const RHIFlags<RHIPipelineStageFlagBits> combined(int64_t(build) | int64_t(compute));
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(storage, RHIAccessMode::eReadWrite, combined),
+              VkAccessFlags(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+                            | VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR));
+    EXPECT_EQ(
+        RHIBufferUsageToAccessFlagBits(RHIFlags<RHIBufferUsageFlagBits>(RHIBufferUsageFlagBits::eAccelerationStructureInput),
+                                       RHIAccessMode::eRead, build),
+        VkAccessFlags(VK_ACCESS_SHADER_READ_BIT));
+    EXPECT_EQ(
+        RHIBufferUsageToAccessFlagBits(RHIFlags<RHIBufferUsageFlagBits>(RHIBufferUsageFlagBits::eAccelerationStructureStorage),
+                                       RHIAccessMode::eRead, compute),
+        VkAccessFlags(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR));
+}
+
+// Specify expected Vulkan bits directly so a shared RHI conversion bug cannot
+// make both the barrier and its expected mask wrong in the same way.
+TEST(VulkanSynchronizationTests, ColorAttachmentMasksCoverLoadAndBlendReads)
+{
+    using namespace zen;
+
+    EXPECT_EQ(RHITextureUsageToAccessFlagBits(RHITextureUsage::eColorAttachment, RHIAccessMode::eReadWrite),
+              VkAccessFlags(VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT));
+
+    EXPECT_EQ(RHITextureUsageToAccessFlagBits(RHITextureUsage::eColorAttachment, RHIAccessMode::eRead),
+              VkAccessFlags(VK_ACCESS_COLOR_ATTACHMENT_READ_BIT));
+
+    EXPECT_EQ(RHITextureUsageToAccessFlagBits(RHITextureUsage::eColorAttachment, RHIAccessMode::eNone), VkAccessFlags(0));
+}
+
+TEST(VulkanSynchronizationTests, DepthStencilAttachmentMasksCoverLoadAndTestReads)
+{
+    using namespace zen;
+
+    EXPECT_EQ(RHITextureUsageToAccessFlagBits(RHITextureUsage::eDepthStencilAttachment, RHIAccessMode::eReadWrite),
+              VkAccessFlags(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT));
+
+    EXPECT_EQ(RHITextureUsageToAccessFlagBits(RHITextureUsage::eDepthStencilAttachment, RHIAccessMode::eRead),
+              VkAccessFlags(VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT));
+
+    EXPECT_EQ(RHITextureUsageToAccessFlagBits(RHITextureUsage::eDepthStencilAttachment, RHIAccessMode::eNone),
+              VkAccessFlags(0));
+}
+
+TEST(VulkanSynchronizationTests, UploadToUniformBufferUsesUniformReadAccess)
+{
+    using namespace zen;
+
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(RHIBufferUsage::eTransferDst, RHIAccessMode::eReadWrite),
+              VkAccessFlags(VK_ACCESS_TRANSFER_WRITE_BIT));
+
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(RHIBufferUsage::eUniformBuffer, RHIAccessMode::eRead),
+              VkAccessFlags(VK_ACCESS_UNIFORM_READ_BIT));
+
+    // A uniform texel buffer still uses shader-read access.
+    EXPECT_EQ(RHIBufferUsageToAccessFlagBits(RHIBufferUsage::eTextureBuffer, RHIAccessMode::eRead),
+              VkAccessFlags(VK_ACCESS_SHADER_READ_BIT));
+}
+
+TEST(VulkanSynchronizationTests, ReleasingUnusedSemaphoreSlotsDoesNotPopulateThePool)
+{
+    static std::string diagnostics;
+    diagnostics.clear();
+    zen::SetRHIMessageCallback([](zen::RHIMessageSeverity, std::string_view message) noexcept { diagnostics.append(message); });
+
+    zen::VulkanSemaphoreManager manager(nullptr);
+
+    zen::VulkanSemaphore* semaphore = nullptr;
+
+    manager.ReleaseSemaphore(semaphore);
+
+    manager.ReleaseSemaphore(semaphore);
+
+    manager.Destroy();
+
+    manager.Destroy();
+
+    zen::SetRHIMessageCallback(nullptr);
+
+    EXPECT_EQ(semaphore, nullptr);
+
+    EXPECT_TRUE(diagnostics.empty()) << diagnostics;
+}
+
+namespace
+{
+using zen::test::ScopedVulkanCall;
+TEST(VulkanNameTests, InternedLayerNamesPreserveGlobalEnumerationAndCallerStorage)
+{
+    using namespace zen;
+
+    static uint32_t queries = 0;
+
+    queries                 = 0;
+
+    ScopedVulkanCall<PFN_vkEnumerateInstanceExtensionProperties> enumerateExtensions(
+        vkEnumerateInstanceExtensionProperties, [](const char* layer, uint32_t* count, VkExtensionProperties*) -> VkResult {
+            if (queries == 0)
+            {
+                EXPECT_EQ(layer, nullptr);
+            }
+            else
+            {
+                EXPECT_STREQ(layer, "VK_LAYER_KHRONOS_validation");
+            }
+
+            ++queries;
+
+            *count = 0;
+
+            return VK_SUCCESS;
+        });
+
+    EXPECT_TRUE(VulkanInstanceExtension::GetSupportedInstanceExtensions().empty());
+
+    std::string layerText = "VK_LAYER_KHRONOS_validation";
+
+    const NameID layerName(layerText);
+
+    layerText.clear();
+
+    EXPECT_TRUE(VulkanInstanceExtension::GetSupportedInstanceExtensions(layerName).empty());
+
+    EXPECT_EQ(queries, 2u);
+
+    std::string extensionText = "VK_EXT_debug_utils";
+
+    VulkanInstanceExtension extension{NameID(extensionText)};
+
+    extensionText.clear();
+
+    EXPECT_EQ(extension.GetName(), NameID("VK_EXT_debug_utils"));
+}
+
+} // namespace

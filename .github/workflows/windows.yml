@@ -1,0 +1,36 @@
+name: Foundation compatibility
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  rhi:
+    runs-on: windows-2022
+    env:
+      VULKAN_SDK: C:\VulkanSDK\1.4.304.1
+    strategy:
+      matrix:
+        # The second entry is the release tag shared by every Zen component of this version.
+        foundation: [main, v0.2.0]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: proton991/ZenFoundation
+          ref: ${{ matrix.foundation }}
+          path: dependencies/ZenFoundation
+      - name: Install pinned Vulkan SDK
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK.exe'
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.304.1/windows/VulkanSDK-1.4.304.1-Installer.exe' -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '--root C:\VulkanSDK\1.4.304.1 --accept-licenses --default-answer --confirm-command install' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "SDK install failed: $($process.ExitCode)" }
+          "$env:VULKAN_SDK\Bin" >> $env:GITHUB_PATH
+      - uses: ilammy/msvc-dev-cmd@v1
+      - shell: pwsh
+        run: |
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DZEN_FOUNDATION_SOURCE_DIR="$pwd/dependencies/ZenFoundation" -DZENRHI_BUILD_EXAMPLES=OFF
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build/ci -j 2
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir build/ci --output-on-failure -L "unit|policy"
