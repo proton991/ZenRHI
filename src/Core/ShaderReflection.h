@@ -7,6 +7,19 @@
 #include "spirv_reflect.h"
 namespace zen
 {
+inline constexpr SpvExecutionModel kShaderExecutionModels[] = {SpvExecutionModelVertex,
+                                                               SpvExecutionModelTessellationControl,
+                                                               SpvExecutionModelTessellationEvaluation,
+                                                               SpvExecutionModelGeometry,
+                                                               SpvExecutionModelFragment,
+                                                               SpvExecutionModelGLCompute,
+                                                               SpvExecutionModelRayGenerationKHR,
+                                                               SpvExecutionModelMissKHR,
+                                                               SpvExecutionModelClosestHitKHR,
+                                                               SpvExecutionModelAnyHitKHR,
+                                                               SpvExecutionModelCallableKHR};
+static_assert(std::size(kShaderExecutionModels) == ToUnderlying(RHIShaderStage::eMax));
+
 inline bool ParseSpvVertexInput(const SpvReflectShaderModule* module, RHIShaderGroupInfo& info)
 {
     uint32_t count = 0;
@@ -28,7 +41,8 @@ inline bool ParseSpvVertexInput(const SpvReflectShaderModule* module, RHIShaderG
         {
             if ((input->decoration_flags & SPV_REFLECT_DECORATION_BUILT_IN) == 0)
             {
-                valid = input->format != SPV_REFLECT_FORMAT_UNDEFINED && input->numeric.scalar.width != 0;
+                valid = input->format != SPV_REFLECT_FORMAT_UNDEFINED && input->numeric.scalar.width != 0
+                     && input->array.dims_count == 0 && input->numeric.matrix.column_count == 0;
 
                 if (!valid)
                 {
@@ -443,37 +457,6 @@ inline bool MergeOrAddSRDs(RHIShaderStage               stage,
             descriptor.stageFlags.SetFlag(RHIShaderStageToFlagBits(stage));
 
             info.SRDTable[descriptor.set].push_back(descriptor);
-        }
-    }
-
-    return valid;
-}
-
-inline bool HasValidSpirvStructure(std::span<const uint8_t> code)
-{
-    bool valid = code.size() >= 5 * sizeof(uint32_t) && code.size() % sizeof(uint32_t) == 0;
-
-    if (valid)
-    {
-        uint32_t header[5]{};
-
-        std::memcpy(header, code.data(), sizeof(header));
-
-        valid         = header[0] == 0x07230203u && header[3] != 0 && header[4] == 0;
-
-        size_t offset = sizeof(header);
-
-        while (valid && offset < code.size())
-        {
-            uint32_t instruction = 0;
-
-            std::memcpy(&instruction, code.data() + offset, sizeof(instruction));
-
-            const size_t size  = size_t(instruction >> 16) * sizeof(uint32_t);
-
-            valid              = size != 0 && size <= code.size() - offset;
-
-            offset            += size;
         }
     }
 

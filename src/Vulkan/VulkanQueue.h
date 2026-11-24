@@ -1,5 +1,6 @@
 #pragma once
 #include <atomic>
+#include <span>
 #include "ZenRHI/RHICommon.h"
 #include "VulkanHeaders.h"
 #include "ZenFoundation/Templates/HeapVector.h"
@@ -7,6 +8,7 @@
 
 namespace zen
 {
+struct RHIError;
 class VulkanWorkload;
 class VulkanDevice;
 class VulkanSemaphore;
@@ -19,6 +21,7 @@ public:
     VulkanQueue(VulkanDevice* pDevice, uint32_t familyIndex, uint32_t queueIndex = 0);
 
     ~VulkanQueue();
+    RHIError GetCreationError() const;
 
     FVulkanCommandBufferPool* AcquireCommandBufferPool(VulkanCommandBufferType type);
 
@@ -100,6 +103,9 @@ private:
     void BuildTimelineSubmitBatch(const WorkloadMergeResult& mergeResult, TimelineSubmitBatch& outSubmitBatch);
 
     void AppendTimelineSubmitWorkload(VulkanWorkload* pWorkload, TimelineSubmitBatch& outSubmitBatch);
+
+    void PrepareBindlessWrites(std::span<VulkanWorkload*> workloads);
+    void AcceptTransferredTransactions(VulkanWorkload* workload);
 
     void QueueSubmittedWorkload(VulkanWorkload* pWorkload, uint64_t submissionSerial);
 

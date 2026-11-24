@@ -321,6 +321,15 @@ TEST(RHIGPUFrameExecutor, ReplayUsesFreshCapturesInInlineAndThreadedModes)
     }
 }
 
+TEST_F(RHIGPUFrameExecutorTest, ClosedCleanupSealsFrameTiming)
+{
+    RHIGPUFrameTimingPtr timing = MakeShared<RHIGPUFrameTiming, MultiThreadCounter>();
+    executor->BeginGPUFrameTiming(timing);
+    executor->Destroy();
+    executor->EndGPUFrameTiming(timing, true);
+    EXPECT_EQ(timing->GetStatus(), RHIGPUTimingStatus::eError);
+}
+
 TEST_F(RHIExecutorTest, BackendWithoutFrameTimestampsReportsUnsupported)
 {
     RHIGPUFrameTimingPtr timing = MakeShared<RHIGPUFrameTiming, MultiThreadCounter>();

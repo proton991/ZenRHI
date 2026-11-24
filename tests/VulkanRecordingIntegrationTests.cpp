@@ -1863,6 +1863,13 @@ TEST_F(VulkanRecordingIntegrationTest, DeviceCacheIsSharedByGraphicsAndComputeCr
 
     EXPECT_GE(size, sizeof(VkPipelineCacheHeaderVersionOne));
 
+    std::vector<uint8_t> snapshot;
+    ASSERT_FALSE(session->rhi.SnapshotPipelineCache(SIZE_MAX, snapshot).IsFailure());
+    ASSERT_GE(snapshot.size(), size);
+    const std::vector<uint8_t> previous = snapshot;
+    EXPECT_TRUE(session->rhi.SnapshotPipelineCache(0, snapshot).IsFailure());
+    EXPECT_EQ(snapshot, previous);
+
     PipelineCacheProbe::cache = VK_NULL_HANDLE;
 }
 

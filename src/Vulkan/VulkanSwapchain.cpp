@@ -514,6 +514,12 @@ RHIAcquireResult VulkanSwapchain::AcquireNextImageChecked(VulkanSemaphore** outS
     {
         m_acquireResult = {RHISurfaceOutcome::eFailed, -1, GVulkanRHI->GetTerminalError()};
     }
+    else if (m_presentResult.acceptance == RHIPresentAcceptance::eRejected)
+    {
+        // The rendering semaphore may still be signaled and the image remains acquired.
+        // Only a replacement swapchain can start another presentation cycle.
+        m_acquireResult.outcome = RHISurfaceOutcome::eRecreate;
+    }
     else if (m_numImages != 0)
     {
         const int32_t nextSemaphore = (m_semaphoreIndex + 1) % static_cast<int32_t>(m_numImages);
@@ -537,10 +543,10 @@ RHIAcquireResult VulkanSwapchain::AcquireNextImageChecked(VulkanSemaphore** outS
 
             uint32_t index           = UINT32_MAX;
 
-            m_lastResult             = vkAcquireNextImageKHR(m_pDevice->GetVkHandle(), m_swapchain, 1000000000ull,
-                                                             acquire.semaphore->GetVkHandle(), acquire.fence, &index);
+            m_lastResult = TimedRHICall(RHIWorkerTime::eWait, vkAcquireNextImageKHR, m_pDevice->GetVkHandle(), m_swapchain,
+                                        1000000000ull, acquire.semaphore->GetVkHandle(), acquire.fence, &index);
 
-            m_acquireResult.outcome  = SurfaceOutcome(m_lastResult);
+            m_acquireResult.outcome = SurfaceOutcome(m_lastResult);
 
             if (m_lastResult == VK_SUCCESS || m_lastResult == VK_SUBOPTIMAL_KHR)
             {
@@ -585,6 +591,9 @@ RHIAcquireResult VulkanSwapchain::AcquireNextImageChecked(VulkanSemaphore** outS
         }
     }
 
+    m_recreationRequested.store(m_acquireResult.outcome == RHISurfaceOutcome::eRecreate
+                                    || m_acquireResult.outcome == RHISurfaceOutcome::eSurfaceLost,
+                                std::memory_order_release);
     return m_acquireResult;
 }
 
@@ -639,7 +648,7 @@ bool VulkanSwapchain::Present(VulkanSemaphore* pRenderingCompleteSemaphore)
         info.pWaitSemaphores    = &semaphore;
     }
 
-    m_lastResult = vkQueuePresentKHR(m_pDevice->GetGfxQueue()->GetVkHandle(), &info);
+    m_lastResult = TimedRHICall(RHIWorkerTime::eWait, vkQueuePresentKHR, m_pDevice->GetGfxQueue()->GetVkHandle(), &info);
 
     // These WSI errors still enqueue the semaphore wait and presentation fence.
     // Allocation failures reject the operation, leaving the fence unsignaled.
@@ -672,10 +681,17 @@ bool VulkanSwapchain::Present(VulkanSemaphore* pRenderingCompleteSemaphore)
     {
         m_presentResult.error = MakeVulkanError(m_lastResult, "vkQueuePresentKHR", __FILE__, __LINE__);
 
-        GVulkanRHI->BlockSubmissions(m_presentResult.error);
+        if (m_presentResult.acceptance != RHIPresentAcceptance::eRejected)
+        {
+            GVulkanRHI->BlockSubmissions(m_presentResult.error);
+        }
     }
 
-    return m_lastResult == VK_SUCCESS || m_lastResult == VK_SUBOPTIMAL_KHR;
+    m_recreationRequested.store(m_presentResult.outcome == RHISurfaceOutcome::eRecreate
+                                    || m_presentResult.outcome == RHISurfaceOutcome::eSurfaceLost
+                                    || m_presentResult.acceptance == RHIPresentAcceptance::eRejected,
+                                std::memory_order_release);
+    return m_presentResult.presented;
 }
 
 void VulkanSwapchain::ReleaseRetiredSwapchains()
@@ -700,7 +716,8 @@ void VulkanSwapchain::CompleteAcquire(AcquireSync& sync, bool wait)
         const VkDevice device = m_pDevice->GetVkHandle();
 
         const VkResult result =
-            wait ? vkWaitForFences(device, 1, &sync.fence, VK_TRUE, UINT64_MAX) : vkGetFenceStatus(device, sync.fence);
+            wait ? TimedRHICall(RHIWorkerTime::eWait, vkWaitForFences, device, 1, &sync.fence, VK_TRUE, UINT64_MAX)
+                 : vkGetFenceStatus(device, sync.fence);
 
         if (result == VK_ERROR_DEVICE_LOST)
         {
@@ -744,7 +761,8 @@ void VulkanSwapchain::WaitForPresent(PresentSync& sync)
     {
         const VkDevice device = m_pDevice->GetVkHandle();
 
-        const VkResult result = vkWaitForFences(device, 1, &sync.fence, VK_TRUE, UINT64_MAX);
+        const VkResult result =
+            TimedRHICall(RHIWorkerTime::eWait, vkWaitForFences, device, 1, &sync.fence, VK_TRUE, UINT64_MAX);
 
         if (result == VK_ERROR_DEVICE_LOST)
         {
@@ -776,7 +794,7 @@ void VulkanSwapchain::Destroy(VulkanSwapchainRecreateInfo* pRecreateInfo)
         if (sync.submissionSerial != 0 && !m_pDevice->GetGfxQueue()->WaitForCompletion(sync.submissionSerial, UINT64_MAX))
         {
             // Distinguish device loss (destruction is legal) from an unproven wait.
-            const VkResult result = vkDeviceWaitIdle(device);
+            const VkResult result = TimedRHICall(RHIWorkerTime::eWait, vkDeviceWaitIdle, device);
 
             if (result != VK_ERROR_DEVICE_LOST)
             {
@@ -801,7 +819,7 @@ void VulkanSwapchain::Destroy(VulkanSwapchainRecreateInfo* pRecreateInfo)
         // Unextended WSI has no host present-completion primitive at shutdown or
         // surface loss, when future reacquisition is impossible. Use the Vulkan
         // guide's device-idle teardown convention only at this terminal boundary.
-        const VkResult result = vkDeviceWaitIdle(device);
+        const VkResult result = TimedRHICall(RHIWorkerTime::eWait, vkDeviceWaitIdle, device);
 
         if (result != VK_ERROR_DEVICE_LOST)
         {

@@ -5,6 +5,7 @@
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanPipeline.h"
 #include "Vulkan/VulkanTexture.h"
+#include "Vulkan/VulkanSynchronization.h"
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <memory>
@@ -471,6 +472,12 @@ protected:
         EXPECT_FALSE(session->rhi.IsBindlessResourceRegistered(arrayHandle));
         EXPECT_FALSE(session->rhi.RegisterBindlessResource(array, 0).IsValid());
         EXPECT_EQ(texture->GetRefCount(), 3u);
+        descriptorWriteCount = 0;
+        {
+            test::ScopedVulkanCall<PFN_vkUpdateDescriptorSets> observe(vkUpdateDescriptorSets, CountDescriptorWrites);
+            manager->Flush();
+            EXPECT_EQ(descriptorWriteCount, 0u);
+        }
         manager->ResolveTransaction(transaction, false);
         EXPECT_EQ(texture->GetRefCount(), 1u);
         EXPECT_EQ(array->GetRefCount(), 1u);
@@ -563,6 +570,46 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, MatchingArrayParametersPublishSe
     }
     EXPECT_EQ(texture->GetRefCount(), 1u);
     EXPECT_EQ(sampler->GetRefCount(), 1u);
+}
+
+TEST_F(VulkanBindlessRetirementIntegrationTest, DetachedWorkloadsOwnBindlessReservationsUntilAcceptedOrDiscarded)
+{
+    RHISampler*                          sampler = Sampler();
+    VulkanBindlessDescriptorPoolManager* manager = session->rhi.GetBindlessDescriptorPoolManager();
+    VulkanQueue*                         queue   = session->rhi.GetDevice()->GetGfxQueue();
+    for (bool submit : {false, true})
+    {
+        RHIBindlessHandle           handle;
+        HeapVector<VulkanWorkload*> workloads;
+        VulkanSemaphore             split(session->rhi.GetDevice());
+        {
+            FVulkanCommandListContext recording(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+            ASSERT_TRUE(manager->RegisterBindlessResource(sampler, 0, &handle, 0, recording.GetRecordingTransaction()));
+            recording.GetCommandBuffer();
+            recording.AddSignalSemaphore(&split);
+            recording.GetCommandBuffer();
+            recording.CollectWorkloads(workloads);
+        }
+        ASSERT_EQ(workloads.size(), 2u);
+        queue->EnqueueWorkload(workloads.front());
+        queue->DiscardPendingWorkloads();
+        EXPECT_FALSE(session->rhi.RegisterBindlessResource(sampler, 0).IsValid());
+        if (submit)
+        {
+            queue->EnqueueWorkload(workloads.back());
+            uint64_t serial = 0;
+            ASSERT_EQ(queue->SubmitPendingWorkloads(serial), RHISubmissionResult::eSuccess);
+            EXPECT_TRUE(queue->WaitForCompletion(serial, UINT64_MAX));
+            EXPECT_TRUE(manager->IsRegistered(handle));
+            EXPECT_TRUE(manager->UnregisterBindlessResource(handle));
+        }
+        else
+        {
+            queue->EnqueueWorkload(workloads.back());
+            queue->DiscardPendingWorkloads();
+            EXPECT_EQ(sampler->GetRefCount(), 1u);
+        }
+    }
 }
 
 TEST_F(VulkanBindlessRetirementIntegrationTest, CubeArrayHeapTransactionRollbackAndCommitKeepSliceSlotsIndependent)

@@ -68,8 +68,6 @@ public:
 
     VkResult WaitForFence(VulkanFence* pFence, uint64_t timeNS);
 
-    void ResetFence(VulkanFence* pFence);
-
 private:
     void DestroyFence(VulkanFence* pFence);
 

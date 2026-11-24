@@ -47,13 +47,11 @@ VulkanFence* VulkanFenceManager::CreateFence(bool createSignaled)
 {
     VulkanFence* result{};
 
-    if (!m_freeFences.Empty())
+    if (!createSignaled && !m_freeFences.Empty())
     {
         VulkanFence* pFence = m_freeFences.Peek();
 
         m_freeFences.Pop();
-
-        pFence->m_state = createSignaled ? VulkanFence::State::eSignaled : VulkanFence::State::eInitial;
 
         m_usedFences.push_back(pFence);
 
@@ -80,7 +78,8 @@ VulkanFence* VulkanFenceManager::CreateFence(bool createSignaled)
 
 void VulkanFenceManager::ReleaseFence(VulkanFence*& fence)
 {
-    ResetFence(fence);
+    const VkResult reset =
+        GVulkanRHI->HasDeviceLoss() ? VK_ERROR_DEVICE_LOST : vkResetFences(m_pDevice->GetVkHandle(), 1, &fence->m_fence);
 
     if (!m_usedFences.empty())
     {
@@ -100,7 +99,21 @@ void VulkanFenceManager::ReleaseFence(VulkanFence*& fence)
         }
     }
 
-    m_freeFences.Push(fence);
+    if (reset == VK_SUCCESS)
+    {
+        fence->m_state = VulkanFence::State::eInitial;
+        m_freeFences.Push(fence);
+    }
+    else
+    {
+        if (!GVulkanRHI->HasDeviceLoss())
+        {
+            ReportVulkanDeviceLoss(reset, "vkResetFences");
+            ZEN_RHI_LOG_ERROR("vkResetFences failed: {}", GetResultString(reset));
+        }
+        DestroyFence(fence);
+        ZEN_DELETE(fence);
+    }
 
     fence = nullptr;
 }
@@ -129,7 +142,8 @@ VkResult VulkanFenceManager::WaitForFence(VulkanFence* pFence, uint64_t timeNS)
     // A failed status query must not be hidden by a subsequent successful wait.
     if (result == VK_NOT_READY)
     {
-        result = vkWaitForFences(m_pDevice->GetVkHandle(), 1, &pFence->m_fence, true, timeNS);
+        result =
+            TimedRHICall(RHIWorkerTime::eWait, vkWaitForFences, m_pDevice->GetVkHandle(), 1, &pFence->m_fence, true, timeNS);
 
         if (result == VK_SUCCESS)
         {
@@ -138,17 +152,6 @@ VkResult VulkanFenceManager::WaitForFence(VulkanFence* pFence, uint64_t timeNS)
     }
 
     return result;
-}
-
-void VulkanFenceManager::ResetFence(VulkanFence* pFence)
-{
-    if (pFence->m_state != VulkanFence::State::eInitial)
-    {
-        ZEN_RHI_VERIFY_MSG_F((vkResetFences(m_pDevice->GetVkHandle(), 1, &pFence->m_fence)) == VK_SUCCESS,
-                             "Vulkan operation failed: vkResetFences(m_pDevice->GetVkHandle(), 1, &pFence->m_fence)");
-
-        pFence->m_state = VulkanFence::State::eInitial;
-    }
 }
 
 void VulkanFenceManager::DestroyFence(VulkanFence* pFence)
@@ -227,7 +230,7 @@ VkResult VulkanSemaphore::Wait(uint64_t value, uint64_t timeNS) const
 
     waitInfo.pValues        = &value;
 
-    return vkWaitSemaphores(m_pDevice->GetVkHandle(), &waitInfo, timeNS);
+    return TimedRHICall(RHIWorkerTime::eWait, vkWaitSemaphores, m_pDevice->GetVkHandle(), &waitInfo, timeNS);
 }
 
 VulkanSemaphore::~VulkanSemaphore()

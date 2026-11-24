@@ -881,6 +881,14 @@ TEST_F(VulkanCapabilityIntegrationTest, RejectsMissingRequiredExtensionsAndHeapL
 
 TEST_F(VulkanCapabilityIntegrationTest, MissingRequiredFeatureRejectsBeforeCreatingDevice)
 {
+    constexpr const char* featureNames[] = {nullptr,
+                                            "dynamicRendering",
+                                            "runtimeDescriptorArray",
+                                            "descriptorBindingPartiallyBound",
+                                            "descriptorBindingSampledImageUpdateAfterBind",
+                                            "descriptorBindingUpdateUnusedWhilePending",
+                                            nullptr,
+                                            "shaderSampledImageArrayNonUniformIndexing"};
     for (uint32_t feature = 1; feature <= 7; ++feature)
     {
         SCOPED_TRACE(feature);
@@ -892,7 +900,7 @@ TEST_F(VulkanCapabilityIntegrationTest, MissingRequiredFeatureRejectsBeforeCreat
             continue;
         }
 
-        EXPECT_FALSE(Reason().empty());
+        EXPECT_NE(Reason().find(featureNames[feature]), std::string::npos);
 
         VulkanDevice device(session->rhi.GetPhysicalDevice());
 

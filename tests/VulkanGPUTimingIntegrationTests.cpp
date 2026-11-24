@@ -499,6 +499,29 @@ TEST_F(VulkanGPUTimingIntegrationTest, DevicePoolBudgetRecyclesRetiredHandles)
         device.ReleaseGPUTimingPool(pool);
     }
 
+    FVulkanCommandListContext context(RHICommandContextType::eGraphics, &device);
+    if (SupportsTiming(context))
+    {
+        RHIGPUTimingPtr timing = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
+        context.RHIBeginGPUTiming(timing);
+        context.RHIDiscardRecording();
+        EXPECT_EQ(timing->GetStatus(), RHIGPUTimingStatus::eDiscarded);
+        acquired.clear();
+        for (uint32_t index = 0; index < FVulkanCommandBuffer::kMaxGPUTimingPools; ++index)
+        {
+            VkQueryPool pool = VK_NULL_HANDLE;
+            if (device.AcquireGPUTimingPool(pool) == VK_SUCCESS)
+            {
+                acquired.push_back(pool);
+            }
+        }
+        EXPECT_EQ(acquired.size(), FVulkanCommandBuffer::kMaxGPUTimingPools);
+        for (VkQueryPool pool : acquired)
+        {
+            device.ReleaseGPUTimingPool(pool);
+        }
+    }
+
     test::ScopedVulkanCall rejectNewAllocation(vkCreateQueryPool, RejectTimingPool);
 
     for (uint32_t index = 0; index < 2 * FVulkanCommandBuffer::kMaxGPUTimingPools; ++index)

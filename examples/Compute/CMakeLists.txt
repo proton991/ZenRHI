@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.24)
+project(ZenRHIComputeExamples LANGUAGES CXX)
+if(NOT TARGET ZenRHI::ZenRHI)
+    find_package(ZenRHI CONFIG REQUIRED)
+endif()
+find_program(GLSL_VALIDATOR glslangValidator REQUIRED HINTS "$ENV{VULKAN_SDK}/Bin")
+foreach(example IN ITEMS ComputeReadback AsyncCompute BindlessTextures RayQuery)
+    set(shader "${CMAKE_CURRENT_BINARY_DIR}/${example}.spv")
+    add_custom_command(OUTPUT "${shader}"
+        COMMAND "${GLSL_VALIDATOR}" --target-env vulkan1.2 -V "${CMAKE_CURRENT_SOURCE_DIR}/${example}.comp" -o "${shader}"
+        DEPENDS "${example}.comp" VERBATIM)
+    add_executable(ZenRHI${example} Main.cpp "${example}.cpp" "${shader}")
+    target_compile_definitions(ZenRHI${example} PRIVATE EXAMPLE_SHADER="${shader}")
+    if(example STREQUAL "RayQuery")
+        target_compile_definitions(ZenRHI${example} PRIVATE EXAMPLE_REQUIRES_RAY_QUERY)
+    endif()
+    target_link_libraries(ZenRHI${example} PRIVATE ZenRHI::ZenRHI)
+endforeach()

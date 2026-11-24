@@ -319,7 +319,8 @@ class VulkanBindlessDescriptorPoolManager
 public:
     VulkanBindlessDescriptorPoolManager() = default;
 
-    void Init();
+    void     Init();
+    RHIError InitChecked();
 
     void Destroy();
 
@@ -339,6 +340,11 @@ public:
     bool CanRegisterBindlessResources(std::span<const RHIShaderResourceParameter> parameters,
                                       uint64_t                                    recordedEpoch,
                                       uint64_t                                    transaction);
+
+    bool TransferTransaction(uint64_t transaction, size_t workloads);
+    void ReleaseTransferredTransaction(uint64_t transaction);
+
+    void PrepareTransaction(uint64_t transaction);
 
     void ResolveTransaction(uint64_t transaction, bool commit);
 
@@ -408,7 +414,16 @@ private:
                            uint64_t            recordedEpoch,
                            uint64_t            transaction);
 
-    void CreateGlobalBindlessDescriptorSet();
+    RHIError CreateGlobalBindlessDescriptorSet();
+
+    struct BindlessJournal
+    {
+        HeapVector<RHIBindlessHandle> slots;
+        size_t                        queued{};
+        size_t                        owners{};
+    };
+
+    void QueueTransactionWrites(BindlessJournal& journal);
 
     void WriteDescriptorSetBatch();
 
@@ -428,7 +443,7 @@ private:
     HeapVector<uint64_t>          m_epochs;
     HeapVector<RHIBindlessHandle> m_retiredSlots;
 
-    FlatHashMap<uint64_t, HeapVector<RHIBindlessHandle>> m_journals;
+    FlatHashMap<uint64_t, BindlessJournal> m_journals;
 
     HeapVector<BindlessDSWrite>   m_pendingWrites[ToUnderlying(RHIBindlessHeapType::eMax)];
     HeapVector<BindlessSlotState> m_slotStates[ToUnderlying(RHIBindlessHeapType::eMax)];

@@ -1,4 +1,5 @@
 #include "Vulkan/VulkanLifetimeTracker.h"
+#include "ZenRHI/RHIOptions.h"
 #include <gtest/gtest.h>
 
 namespace
@@ -8,6 +9,28 @@ using namespace zen;
 void CountDestruction(void* resource)
 {
     ++*static_cast<uint32_t*>(resource);
+}
+
+TEST(VulkanLifetimeTrackerDeathTest, TeardownHonorsOwnershipPolicy)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_EXIT(
+        {
+            RHIOptions::GetInstance().SetStrictTeardownChecks(false);
+            VulkanLifetimeTracker tracker;
+            tracker.Create();
+            tracker.Destroy();
+            std::_Exit(0);
+        },
+        testing::ExitedWithCode(0), "lifetime");
+    EXPECT_DEATH(
+        {
+            RHIOptions::GetInstance().SetStrictTeardownChecks(true);
+            VulkanLifetimeTracker tracker;
+            tracker.Create();
+            tracker.Destroy();
+        },
+        "lifetime");
 }
 
 TEST(VulkanLifetimeTrackerTest, RetirementWaitsForEveryRecording)

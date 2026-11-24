@@ -77,11 +77,11 @@ VulkanMemoryAllocator::~VulkanMemoryAllocator()
     }
 }
 
-void VulkanMemoryAllocator::Init(VkInstance       instance,
-                                 VkPhysicalDevice gpu,
-                                 VkDevice         device,
-                                 bool             bufferDeviceAddress,
-                                 bool             memoryBudget)
+VkResult VulkanMemoryAllocator::Init(VkInstance       instance,
+                                     VkPhysicalDevice gpu,
+                                     VkDevice         device,
+                                     bool             bufferDeviceAddress,
+                                     bool             memoryBudget)
 {
     // pass dynamic function pointers to vma
     VmaVulkanFunctions vmaVkFunc{};
@@ -176,8 +176,7 @@ void VulkanMemoryAllocator::Init(VkInstance       instance,
 
     allocatorCI.pDeviceMemoryCallbacks = &memoryCallbacks;
 
-    ZEN_RHI_VERIFY_MSG_F((vmaCreateAllocator(&allocatorCI, &m_vmaAllocator)) == VK_SUCCESS,
-                         "Vulkan operation failed: vmaCreateAllocator(&allocatorCI, &m_vmaAllocator)");
+    return vmaCreateAllocator(&allocatorCI, &m_vmaAllocator);
 }
 
 void VulkanMemoryAllocator::BeginFrame(uint32_t frame)

@@ -1,0 +1,12 @@
+#version 460
+#extension GL_EXT_ray_query : require
+layout(set=1,binding=1) uniform accelerationStructureEXT scene;
+layout(local_size_x=1) in;
+layout(set=1,binding=0,std430) buffer Output { uint value; } outputData;
+void main()
+{
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 255, vec3(0), 0.001, vec3(0, 0, 1), 10.0);
+    while (rayQueryProceedEXT(query)) {}
+    outputData.value = rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 42 : 0;
+}

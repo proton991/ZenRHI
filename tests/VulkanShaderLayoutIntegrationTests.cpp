@@ -234,7 +234,11 @@ TEST(VulkanShaderLayoutIntegrationTest, DeviceLayoutLimitsRejectSpecializationMe
     for (const DescriptorCase& testCase : cases)
     {
         SCOPED_TRACE(ToUnderlying(testCase.type));
-        ASSERT_LT(testCase.limit, std::numeric_limits<uint32_t>::max());
+        if (testCase.limit == std::numeric_limits<uint32_t>::max())
+        {
+            // No representable descriptor count exceeds this limit.
+            continue;
+        }
         RHIShaderCreateInfo          overLimit  = reusable;
         RHIShaderResourceDescriptor& descriptor = overLimit.reflection->SRDTable[1][0];
         descriptor.type                         = testCase.type;

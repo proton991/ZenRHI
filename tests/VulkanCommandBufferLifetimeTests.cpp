@@ -41,6 +41,28 @@ struct CommandBufferAllocations
     }
 };
 
+VKAPI_ATTR VkResult VKAPI_CALL RejectCommandBufferAllocation(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*)
+{
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+TEST(VulkanCommandBufferPoolTest, RetryUsesAvailableBufferWhenAllocationIsStillFailing)
+{
+    test::VulkanSession       session;
+    VulkanDevice*             device = session.rhi.GetDevice();
+    VulkanSemaphore           signal(device);
+    FVulkanCommandListContext context(RHICommandContextType::eGraphics, device);
+    FVulkanCommandBuffer*     ready = context.GetCommandBuffer();
+    ASSERT_TRUE(ready->IsAllocated());
+    context.AddSignalSemaphore(&signal);
+    test::ScopedVulkanCall fail(vkAllocateCommandBuffers, RejectCommandBufferAllocation);
+    EXPECT_FALSE(context.GetCommandBuffer()->IsAllocated());
+    context.RHIDiscardRecording();
+    FVulkanCommandBuffer* retry = context.GetCommandBuffer();
+    EXPECT_EQ(retry, ready);
+    EXPECT_TRUE(retry->HasBegun());
+}
+
 enum class AbandonedRecordingState
 {
     eRecording,

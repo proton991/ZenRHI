@@ -5,6 +5,9 @@
 #include <chrono>
 #include <future>
 #include <thread>
+#if defined(ZEN_WIN32)
+#    include <windows.h>
+#endif
 
 using namespace zen;
 
@@ -33,12 +36,102 @@ TEST(RHIThreadTest, FifoNestedInvokeAndDrain)
     }
 }
 
+namespace
+{
+std::atomic<bool> observedStall{};
+std::atomic<bool> observedStack{};
+std::atomic<bool> observedRecovery{};
+void              CaptureStall(RHIMessageSeverity, std::string_view message) noexcept
+{
+    if ((message.starts_with("RHI stall: synchronous RHI call") || message.starts_with("RHI stall: RHI shutdown"))
+        && message.find("worker=executing") != std::string_view::npos)
+    {
+        observedStall.store(true);
+    }
+    if (message.starts_with("RHI worker stack [0]"))
+    {
+        observedStack.store(true);
+    }
+    if (message.starts_with("RHI stall recovered: synchronous RHI call")
+        || message.starts_with("RHI stall recovered: RHI shutdown"))
+    {
+        observedRecovery.store(true);
+    }
+}
+bool WaitForStallReport()
+{
+    const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!observedStall.load() && std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return observedStall.load();
+}
+} // namespace
+
+TEST(RHIThreadTest, ReportsBlockedInvocationAndResumes)
+{
+#if defined(ZEN_WIN32)
+    if (IsDebuggerPresent())
+    {
+        GTEST_SKIP() << "The RHI watchdog suppresses reports while a debugger is attached";
+    }
+#endif
+    const std::chrono::milliseconds threshold = RHIOptions::GetInstance().StallReportThreshold();
+    const RHIMessageCallback        callback  = GetRHIMessageCallback();
+    RHIOptions::GetInstance().SetStallReportThreshold(std::chrono::milliseconds(10));
+    SetRHIMessageCallback(CaptureStall);
+    observedStall.store(false);
+    observedStack.store(false);
+    observedRecovery.store(false);
+    RHIThread thread;
+    thread.Start(RHIExecutionMode::eThreaded);
+    EXPECT_TRUE(thread.Invoke(WaitForStallReport));
+    EXPECT_TRUE(observedRecovery.load());
+    observedStall.store(false);
+    observedRecovery.store(false);
+    thread.Stop([] { WaitForStallReport(); });
+    EXPECT_TRUE(observedStall.load());
+    SetRHIMessageCallback(callback);
+    RHIOptions::GetInstance().SetStallReportThreshold(threshold);
+    EXPECT_TRUE(observedRecovery.load());
+#if defined(_WIN32) && defined(_M_X64)
+    EXPECT_TRUE(observedStack.load());
+#endif
+}
+
+TEST(RHIDiagnosticsTest, ReportsAnEmptyDefaultView)
+{
+    const RHIMessageCallback previous = GetRHIMessageCallback();
+    SetRHIMessageCallback(nullptr);
+    testing::internal::CaptureStderr();
+    ReportRHIMessage(RHIMessageSeverity::eInfo, {});
+    EXPECT_EQ(testing::internal::GetCapturedStderr(), "[info] \n");
+    SetRHIMessageCallback(previous);
+}
+
 TEST(RHIThreadTest, InlineUsesCallingThread)
 {
     RHIThread thread;
     thread.Start(RHIExecutionMode::eInline);
     EXPECT_EQ(thread.Invoke([] { return std::this_thread::get_id(); }), std::this_thread::get_id());
     thread.Stop();
+}
+
+TEST(RHIThreadDeathTest, ExplicitFatalThresholdEndsABlockedInvocation)
+{
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(
+        {
+            RHIOptions::GetInstance().SetStallStackCapture(false);
+            RHIOptions::GetInstance().SetStallReportThreshold(std::chrono::milliseconds(0));
+            RHIOptions::GetInstance().SetStallFatalThreshold(std::chrono::milliseconds(30));
+            RHIThread thread;
+            thread.Start(RHIExecutionMode::eThreaded);
+            thread.Invoke([] { std::this_thread::sleep_for(std::chrono::seconds(2)); });
+            thread.Stop();
+        },
+        "Fatal RHI stall in synchronous RHI call");
 }
 
 TEST(RHIGPUMemoryBudgetTest, PressureUsesDeviceLocalBudgetAndHandlesUnavailableTelemetry)
@@ -111,6 +204,68 @@ TEST(RHIThreadProductionTest, ShutdownDrainsLateCleanupBeforeTheFinalizer)
 }
 
 
+
+namespace
+{
+struct QueueStallGate
+{
+    std::promise<void>            waiting;
+    RHIThreadEvent                resume;
+    static inline QueueStallGate* active{};
+    static void                   OnMessage(RHIMessageSeverity, std::string_view message) noexcept
+    {
+        if (message.starts_with("RHI stall: RHI queue space") && !active->reported.exchange(true))
+        {
+            active->waiting.set_value();
+            active->resume.Wait();
+        }
+    }
+    std::atomic<bool> reported{};
+};
+} // namespace
+
+TEST(RHIThreadProductionTest, LateCleanupKeepsShutdownWakeVisibleToFullQueueProducer)
+{
+    using namespace std::chrono_literals;
+    RHIThread      thread;
+    RHIThreadEvent entered, release;
+    QueueStallGate gate;
+    QueueStallGate::active                    = &gate;
+    RHIOptions&                     options   = RHIOptions::GetInstance();
+    const std::chrono::milliseconds threshold = options.StallReportThreshold();
+    const RHIMessageCallback        callback  = GetRHIMessageCallback();
+    options.SetStallReportThreshold(5ms);
+    SetRHIMessageCallback(QueueStallGate::OnMessage);
+    thread.Start(RHIExecutionMode::eThreaded, 1);
+    thread.Dispatch([&entered, &release] {
+        entered.Signal();
+        release.Wait();
+    });
+    entered.Wait();
+    thread.Dispatch([] {});
+    std::future<RHIJobAdmissionResult> producer =
+        std::async(std::launch::async, [&thread] { return thread.DispatchChecked([] {}); });
+    const bool  reached = gate.waiting.get_future().wait_for(2s) == std::future_status::ready;
+    std::thread stopper([&thread] { thread.Stop(); });
+    while (!thread.IsStopping())
+    {
+        std::this_thread::yield();
+    }
+    EXPECT_TRUE(thread.DispatchCleanup([] {}));
+    gate.resume.Signal();
+    const bool woke = producer.wait_for(1s) == std::future_status::ready;
+    release.Signal();
+    stopper.join();
+    EXPECT_EQ(producer.get().admission, RHIJobAdmission::eClosed);
+    SetRHIMessageCallback(callback);
+    options.SetStallReportThreshold(threshold);
+    QueueStallGate::active = nullptr;
+    if (!reached)
+    {
+        GTEST_SKIP() << "Stall diagnostics unavailable";
+    }
+    EXPECT_TRUE(woke);
+}
 
 TEST(RHIThreadProductionTest, FullQueueFailureWakesProducersAndPreservesTheFirstCause)
 {

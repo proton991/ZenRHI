@@ -20,12 +20,18 @@ void AddWindowInstanceExtensions(HeapVector<UniquePtr<VulkanInstanceExtension>>&
 
         for (const UniquePtr<VulkanInstanceExtension>& extension : extensions)
         {
-            exists |= extension->GetName() == NameID(name);
+            if (extension->GetName() == NameID(name))
+            {
+                extension->required = true;
+                extension->SetEnable();
+                exists = true;
+                break;
+            }
         }
 
         if (!exists)
         {
-            extensions.emplace_back(MakeUnique<VulkanInstanceExtension>(name));
+            extensions.emplace_back(MakeUnique<VulkanInstanceExtension>(name, true));
         }
     }
 }

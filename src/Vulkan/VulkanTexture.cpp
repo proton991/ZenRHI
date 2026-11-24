@@ -182,6 +182,7 @@ RHISampler* VulkanResourceFactory::CreateSampler(const RHISamplerCreateInfo& cre
 
 RHISampler* VulkanRHI::CreateSampler(const RHISamplerCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::eResource);
     return GVulkanRHI->GetResourceFactory()->CreateSampler(createInfo);
 }
 
@@ -294,11 +295,13 @@ RHITexture* VulkanResourceFactory::CreateTexture(const RHITextureCreateInfo& cre
 
 RHITexture* VulkanRHI::CreateTexture(const RHITextureCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::eResource);
     return GVulkanRHI->GetResourceFactory()->CreateTexture(createInfo);
 }
 
 RHITextureView* VulkanRHI::CreateTextureView(RHITexture* pBaseTexture, const RHITextureViewCreateInfo& createInfo)
 {
+    RHIWorkerTimer  timer(RHIWorkerTime::eResource);
     RHITextureView* view = nullptr;
 
     if (pBaseTexture == nullptr)

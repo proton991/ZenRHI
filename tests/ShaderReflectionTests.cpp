@@ -338,6 +338,19 @@ TEST(ShaderReflectionTests, NestedAndIncompleteBlockMetadataCannotHideAccess)
     EXPECT_TRUE(result.writable);
 }
 
+TEST(ShaderReflectionTests, MultiLocationVertexInputCannotPublishASingleAttribute)
+{
+    RHIShaderGroupSPIRVPtr spirv = MakeRefCountPtr<RHIShaderGroupSPIRV>();
+    for (const char* shader : {"review_array.vert.spv", "review_matrix.vert.spv"})
+    {
+        SCOPED_TRACE(shader);
+        spirv->SetStageSPIRV(RHIShaderStage::eVertex, LoadReflectionFixture(shader));
+        RHIShaderGroupInfo info;
+        EXPECT_FALSE(RHIShaderUtil::ReflectShaderGroupInfo(spirv, kNoDeviceSetLimit, info));
+        EXPECT_EQ(info.vertexBindingStride, 0u);
+    }
+}
+
 TEST(ShaderReflectionTests, CorruptInputDoesNotPublishPartialReflection)
 {
     RHIShaderGroupSPIRVPtr spirv = MakeRefCountPtr<RHIShaderGroupSPIRV>();
@@ -491,8 +504,7 @@ TEST(ShaderReflectionTests, ArrayHeapShadersReflectAndRejectMismatchedImageDecla
     for (const char* fixture : {"binding_bindless_array.comp.spv", "binding_bindless_cube_array.comp.spv"})
     {
         SCOPED_TRACE(fixture);
-        HeapVector<uint8_t> bytes = LoadReflectionFixture(fixture);
-        ASSERT_TRUE(HasValidSpirvStructure(bytes));
+        HeapVector<uint8_t>    bytes = LoadReflectionFixture(fixture);
         RHIShaderGroupSPIRVPtr spirv = MakeRefCountPtr<RHIShaderGroupSPIRV>();
         spirv->SetStageSPIRV(RHIShaderStage::eCompute, HeapVector<uint8_t>(bytes));
         RHIShaderGroupInfo info{};

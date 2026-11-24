@@ -209,7 +209,7 @@ const RHIBatchResult& RHISubmissionTicket::Wait() const
 
     if (m_result.valid() && !IsReady())
     {
-        m_completion->Wait();
+        m_completion->Wait("frame submission", GetRHIThread().GetActivity());
     }
 
     return m_result.get();
@@ -309,6 +309,7 @@ void RHICommandListExecutor::ExecuteDestroy()
 void RHICommandListExecutor::PublishProgress()
 {
     GetRHIThread().CheckOwnership();
+    m_publishedFrameNumber.store(ToValue(GRHIFrameState.GetFrameNumber()), std::memory_order_release);
 
     for (uint32_t i = 0; i < RHICompletionSet::kQueueCount; ++i)
     {
@@ -370,13 +371,14 @@ void RHICommandListExecutor::PublishTerminalError(RHIError error)
     if (first)
     {
         const RHICompletionSet submitted = GetCachedSubmittedSerials();
+        // Rejected admission can log on the producer while the worker is advancing a frame.
+        const uint64_t frame = m_publishedFrameNumber.load(std::memory_order_acquire);
 
         ZEN_RHI_LOG_ERROR(
             "RHI stopped at frame {} (slot {}): {} (code {}, native {}, {}:{}, resource {}); submitted graphics={}, compute={}, transfer={}",
-            ToValue(GRHIFrameState.GetFrameNumber()), ToIndex(GRHIFrameState.GetFrameSlot()),
-            RHIErrorText(error.operation, "unknown operation"), static_cast<uint32_t>(error.code), error.nativeCode,
-            RHIErrorText(error.source, "unknown source"), error.line, error.resourceId,
-            submitted.serials[static_cast<uint32_t>(RHICommandContextType::eGraphics)],
+            frame, frame % GRHIFrameState.GetNumFramesInFlight(), RHIErrorText(error.operation, "unknown operation"),
+            static_cast<uint32_t>(error.code), error.nativeCode, RHIErrorText(error.source, "unknown source"), error.line,
+            error.resourceId, submitted.serials[static_cast<uint32_t>(RHICommandContextType::eGraphics)],
             submitted.serials[static_cast<uint32_t>(RHICommandContextType::eAsyncCompute)],
             submitted.serials[static_cast<uint32_t>(RHICommandContextType::eTransfer)]);
     }
@@ -674,6 +676,11 @@ RHIBatchResult RHICommandListExecutor::SubmitGroups(std::span<const RHISubmissio
     else if (AreSubmissionsBlocked())
     {
         result.submission = RHISubmissionResult::eFatal;
+        result.cause      = GetTerminalError();
+    }
+    else if (std::this_thread::get_id() == m_renderThread && m_destroyed)
+    {
+        result.cause = MakeRHIError(RHIErrorCode::eCancelled, "RHI executor shutdown", __FILE__, __LINE__);
     }
 
     return result;
@@ -717,9 +724,9 @@ RHISubmissionTicket RHICommandListExecutor::QueueBatch(std::span<const RHISubmis
 {
     RHISubmissionTicket ticket;
 
-    bool valid = std::this_thread::get_id() == m_renderThread && !AreSubmissionsBlocked();
+    bool valid = std::this_thread::get_id() == m_renderThread && !m_destroyed && !AreSubmissionsBlocked();
 
-    if (!state)
+    if (valid && !state)
     {
         HeapVector<RHICommandContextType> queues;
 
@@ -900,9 +907,10 @@ bool RHICommandListExecutor::ExecuteGroups(RHICommandBatch& batch)
 
         RHISubmissionResult submitted = ready ? ExecuteBatch(lists) : unsubmitted;
 
-        const RHIError cause = ready
-                                 ? m_executionError
-                                 : MakeRHIError(RHIErrorCode::eInvalidArgument, "RHI group preparation", __FILE__, __LINE__);
+        const RHIError cause =
+            ready ? m_executionError
+                  : RHIErrorOr(batch.result.cause,
+                               MakeRHIError(RHIErrorCode::eInvalidArgument, "RHI group preparation", __FILE__, __LINE__));
 
         if (!batch.result.cause.IsFailure() && cause.IsFailure())
         {
@@ -1052,9 +1060,12 @@ void RHICommandListExecutor::ExecuteFrame(const RefCountPtr<RHICommandBatch>& ba
 
                 if (result.presentation.error.IsFailure())
                 {
-                    result.cause      = result.presentation.error;
-
-                    result.submission = RHISubmissionResult::eFatal;
+                    result.cause = result.presentation.error;
+                    if (result.presentation.acceptance != RHIPresentAcceptance::eRejected
+                        || result.cause.code == RHIErrorCode::eDeviceLost)
+                    {
+                        result.submission = RHISubmissionResult::eFatal;
+                    }
                 }
 
                 result.needsRecreation = batch->viewport->NeedsRecreation();
@@ -1200,7 +1211,12 @@ void RHICommandListExecutor::BeginGPUFrameTiming(const RHIGPUFrameTimingPtr& tim
 
 void RHICommandListExecutor::EndGPUFrameTiming(const RHIGPUFrameTimingPtr& timing, bool succeeded)
 {
-    GetRHIThread().DispatchCleanup(std::bind_front(&RHICommandListExecutor::ExecuteEndGPUFrameTiming, this, timing, succeeded));
+    if (!GetRHIThread().DispatchCleanup(
+            std::bind_front(&RHICommandListExecutor::ExecuteEndGPUFrameTiming, this, timing, succeeded))
+        && timing)
+    {
+        timing->Seal(RHIGPUTimingStatus::eError);
+    }
 }
 
 void RHICommandListExecutor::ExecuteEndGPUFrameTiming(const RHIGPUFrameTimingPtr& timing, bool succeeded)
@@ -1311,9 +1327,9 @@ bool RHICommandListExecutor::AreSubmissionsBlocked() const
 
 RHIThreadMetrics RHICommandListExecutor::GetThreadMetrics() const
 {
-    return {m_submittedBatches.load(),   m_completedBatches.load(),        m_executionCPUUs.load(),
-            m_queueWaitUs.load(),        m_pendingBatches.load(),          m_peakPendingBatches.load(),
-            m_submitGroupsWaitNS.load(), m_backend->GetExecutionCounters()};
+    return {m_submittedBatches.load(),   m_completedBatches.load(),         m_executionCPUUs.load(),
+            m_queueWaitUs.load(),        m_pendingBatches.load(),           m_peakPendingBatches.load(),
+            m_submitGroupsWaitNS.load(), m_backend->GetExecutionCounters(), RHIWorkerTimer::Read()};
 }
 
 RHIAPIType RHICommandListExecutor::GetAPIType()
@@ -1399,6 +1415,22 @@ RHIPipeline* RHICommandListExecutor::CreatePipeline(const RHIRayTracingPipelineC
 {
     RHIResult<RHIPipeline*> result = GetRHIThread().InvokeChecked([&] { return m_backend->CreatePipeline(info); });
     return result ? result.GetValue() : nullptr;
+}
+
+RHIError RHICommandListExecutor::SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes)
+{
+    RHIError error = GetTerminalError();
+    if (!error.IsFailure())
+    {
+        // RHIError itself cannot be the value type of RHIResult. Keep it in caller storage until the ordered job finishes.
+        const RHIResult<void> call =
+            GetRHIThread().InvokeChecked([&] { error = m_backend->SnapshotPipelineCache(byteLimit, bytes); });
+        if (!call)
+        {
+            error = call.GetError();
+        }
+    }
+    return error;
 }
 
 void RHICommandListExecutor::DestroyPipeline(RHIPipeline* pipeline)

@@ -1114,6 +1114,13 @@ bool FitBindlessHeapCapacities(const VkPhysicalDeviceDescriptorIndexingPropertie
 
 void VulkanBindlessDescriptorPoolManager::Init()
 {
+    const RHIError error = InitChecked();
+    ZEN_RHI_VERIFY_MSG_F(!error.IsFailure(), "{} failed ({})", error.operation, error.nativeCode);
+}
+
+RHIError VulkanBindlessDescriptorPoolManager::InitChecked()
+{
+    RHIError error;
     m_pDevice                              = GVulkanRHI->GetDevice();
 
     const bool                      usable = m_pDevice != nullptr && m_pDevice->GetExtensionFlags().hasDescriptorIndexing != 0;
@@ -1137,7 +1144,7 @@ void VulkanBindlessDescriptorPoolManager::Init()
                 capacities.Get(RHIBindlessHeapType::eTextureCubeArray), fitted.Get(RHIBindlessHeapType::eTextureCubeArray));
         }
 
-        CreateGlobalBindlessDescriptorSet();
+        error = CreateGlobalBindlessDescriptorSet();
 
         if (m_vkSet != VK_NULL_HANDLE)
         {
@@ -1166,6 +1173,7 @@ void VulkanBindlessDescriptorPoolManager::Init()
             m_capacities = kNoBindlessHeaps;
         }
     }
+    return error;
 }
 
 void VulkanBindlessDescriptorPoolManager::Destroy()
@@ -1360,17 +1368,18 @@ bool VulkanBindlessDescriptorPoolManager::RegisterBindlessResource(RHIResource* 
             {
                 static std::atomic<uint64_t> nextGeneration{1};
 
-                // Reserve the journal and pending write before retaining or publishing.
+                // Transactional writes enter the native update batch at submission.
                 if (transaction != 0)
                 {
-                    HeapVector<RHIBindlessHandle>& journal = m_journals[transaction];
+                    HeapVector<RHIBindlessHandle>& journal = m_journals[transaction].slots;
 
                     journal.reserve(journal.size() + 1);
                 }
-
-                m_pendingWrites[heapIdx].push_back({slotIdx, pResource});
-
-                m_hasPendingWrites.store(true, std::memory_order_release);
+                else
+                {
+                    m_pendingWrites[heapIdx].push_back({slotIdx, pResource});
+                    m_hasPendingWrites.store(true, std::memory_order_release);
+                }
 
                 pResource->AddReference();
 
@@ -1393,7 +1402,7 @@ bool VulkanBindlessDescriptorPoolManager::RegisterBindlessResource(RHIResource* 
 
                 if (transaction != 0)
                 {
-                    m_journals[transaction].push_back({heapType, slotIdx, slot.generation});
+                    m_journals[transaction].slots.push_back({heapType, slotIdx, slot.generation});
                 }
             }
 
@@ -1493,15 +1502,79 @@ bool VulkanBindlessDescriptorPoolManager::CanRegisterLocked(RHIBindlessHeapType 
     return valid;
 }
 
+void VulkanBindlessDescriptorPoolManager::QueueTransactionWrites(BindlessJournal& journal)
+{
+    while (journal.queued < journal.slots.size())
+    {
+        const RHIBindlessHandle  handle = journal.slots[journal.queued++];
+        const BindlessSlotState* slot   = FindRegistration(handle);
+        ZEN_RHI_VERIFY(slot != nullptr);
+        m_pendingWrites[ToUnderlying(handle.heapType)].push_back({handle.slotIndex, slot->pResource});
+        m_hasPendingWrites.store(true, std::memory_order_release);
+    }
+}
+
+bool VulkanBindlessDescriptorPoolManager::TransferTransaction(uint64_t transaction, size_t workloads)
+{
+    bool transferred = false;
+    if (workloads == 0)
+    {
+        ResolveTransaction(transaction, false);
+    }
+    else
+    {
+        LockAuto   lock(&m_mutex);
+        const auto journal = m_journals.find(transaction);
+        if (journal != m_journals.end())
+        {
+            journal->second.owners += workloads;
+            transferred             = true;
+        }
+    }
+    return transferred;
+}
+
+void VulkanBindlessDescriptorPoolManager::ReleaseTransferredTransaction(uint64_t transaction)
+{
+    bool last = false;
+    {
+        LockAuto   lock(&m_mutex);
+        const auto journal = m_journals.find(transaction);
+        if (journal != m_journals.end())
+        {
+            ZEN_RHI_VERIFY(journal->second.owners != 0);
+            last = --journal->second.owners == 0;
+        }
+    }
+    if (last)
+    {
+        ResolveTransaction(transaction, false);
+    }
+}
+
+void VulkanBindlessDescriptorPoolManager::PrepareTransaction(uint64_t transaction)
+{
+    LockAuto   lock(&m_mutex);
+    const auto journal = m_journals.find(transaction);
+    if (journal != m_journals.end())
+    {
+        QueueTransactionWrites(journal->second);
+    }
+}
+
 void VulkanBindlessDescriptorPoolManager::ResolveTransaction(uint64_t transaction, bool commit)
 {
     LockAuto lock(&m_mutex);
 
-    const FlatHashMap<uint64_t, HeapVector<RHIBindlessHandle>>::iterator journal = m_journals.find(transaction);
+    const auto journal = m_journals.find(transaction);
 
     if (journal != m_journals.end())
     {
-        for (RHIBindlessHandle handle : journal->second)
+        if (commit)
+        {
+            QueueTransactionWrites(journal->second);
+        }
+        for (RHIBindlessHandle handle : journal->second.slots)
         {
             BindlessSlotState* slot = FindRegistration(handle);
 
@@ -1725,7 +1798,7 @@ VkDescriptorSet VulkanBindlessDescriptorPoolManager::GetGlobalBindlessSet() cons
     return m_vkSet;
 }
 
-void VulkanBindlessDescriptorPoolManager::CreateGlobalBindlessDescriptorSet()
+RHIError VulkanBindlessDescriptorPoolManager::CreateGlobalBindlessDescriptorSet()
 {
     VkDescriptorSetLayoutBinding bindings[kBindlessHeapCount]{};
 
@@ -1773,9 +1846,17 @@ void VulkanBindlessDescriptorPoolManager::CreateGlobalBindlessDescriptorSet()
 
     // Device selection cannot ask before the device exists, and no shader can be created
     // without this layout, so continuing would only fail later and less clearly.
-    ZEN_RHI_VERIFY_MSG(support.supported == VK_TRUE, "The Vulkan device does not support the global bindless layout");
-
-    VkResult result = vkCreateDescriptorSetLayout(m_pDevice->GetVkHandle(), &layoutCI, nullptr, &m_vkLayout);
+    VkResult    result    = VK_ERROR_FEATURE_NOT_PRESENT;
+    const char* operation = "vkGetDescriptorSetLayoutSupport";
+    if (!support.supported)
+    {
+        ZEN_RHI_LOG_ERROR("The Vulkan device does not support the global bindless layout");
+    }
+    if (support.supported)
+    {
+        operation = "vkCreateDescriptorSetLayout";
+        result    = vkCreateDescriptorSetLayout(m_pDevice->GetVkHandle(), &layoutCI, nullptr, &m_vkLayout);
+    }
 
     if (result != VK_SUCCESS)
     {
@@ -1800,6 +1881,7 @@ void VulkanBindlessDescriptorPoolManager::CreateGlobalBindlessDescriptorSet()
 
         poolCI.pPoolSizes    = poolSizes;
 
+        operation            = "vkCreateDescriptorPool";
         result               = vkCreateDescriptorPool(m_pDevice->GetVkHandle(), &poolCI, nullptr, &m_vkPool);
 
         if (result != VK_SUCCESS)
@@ -1820,6 +1902,7 @@ void VulkanBindlessDescriptorPoolManager::CreateGlobalBindlessDescriptorSet()
 
         allocateInfo.pSetLayouts        = &m_vkLayout;
 
+        operation                       = "vkAllocateDescriptorSets";
         result                          = vkAllocateDescriptorSets(m_pDevice->GetVkHandle(), &allocateInfo, &m_vkSet);
 
         if (result != VK_SUCCESS)
@@ -1846,6 +1929,7 @@ void VulkanBindlessDescriptorPoolManager::CreateGlobalBindlessDescriptorSet()
 
         m_vkLayout = VK_NULL_HANDLE;
     }
+    return MakeVulkanError(result, operation);
 }
 
 void VulkanBindlessDescriptorPoolManager::WriteDescriptorSetBatch()

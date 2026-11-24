@@ -14,8 +14,9 @@ enum class RHIMessageSeverity
 using RHIMessageCallback = void (*)(RHIMessageSeverity severity, std::string_view message) noexcept;
 
 // The device may report on any calling or worker thread. The view is valid for the duration of the callback.
-void ReportRHIMessage(RHIMessageSeverity severity, std::string_view message) noexcept;
-void SetRHIMessageCallback(RHIMessageCallback callback) noexcept;
+void               ReportRHIMessage(RHIMessageSeverity severity, std::string_view message) noexcept;
+RHIMessageCallback GetRHIMessageCallback() noexcept;
+void               SetRHIMessageCallback(RHIMessageCallback callback) noexcept;
 
 [[noreturn]] inline void RHIVerificationFailure(const char* expression, const char* file, int line, const char* message)
 {

@@ -1,6 +1,9 @@
 #pragma once
 #include <cstdint>
+#include <chrono>
 #include <span>
+#include <memory>
+#include <vector>
 #include <string>
 #include <string_view>
 #include "RHICommon.h"
@@ -52,6 +55,13 @@ inline bool ParseRHIPresentMode(std::string_view name, RHIPresentMode& outMode)
 
     return valid;
 }
+
+enum class RHIValidationMode : uint8_t
+{
+    eOff,
+    eRequested,
+    eRequired
+};
 
 class RHIDeviceDesc
 {
@@ -114,6 +124,47 @@ public:
         return m_pipelineStatistics;
     }
 
+    // Supply a snapshot previously returned by this SDK. Copies of the descriptor share the immutable bytes.
+    void SetPipelineCacheSeed(std::vector<uint8_t> bytes)
+    {
+        m_pipelineCacheSeed = bytes.empty() ? nullptr : std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+    }
+
+    std::span<const uint8_t> PipelineCacheSeed() const
+    {
+        return m_pipelineCacheSeed ? std::span<const uint8_t>(*m_pipelineCacheSeed) : std::span<const uint8_t>{};
+    }
+
+    void SetStallReportThreshold(std::chrono::milliseconds threshold)
+    {
+        m_stallReportThreshold = threshold;
+    }
+
+    std::chrono::milliseconds StallReportThreshold() const
+    {
+        return m_stallReportThreshold;
+    }
+
+    void SetStallFatalThreshold(std::chrono::milliseconds threshold)
+    {
+        m_stallFatalThreshold = threshold;
+    }
+
+    std::chrono::milliseconds StallFatalThreshold() const
+    {
+        return m_stallFatalThreshold;
+    }
+
+    void SetStallStackCapture(bool enabled)
+    {
+        m_stallStackCapture = enabled;
+    }
+
+    bool StallStackCapture() const
+    {
+        return m_stallStackCapture;
+    }
+
     void SetDeviceLossDiagnostics(bool enabled)
     {
         m_deviceLossDiagnostics = enabled;
@@ -136,12 +187,22 @@ public:
 
     void SetValidationEnabled(bool enabled)
     {
-        m_validationEnabled = enabled;
+        SetValidationMode(enabled ? RHIValidationMode::eRequested : RHIValidationMode::eOff);
     }
 
     bool ValidationEnabled() const
     {
-        return m_validationEnabled;
+        return m_validationMode != RHIValidationMode::eOff;
+    }
+
+    void SetValidationMode(RHIValidationMode mode)
+    {
+        m_validationMode = mode;
+    }
+
+    RHIValidationMode ValidationMode() const
+    {
+        return m_validationMode;
     }
 
     void SetDebugPrintfEnabled(bool enabled)
@@ -152,6 +213,15 @@ public:
     bool DebugPrintfEnabled() const
     {
         return m_debugPrintfEnabled;
+    }
+
+    void SetWorkerTimingEnabled(bool enabled)
+    {
+        m_workerTimingEnabled = enabled;
+    }
+    bool WorkerTimingEnabled() const
+    {
+        return m_workerTimingEnabled;
     }
 
     void SetExecutionCountersEnabled(bool enabled)
@@ -227,25 +297,30 @@ public:
     RHIMessageCallback                                     messageCallback{};
 
 private:
-    RHIPresentMode            m_presentMode{RHIPresentMode::eDefault};
-    RHIBindlessHeapCapacities m_bindlessHeapCapacities;
+    std::shared_ptr<const std::vector<uint8_t>> m_pipelineCacheSeed;
+    RHIPresentMode                              m_presentMode{RHIPresentMode::eDefault};
+    RHIBindlessHeapCapacities                   m_bindlessHeapCapacities;
 #if defined(NDEBUG)
-    bool m_strictTeardownChecks{false};
-    bool m_validationEnabled{false};
+    bool              m_strictTeardownChecks{false};
+    RHIValidationMode m_validationMode{RHIValidationMode::eOff};
 #else
-    bool m_strictTeardownChecks{true};
-    bool m_validationEnabled{true};
+    bool              m_strictTeardownChecks{true};
+    RHIValidationMode m_validationMode{RHIValidationMode::eRequested};
 #endif
-    bool        m_executionCountersEnabled{true};
-    bool        m_debugPrintfEnabled{false};
-    bool        m_robustBufferAccessEnabled{false};
-    bool        m_rayTracingDisabled{false};
-    uint64_t    m_deviceMemoryLimit{0};
-    std::string m_preferredDevice;
-    bool        m_gpuProfilerMarkers{false};
-    bool        m_pipelineStatistics{false};
-    bool        m_gpuMemoryStats{false};
-    bool        m_deviceLossDiagnostics{false};
+    bool                      m_workerTimingEnabled{};
+    bool                      m_executionCountersEnabled{true};
+    bool                      m_debugPrintfEnabled{false};
+    bool                      m_robustBufferAccessEnabled{false};
+    bool                      m_rayTracingDisabled{false};
+    uint64_t                  m_deviceMemoryLimit{0};
+    std::string               m_preferredDevice;
+    bool                      m_gpuProfilerMarkers{false};
+    bool                      m_pipelineStatistics{false};
+    bool                      m_gpuMemoryStats{false};
+    std::chrono::milliseconds m_stallReportThreshold{10000};
+    std::chrono::milliseconds m_stallFatalThreshold{};
+    bool                      m_stallStackCapture{true};
+    bool                      m_deviceLossDiagnostics{false};
 };
 
 class RHIOptions : public RHIDeviceDesc

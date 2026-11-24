@@ -1,0 +1,41 @@
+name: Select SwiftShader
+description: Build the pinned Windows Vulkan software driver and select its ICD
+runs:
+  using: composite
+  steps:
+    - name: Restore SwiftShader build
+      id: swiftshader-cache
+      uses: actions/cache@v4
+      with:
+        path: build/swiftshader
+        key: swiftshader-${{ runner.os }}-1e80438d2b93ef36a7c05f8d2b81233bac0e3d16-vs2022-${{ hashFiles('**/.github/actions/software-driver/compute-sampling.patch') }}
+    - name: Build pinned SwiftShader
+      if: steps.swiftshader-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        # Fetch only the pinned revision instead of the repository history.
+        git init build/swiftshader-src
+        git -C build/swiftshader-src remote add origin https://github.com/google/swiftshader.git
+        git -C build/swiftshader-src fetch --depth 1 origin 1e80438d2b93ef36a7c05f8d2b81233bac0e3d16
+        if ($LASTEXITCODE -ne 0) { throw 'SwiftShader fetch failed' }
+        git -C build/swiftshader-src checkout FETCH_HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'SwiftShader checkout failed' }
+        # This revision prepares compressed descriptors before a draw but omits that step before a dispatch.
+        git -C build/swiftshader-src apply --whitespace=nowarn "$env:GITHUB_ACTION_PATH/compute-sampling.patch"
+        if ($LASTEXITCODE) { throw 'SwiftShader compute preparation patch failed' }
+        cmake -S build/swiftshader-src -B build/swiftshader -G Ninja -DCMAKE_BUILD_TYPE=Release -DSWIFTSHADER_BUILD_TESTS=OFF
+        if ($LASTEXITCODE -ne 0) { throw 'SwiftShader configure failed' }
+        cmake --build build/swiftshader --target vk_swiftshader -j 2
+        if ($LASTEXITCODE -ne 0) { throw 'SwiftShader build failed' }
+    - name: Select SwiftShader driver
+      shell: pwsh
+      run: |
+        $icd = Get-ChildItem build/swiftshader -Recurse -Filter vk_swiftshader_icd.json | Select-Object -First 1
+        if (!$icd) { throw 'SwiftShader ICD manifest missing' }
+        "VK_DRIVER_FILES=$($icd.FullName)" >> $env:GITHUB_ENV
+    - name: Confirm software driver
+      shell: pwsh
+      run: |
+        vulkaninfo --summary | Tee-Object -FilePath build/software-driver.txt
+        if ($LASTEXITCODE -ne 0) { throw 'Software Vulkan driver unavailable' }
+        if (!(Select-String -Path build/software-driver.txt -Pattern 'SwiftShader')) { throw 'Unexpected Vulkan driver' }

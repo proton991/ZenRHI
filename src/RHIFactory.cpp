@@ -7,6 +7,16 @@
 
 namespace zen
 {
+RHIResult<std::vector<RHIAdapterInfo>> EnumerateRHIAdapters(const RHIDeviceDesc& description)
+{
+    return EnumerateVulkanAdapters(description);
+}
+
+RHIResult<DynamicRHI*> CreateRHIChecked(const RHIDeviceDesc& description)
+{
+    return CreateVulkanRHIChecked(description);
+}
+
 DynamicRHI* CreateRHI(const RHIDeviceDesc& description)
 {
     return CreateVulkanRHI(description);

@@ -74,6 +74,7 @@ struct DescriptorWriteBatch
 };
 
 bool ResolveDescriptorBinding(const RHIShaderResourceBinding& binding,
+                              uint32_t                        arraySize,
                               uint32_t                        valueRange,
                               std::span<const uint32_t>       offsets,
                               DescriptorWriteBatch*           batch)
@@ -86,7 +87,7 @@ bool ResolveDescriptorBinding(const RHIShaderResourceBinding& binding,
         const uint32_t index     = element * stride;
         RHIResource*   resource  = binding.resources[index];
         RHIResource*   auxiliary = stride == 2 ? binding.resources[index + 1] : nullptr;
-        if (resource == nullptr && auxiliary == nullptr && count > 1)
+        if (resource == nullptr && auxiliary == nullptr && arraySize > 1)
         {
             continue;
         }
@@ -497,8 +498,9 @@ RHIStatus VulkanDescriptorSetState::ResolveSet(uint32_t setIdx)
                     // Offsets are absent from the content key, so cache hits still need
                     // validation. Misses retain the same resolution as native writes.
                     valid = valid
-                         && ResolveDescriptorBinding(binding.srb, binding.valueRange, binding.dynamicOffsets,
-                                                     needsWrite ? &writeBatch : nullptr);
+                         && ResolveDescriptorBinding(
+                                binding.srb, shader->GetSRDByLocation(setIdx, binding.srb.binding)->arraySize,
+                                binding.valueRange, binding.dynamicOffsets, needsWrite ? &writeBatch : nullptr);
                 }
                 if (valid)
                 {

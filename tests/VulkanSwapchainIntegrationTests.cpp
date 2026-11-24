@@ -944,6 +944,39 @@ TEST_F(VulkanSwapchainIntegrationTest, InvalidSuccessfulIndexIsAnInvariantFailur
     EXPECT_DEATH(swapchain->AcquireNextImage(&semaphore), "Acquired image 12 exceeds swapchain image count");
 }
 
+namespace
+{
+struct AcquirePublicationProbe
+{
+    static inline VulkanSwapchain*        observed{};
+    static inline bool                    recreationPending{};
+    static VKAPI_ATTR VkResult VKAPI_CALL Acquire(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t*)
+    {
+        std::thread reader([] { recreationPending = observed->NeedsRecreation(); });
+        reader.join();
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+};
+} // namespace
+
+TEST_F(VulkanSwapchainIntegrationTest, RecreationRemainsPublishedDuringAnOutstandingAcquire)
+{
+    Create();
+    VulkanSemaphore* semaphore{};
+    ASSERT_GE(swapchain->AcquireNextImage(&semaphore), 0);
+    WSIDriver::presentResult = VK_SUBOPTIMAL_KHR;
+    ASSERT_TRUE(swapchain->Present(nullptr));
+    ASSERT_TRUE(swapchain->NeedsRecreation());
+    AcquirePublicationProbe::observed = swapchain.get();
+    {
+        zen::test::ScopedVulkanCall hook(vkAcquireNextImageKHR, AcquirePublicationProbe::Acquire);
+        EXPECT_LT(swapchain->AcquireNextImage(&semaphore), 0);
+    }
+    EXPECT_TRUE(AcquirePublicationProbe::recreationPending);
+    EXPECT_TRUE(swapchain->NeedsRecreation());
+    AcquirePublicationProbe::observed = nullptr;
+}
+
 TEST_F(VulkanSwapchainIntegrationTest, SuboptimalAcquisitionSurvivesSuccessfulPresent)
 {
     Create();
@@ -1748,6 +1781,10 @@ TEST_F(VulkanSwapchainIntegrationTest, RejectedPresentationDoesNotWaitOnUnsubmit
     EXPECT_TRUE(swapchain->GetPresentResult().error.IsFailure());
 
     EXPECT_EQ(swapchain->GetPresentResult().acceptance, RHIPresentAcceptance::eRejected);
+    EXPECT_FALSE(session->rhi.AreSubmissionsBlocked());
+    EXPECT_TRUE(swapchain->NeedsRecreation());
+    EXPECT_EQ(swapchain->AcquireNextImageChecked(&semaphore).outcome, RHISurfaceOutcome::eRecreate);
+    EXPECT_EQ(semaphore, nullptr);
 
     swapchain->Destroy(nullptr);
 

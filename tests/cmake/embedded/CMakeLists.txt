@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.24)
+project(EmbeddedRhiPackage LANGUAGES C CXX)
+# A parent may supply private targets without installing or exporting them.
+foreach(dependency IN ITEMS spirv-reflect volk vma)
+    add_library(${dependency} INTERFACE)
+endforeach()
+set(ZENRHI_INSTALL ON CACHE BOOL "")
+set(ZENRHI_BUILD_TESTS OFF CACHE BOOL "")
+set(ZENRHI_BUILD_EXAMPLES OFF CACHE BOOL "")
+add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../.." ZenRHI)

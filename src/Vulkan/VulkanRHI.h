@@ -53,6 +53,8 @@ class VulkanRHI : public DynamicRHI
 {
 public:
     VulkanRHI();
+    void     CountValidationMessage(RHIMessageSeverity severity, std::string_view id);
+    uint64_t GetValidationCount(RHIMessageSeverity severity, std::string_view id) const;
 
     // Clears GVulkanRHI when it still points to this backend.
     ~VulkanRHI() override;
@@ -75,6 +77,11 @@ public:
                                        std::span<const RHISubmissionDependency> dependencies) override;
 
     void Init() override;
+    bool IsInitialized() const
+    {
+        return m_initialized;
+    }
+    RHIError InitChecked(std::vector<RHIAdapterInfo>* adapters = nullptr);
 
     void Destroy() override;
 
@@ -130,6 +137,8 @@ public:
 
     RHIPipeline* CreatePipeline(const RHIGfxPipelineCreateInfo& createInfo) final;
 
+    RHIError SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes) override;
+
     void DestroyPipeline(RHIPipeline* pPipeline) final;
 
     RHISampler* CreateSampler(const RHISamplerCreateInfo& createInfo) final;
@@ -162,19 +171,29 @@ public:
 
     void BlockSubmissions(RHIError error)
     {
-        m_deviceLost |= error.code == RHIErrorCode::eDeviceLost;
+        std::lock_guard<std::mutex> lock(m_terminalMutex);
 
         if (!m_terminalError.IsFailure())
         {
             m_terminalError = error;
         }
 
-        m_submissionBlocked = true;
+        m_submissionBlocked.store(true, std::memory_order_release);
+        if (error.code == RHIErrorCode::eDeviceLost)
+        {
+            m_deviceLost.store(true, std::memory_order_release);
+        }
     }
 
     RHIError GetTerminalError() const override
     {
-        return m_terminalError;
+        RHIError error;
+        if (AreSubmissionsBlocked())
+        {
+            std::lock_guard<std::mutex> lock(m_terminalMutex);
+            error = m_terminalError;
+        }
+        return error;
     }
 
     bool HasDeviceLoss() const override
@@ -184,7 +203,7 @@ public:
 
     RHIError GetLastSubmissionError() const override
     {
-        return RHIErrorOr(m_submissionError, m_terminalError);
+        return m_submissionError.IsFailure() ? m_submissionError : GetTerminalError();
     }
 
     RHIError GetSubmissionFailureCause(const RHIError& fallback) const
@@ -277,18 +296,30 @@ public:
     }
 
 protected:
-    void CreateInstance();
+    RHIError CreateInstance();
+    void     PopulateGPUInfo();
 
 private:
-    void SetupInstanceLayers(VulkanInstanceExtensionArray& instanceExtensions);
+    RHIError SetupInstanceLayers(VulkanInstanceExtensionArray& instanceExtensions);
 
-    void SetupInstanceExtensions(VulkanInstanceExtensionArray& instanceExtensions);
+    RHIError SetupInstanceExtensions(VulkanInstanceExtensionArray& instanceExtensions);
 
     RHIExecutionCounterStorage m_executionCounters;
 
     void PopulateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& dbgMessengerCI);
 
-    void SelectGPU();
+    RHIError          SelectGPU(std::vector<RHIAdapterInfo>* adapters);
+    VkResult          m_loaderResult{};
+    bool              m_initialized{};
+    VkLayerProperties m_validationLayer{};
+    struct ValidationMessageCount
+    {
+        RHIMessageSeverity severity;
+        std::string        id;
+        uint64_t           count;
+    };
+    mutable std::mutex                 m_validationMutex;
+    HeapVector<ValidationMessageCount> m_validationCounts;
 
     VulkanPlatformCommandList* AcquirePlatformCommandList();
 
@@ -317,11 +348,12 @@ private:
     ObjectPool<VulkanPlatformCommandList> m_platformCommandListPool;
 
     HeapVector<VulkanPlatformCommandList*> m_pendingPlatformCmdLists;
-    bool                                   m_submissionBlocked{false};
+    mutable std::mutex                     m_terminalMutex;
+    std::atomic<bool>                      m_submissionBlocked{false};
     RHIError                               m_terminalError{};
     RHIError                               m_submissionError{};
     RHIError                               m_creationError{};
-    bool                                   m_deviceLost{false};
+    std::atomic<bool>                      m_deviceLost{false};
     RHIGPUFrameTimingPtr                   m_gpuFrameTiming;
     uint32_t                               m_pendingNativeRecordings{0};
     VulkanLifetimeTracker                  m_lifetimeTracker;

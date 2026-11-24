@@ -145,6 +145,7 @@ struct RHIThreadMetrics
     uint64_t             peakPendingBatches{0};
     uint64_t             submitGroupsWaitNS{0};
     RHIExecutionCounters native;
+    RHIWorkerTimes       workerTimeNS{};
 };
 
 // DynamicRHI facade: RenderCore keeps its API, while mutable backend operations
@@ -265,6 +266,8 @@ public:
     RHIPipeline* CreatePipeline(const RHIRayTracingPipelineCreateInfo& info) override;
 
     RHIPipeline* CreatePipeline(const RHIGfxPipelineCreateInfo& info) override;
+
+    RHIError SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes) override;
 
     void DestroyPipeline(RHIPipeline* pipeline) override;
 
@@ -388,6 +391,7 @@ private:
     const RHIQueueCapabilities                                           m_submissionQueueCapabilities;
     SmallVector<RHIQueueCopyCapabilities, RHICompletionSet::kQueueCount> m_queueCapabilities;
     // Populate before starting the worker; owned atomics retain stable addresses.
+    std::atomic<uint64_t>                                                m_publishedFrameNumber{0};
     SmallVector<UniquePtr<QueueProgress>, RHICompletionSet::kQueueCount> m_queueProgress;
     HeapVector<RefCountPtr<RHICommandBatch>>                             m_retired;
     // Limit idle storage after a burst. In-flight batches always retain their own lists.

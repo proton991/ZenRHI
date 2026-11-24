@@ -1,0 +1,8 @@
+#version 460
+
+layout(local_size_x=1) in;
+layout(set=1,binding=0,std430) buffer Output { uint value; } outputData;
+void main()
+{
+    outputData.value += 42;
+}

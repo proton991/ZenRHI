@@ -79,8 +79,7 @@ public:
 
     bool NeedsRecreation() const
     {
-        return m_lastResult == VK_SUBOPTIMAL_KHR || m_lastResult == VK_ERROR_OUT_OF_DATE_KHR
-            || m_lastResult == VK_ERROR_SURFACE_LOST_KHR;
+        return m_recreationRequested.load(std::memory_order_acquire);
     }
 
     // A failed query also reports true, so recreation surfaces the native error.
@@ -159,6 +158,7 @@ private:
     HeapVector<PresentSync>            m_presentSync;
     HeapVector<VulkanRetiredSwapchain> m_retiredSwapchains;
     bool                               m_hasPresentFences{false};
+    std::atomic<bool>                  m_recreationRequested{false};
     VkResult                           m_lastResult{VK_SUCCESS};
     bool                               m_acquiredSuboptimal{false};
     RHIError                           m_error{};

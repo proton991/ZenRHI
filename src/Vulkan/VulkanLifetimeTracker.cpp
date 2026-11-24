@@ -1,5 +1,6 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include <span>
+#include "ZenRHI/RHIError.h"
 #include "Vulkan/VulkanLifetimeTracker.h"
 #include "Vulkan/VulkanQueue.h"
 #include <algorithm>
@@ -230,7 +231,7 @@ void VulkanLifetimeTracker::Destroy()
         {
             Entry& entry = item.second;
 
-            ZEN_RHI_VERIFY(entry.retired);
+            VerifyTeardownOwnership(entry.retired, "Vulkan lifetime entry outlived its backend", __FILE__, __LINE__);
 
             if (entry.destroy != nullptr)
             {

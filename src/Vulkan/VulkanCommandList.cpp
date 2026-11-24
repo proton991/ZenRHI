@@ -1,3 +1,4 @@
+#include "VulkanFaultReport.h"
 #include "ZenRHI/RHIDiagnostics.h"
 #include <span>
 #include "ZenRHI/RHIOptions.h"
@@ -232,6 +233,7 @@ bool FVulkanCommandBuffer::Begin()
     m_breadcrumbNames.clear();
 
     m_openBreadcrumbs.clear();
+    m_openLabels.clear();
 
     if (m_breadcrumbBuffer != VK_NULL_HANDLE)
     {
@@ -393,10 +395,12 @@ FVulkanCommandBuffer::FVulkanCommandBuffer(FVulkanCommandBufferPool* pPool) : m_
 
 FVulkanCommandBuffer::~FVulkanCommandBuffer()
 {
-    if (m_breadcrumbBuffer != VK_NULL_HANDLE)
+    if (m_registeredForDiagnostics)
     {
         GVulkanRHI->GetDevice()->UnregisterDiagnosticBuffer(this);
-
+    }
+    if (m_breadcrumbBuffer != VK_NULL_HANDLE)
+    {
         GVkMemAllocator->FreeBuffer(m_breadcrumbBuffer, m_breadcrumbAllocation);
     }
 
@@ -410,6 +414,11 @@ void FVulkanCommandBuffer::BeginBreadcrumb(NameID name)
 {
     if (RHIOptions::GetInstance().DeviceLossDiagnostics())
     {
+        if (!m_registeredForDiagnostics)
+        {
+            GVulkanRHI->GetDevice()->RegisterDiagnosticBuffer(this);
+            m_registeredForDiagnostics = true;
+        }
         uint32_t index = UINT32_MAX;
 
         if (IsOutsideRenderPass() && m_breadcrumbNames.size() < kMaxBreadcrumbs)
@@ -426,8 +435,6 @@ void FVulkanCommandBuffer::BeginBreadcrumb(NameID name)
                                                  &m_breadcrumbAllocation))
                 {
                     std::memset(m_breadcrumbAllocation.info.pMappedData, 0, size_t(info.size));
-
-                    GVulkanRHI->GetDevice()->RegisterDiagnosticBuffer(this);
                 }
             }
 
@@ -442,6 +449,7 @@ void FVulkanCommandBuffer::BeginBreadcrumb(NameID name)
         }
 
         m_openBreadcrumbs.push_back(index);
+        m_openLabels.push_back(name);
     }
 }
 
@@ -452,6 +460,7 @@ void FVulkanCommandBuffer::EndBreadcrumb()
         const uint32_t index = m_openBreadcrumbs.back();
 
         m_openBreadcrumbs.pop_back();
+        m_openLabels.pop_back();
 
         if (index != UINT32_MAX && IsOutsideRenderPass())
         {
@@ -496,7 +505,7 @@ void FVulkanCommandBuffer::WriteBreadcrumb(uint32_t index, uint32_t value)
     }
 }
 
-void FVulkanCommandBuffer::ReportBreadcrumbs() const
+void FVulkanCommandBuffer::ReportBreadcrumbs(VulkanFaultReport& report) const
 {
     const volatile uint32_t* values = static_cast<const volatile uint32_t*>(m_breadcrumbAllocation.info.pMappedData);
 
@@ -523,8 +532,12 @@ void FVulkanCommandBuffer::ReportBreadcrumbs() const
         }
     }
 
-    std::fprintf(stderr, "RHI GPU breadcrumb queue=%u:%u buffer=%p last_started=%s last_completed=%s\n",
-                 queue->GetFamilyIndex(), queue->GetQueueIndex(), reinterpret_cast<void*>(m_vkHandle), started, completed);
+    report.Append("RHI GPU breadcrumb queue={}:{} buffer={} last_started={} last_completed={}\n", queue->GetFamilyIndex(),
+                  queue->GetQueueIndex(), reinterpret_cast<void*>(m_vkHandle), started, completed);
+    for (const NameID label : m_openLabels)
+    {
+        report.Append("open label={}\n", label.CStr());
+    }
 }
 
 void FVulkanCommandBuffer::AllocMemory()
@@ -558,8 +571,6 @@ void FVulkanCommandBuffer::AllocMemory()
 void FVulkanCommandBuffer::FreeMemory()
 {
     DiscardGPUTimings();
-
-    ReleaseGPUTimingPool();
 
     vkFreeCommandBuffers(GVulkanRHI->GetVkDevice(), m_pCmdBufferPool->GetVkHandle(), 1, &m_vkHandle);
 
@@ -759,6 +770,7 @@ void FVulkanCommandBuffer::DiscardGPUTimings()
     }
 
     m_timingScopes.clear();
+    ReleaseGPUTimingPool();
 }
 
 void FVulkanCommandBuffer::ReleaseGPUTimingPool()
@@ -954,12 +966,25 @@ VulkanWorkload* VulkanCommandContextBase::GetWorkload(WorkloadPhase phase)
     return m_pCurrentWorkload;
 }
 
-void VulkanCommandContextBase::CollectWorkloads(HeapVector<VulkanWorkload*>& outWorkloads)
+void VulkanCommandContextBase::CollectWorkloads(HeapVector<VulkanWorkload*>& outWorkloads, uint64_t* transactionOwner)
 {
     FinalizePendingWorkload();
 
+    const uint64_t                       transaction = DetachRecordingTransaction();
+    VulkanBindlessDescriptorPoolManager* manager     = GVulkanRHI->GetBindlessDescriptorPoolManager();
+    const bool                           rawOwners   = transactionOwner == nullptr && transaction != 0
+                                                    && manager->TransferTransaction(transaction, m_finalizedWorkloads.size());
+    if (transactionOwner != nullptr)
+    {
+        *transactionOwner = transaction;
+    }
     if (!m_finalizedWorkloads.empty())
     {
+        for (VulkanWorkload* workload : m_finalizedWorkloads)
+        {
+            workload->m_bindlessTransaction     = transaction;
+            workload->m_ownsBindlessTransaction = rawOwners;
+        }
         outWorkloads.push_back(m_finalizedWorkloads);
 
         m_finalizedWorkloads.clear();
@@ -997,9 +1022,8 @@ RHISubmissionResult VulkanCommandContextBase::SubmitRecordedWorkloads()
 
     HeapVector<VulkanWorkload*> workloads;
 
-    CollectWorkloads(workloads);
-
-    const uint64_t transaction = DetachRecordingTransaction();
+    uint64_t transaction = 0;
+    CollectWorkloads(workloads, &transaction);
 
     if (m_recordingError.IsFailure())
     {
@@ -1196,26 +1220,28 @@ void VulkanCommandContextBase::SetupNewCommandBuffer()
     ++m_pCmdBufferPool->m_numCmdBufferRequests;
 #endif
     FVulkanCommandBuffer* pCmdBuffer = nullptr;
-
-    for (uint32_t i = 0; i < m_pCmdBufferPool->m_cmdBuffersInUse.size(); i++)
+    FVulkanCommandBuffer* unallocated = nullptr;
+    for (FVulkanCommandBuffer* candidate : m_pCmdBufferPool->m_cmdBuffersInUse)
     {
-        FVulkanCommandBuffer* pCurrent = m_pCmdBufferPool->m_cmdBuffersInUse[i];
-
-        if (pCurrent->m_state == FVulkanCommandBuffer::State::eReadyForBegin
-            || pCurrent->m_state == FVulkanCommandBuffer::State::eNeedReset)
+        if (candidate->m_state == FVulkanCommandBuffer::State::eReadyForBegin
+            || candidate->m_state == FVulkanCommandBuffer::State::eNeedReset)
         {
-            pCmdBuffer = pCurrent;
+            pCmdBuffer = candidate;
+            break;
         }
-        else if (pCurrent->m_state == FVulkanCommandBuffer::State::eNotAllocated)
+        if (candidate->m_state == FVulkanCommandBuffer::State::eNotAllocated)
         {
-            pCurrent->AllocMemory();
-
-            pCmdBuffer = pCurrent;
+            unallocated = candidate;
         }
         else
         {
-            ZEN_RHI_VERIFY(pCurrent->IsSubmitted() || pCurrent->HasEnded());
+            ZEN_RHI_VERIFY(candidate->IsSubmitted() || candidate->HasEnded());
         }
+    }
+    if (pCmdBuffer == nullptr && unallocated != nullptr)
+    {
+        unallocated->AllocMemory();
+        pCmdBuffer = unallocated;
     }
 
     if (!pCmdBuffer)
@@ -2417,9 +2443,11 @@ RHIStatus VulkanRHI::FinalizeCommandLists(std::span<RHICommandList*>            
             // may keep bindings between calls, but pooled lists must not inherit them.
             context->ResetShaderBindings();
 
+            RHIWorkerTimer timer(RHIWorkerTime::eTranslation);
             commands->Execute();
 
-            context->CollectWorkloads(platform->m_workloads);
+            uint64_t owner = 0;
+            context->CollectWorkloads(platform->m_workloads, &owner);
 
             status.error = context->GetRecordingError();
 
@@ -2435,7 +2463,7 @@ RHIStatus VulkanRHI::FinalizeCommandLists(std::span<RHICommandList*>            
                 platform->m_workloads.back()->m_submissionBoundary = true;
             }
 
-            platform->m_transactions.push_back(context->DetachRecordingTransaction());
+            platform->m_transactions.push_back(owner);
 
             platform->m_contextWorkloadRanges.push_back(
                 {context, commands, 0, static_cast<uint32_t>(platform->m_workloads.size())});

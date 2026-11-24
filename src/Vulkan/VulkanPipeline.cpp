@@ -298,16 +298,19 @@ RHIPipeline* VulkanResourceFactory::CreatePipeline(const RHIRayTracingPipelineCr
 
 RHIPipeline* VulkanRHI::CreatePipeline(const RHIRayTracingPipelineCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::ePipeline);
     return GVulkanRHI->GetResourceFactory()->CreatePipeline(createInfo);
 }
 
 RHIPipeline* VulkanRHI::CreatePipeline(const RHIComputePipelineCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::ePipeline);
     return GVulkanRHI->GetResourceFactory()->CreatePipeline(createInfo);
 }
 
 RHIPipeline* VulkanRHI::CreatePipeline(const RHIGfxPipelineCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::ePipeline);
     return GVulkanRHI->GetResourceFactory()->CreatePipeline(createInfo);
 }
 
@@ -318,6 +321,7 @@ void VulkanRHI::DestroyPipeline(RHIPipeline* pPipeline)
 
 RHIShader* VulkanRHI::CreateShader(const RHIShaderCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::eResource);
     return GVulkanRHI->GetResourceFactory()->CreateShader(createInfo);
 }
 

@@ -1,7 +1,40 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include "ShaderReflection.h"
+#include <spirv-tools/libspirv.h>
+
 namespace zen
 {
+namespace
+{
+SpvReflectResult ReflectValidatedModule(std::span<const uint8_t> code, SpvReflectShaderModule& module)
+{
+    SpvReflectResult result = SPV_REFLECT_RESULT_ERROR_SPIRV_INVALID_CODE_SIZE;
+    if (code.size() >= 5 * sizeof(uint32_t) && code.size() % sizeof(uint32_t) == 0)
+    {
+        HeapVector<uint32_t> words(code.size() / sizeof(uint32_t));
+        std::memcpy(words.data(), code.data(), code.size());
+        // Validate IDs, operand types and instruction relationships before reflection follows them.
+        spv_context    context = spvContextCreate(SPV_ENV_UNIVERSAL_1_6);
+        spv_diagnostic diagnostic{};
+        if (context && spvValidateBinary(context, words.data(), words.size(), &diagnostic) == SPV_SUCCESS)
+        {
+            result = spvReflectCreateShaderModule(code.size(), words.data(), &module);
+        }
+        else
+        {
+            result = SPV_REFLECT_RESULT_ERROR_PARSE_FAILED;
+            if (diagnostic)
+            {
+                ZEN_RHI_LOG_ERROR("Invalid SPIR-V at word {}: {}", diagnostic->position.index, diagnostic->error);
+            }
+        }
+        spvDiagnosticDestroy(diagnostic);
+        spvContextDestroy(context);
+    }
+    return result;
+}
+} // namespace
+
 bool RHIShaderUtil::ReflectShaderGroupInfo(RHIShaderGroupSPIRVPtr spirv, uint32_t maxDescriptorSets, RHIShaderGroupInfo& output)
 {
     bool valid    = spirv != nullptr;
@@ -21,32 +54,17 @@ bool RHIShaderUtil::ReflectShaderGroupInfo(RHIShaderGroupSPIRVPtr spirv, uint32_
 
             SpvReflectShaderModule module{};
 
-            std::span<const uint8_t> code = shader.code;
-
-            const SpvReflectResult result = HasValidSpirvStructure(code)
-                                              ? spvReflectCreateShaderModule(code.size(), code.data(), &module)
-                                              : SPV_REFLECT_RESULT_ERROR_SPIRV_INVALID_CODE_SIZE;
+            const SpvReflectResult result = ReflectValidatedModule(shader.code, module);
 
             valid                         = result == SPV_REFLECT_RESULT_SUCCESS;
 
             if (valid)
             {
-                static constexpr SpvExecutionModel executionModels[] = {SpvExecutionModelVertex,
-                                                                        SpvExecutionModelTessellationControl,
-                                                                        SpvExecutionModelTessellationEvaluation,
-                                                                        SpvExecutionModelGeometry,
-                                                                        SpvExecutionModelFragment,
-                                                                        SpvExecutionModelGLCompute,
-                                                                        SpvExecutionModelRayGenerationKHR,
-                                                                        SpvExecutionModelMissKHR,
-                                                                        SpvExecutionModelClosestHitKHR,
-                                                                        SpvExecutionModelAnyHitKHR,
-                                                                        SpvExecutionModelCallableKHR};
-                static_assert(std::size(executionModels) == ToUnderlying(RHIShaderStage::eMax));
                 uint32_t count = 0;
 
-                valid = stage < RHIShaderStage::eMax && module.spirv_execution_model == executionModels[ToUnderlying(stage)]
-                     && spvReflectEnumerateDescriptorSets(&module, &count, nullptr) == SPV_REFLECT_RESULT_SUCCESS;
+                valid          = stage < RHIShaderStage::eMax
+                              && module.spirv_execution_model == kShaderExecutionModels[ToUnderlying(stage)]
+                              && spvReflectEnumerateDescriptorSets(&module, &count, nullptr) == SPV_REFLECT_RESULT_SUCCESS;
 
                 HeapVector<SpvReflectDescriptorSet*> sets(count);
 

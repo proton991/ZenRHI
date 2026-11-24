@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.23)
+cmake_minimum_required(VERSION 3.24)
 project(ZenRHITriangle LANGUAGES CXX)
 if(NOT TARGET ZenRHI::ZenRHI)
     find_package(ZenRHI 0.2 CONFIG REQUIRED)

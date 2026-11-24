@@ -6,6 +6,84 @@
 
 namespace zen
 {
+enum class RHIWorkerTime : uint8_t
+{
+    eTranslation,
+    ePipeline,
+    eResource,
+    eSubmission,
+    eWait,
+    eIdle,
+    eCallerBlocked,
+    eCount
+};
+
+using RHIWorkerTimes = std::array<uint64_t, static_cast<size_t>(RHIWorkerTime::eCount)>;
+
+// Exclusive CPU nanoseconds. A caller wait runs on the requesting thread and is independent of worker time.
+class RHIWorkerTimer
+{
+public:
+    explicit RHIWorkerTimer(RHIWorkerTime category, bool measure = true) :
+        m_enabled(measure && RHIOptions::GetInstance().WorkerTimingEnabled()), m_category(category)
+    {
+        if (m_enabled)
+        {
+            m_parent = s_active;
+            s_active = this;
+            m_start  = std::chrono::steady_clock::now();
+        }
+    }
+
+    ~RHIWorkerTimer()
+    {
+        if (m_enabled)
+        {
+            const uint64_t elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - m_start).count();
+            s_totals[static_cast<size_t>(m_category)].fetch_add(elapsed - m_children, std::memory_order_relaxed);
+            s_active = m_parent;
+            if (m_parent)
+            {
+                m_parent->m_children += elapsed;
+            }
+        }
+    }
+
+    RHIWorkerTimer(const RHIWorkerTimer&)            = delete;
+    RHIWorkerTimer& operator=(const RHIWorkerTimer&) = delete;
+
+    static RHIWorkerTimes Read()
+    {
+        RHIWorkerTimes times{};
+        if (RHIOptions::GetInstance().WorkerTimingEnabled())
+        {
+            for (size_t i = 0; i < times.size(); ++i)
+            {
+                times[i] = s_totals[i].load(std::memory_order_relaxed);
+            }
+        }
+        return times;
+    }
+
+private:
+    bool                                  m_enabled;
+    RHIWorkerTime                         m_category;
+    RHIWorkerTimer*                       m_parent{};
+    std::chrono::steady_clock::time_point m_start;
+    uint64_t                              m_children{};
+
+    static inline thread_local RHIWorkerTimer*                                                  s_active{};
+    static inline std::array<std::atomic<uint64_t>, static_cast<size_t>(RHIWorkerTime::eCount)> s_totals{};
+};
+
+template <typename Function, typename... Args>
+std::invoke_result_t<Function, Args...> TimedRHICall(RHIWorkerTime category, Function fn, Args&&... args)
+{
+    RHIWorkerTimer timer(category);
+    return fn(std::forward<Args>(args)...);
+}
+
 // Cumulative backend counters. Consumers subtract snapshots for a frame/run interval.
 struct RHIExecutionCounters
 {

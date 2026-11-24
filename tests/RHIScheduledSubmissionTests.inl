@@ -23,6 +23,23 @@ struct TestQueueFlushOrder
     HeapVector<RHICommandContextType> queues;
 };
 
+class RejectedPresentViewport : public TestViewport
+{
+public:
+    RHIStatus PrepareForPresentChecked(RHICommandList* commands) override
+    {
+        return rejectPreparation ? RHIStatus{error} : TestViewport::PrepareForPresentChecked(commands);
+    }
+
+    RHIPresentResult PresentChecked() override
+    {
+        return {RHISurfaceOutcome::eFailed, RHIPresentAcceptance::eRejected, error, false};
+    }
+
+    bool     rejectPreparation{};
+    RHIError error = MakeRHIError(RHIErrorCode::eOutOfDeviceMemory, "test presentation", __FILE__, __LINE__);
+};
+
 class RHIScheduledSubmissionTest : public testing::TestWithParam<std::tuple<RHIExecutionMode, bool>>
 {
 protected:
@@ -40,6 +57,10 @@ protected:
 
     void TearDown() override
     {
+        if (rejectedSurface)
+        {
+            rejectedSurface->ReleaseForTeardown();
+        }
         viewport.ReleaseForTeardown();
         executor->Destroy();
         ZEN_DELETE(executor);
@@ -106,6 +127,7 @@ protected:
     TestRHI*                rhi{nullptr};
     RHICommandListExecutor* executor{nullptr};
     TestViewport            viewport;
+    std::optional<RejectedPresentViewport> rejectedSurface;
 };
 
 TEST_P(RHIScheduledSubmissionTest, ReadyGroupsSubmitInOrderAndRetainExactLogicalSerials)
@@ -468,6 +490,41 @@ INSTANTIATE_TEST_SUITE_P(InlineThreadedAndAliases,
                          testing::Combine(testing::Values(RHIExecutionMode::eInline, RHIExecutionMode::eThreaded),
                                           testing::Bool()));
 
+TEST_P(RHIScheduledSubmissionTest, PresentRejectionPreservesAcceptedRendering)
+{
+    RejectedPresentViewport&                    surface = rejectedSurface.emplace();
+    const SmallVector<RHICommandContextType, 1> queues{RHICommandContextType::eGraphics};
+    TestOwnedSchedule                           schedule(*executor, queues);
+    schedule.lists[0]->Draw(3, 1, 0, 0);
+    const RHIBatchResult result = executor->SubmitFrame(schedule.groups, &surface, schedule.state).Wait();
+    EXPECT_EQ(result.presentation.error.code, surface.error.code);
+    EXPECT_FALSE(result.presented);
+    EXPECT_EQ(result.submission, RHISubmissionResult::eSuccess);
+    RHISubmissionDependency point;
+    EXPECT_EQ(schedule.state->Resolve(0, point), RHISubmissionPointStatus::eAccepted);
+    EXPECT_FALSE(executor->AreSubmissionsBlocked());
+    EXPECT_EQ(ToValue(GRHIFrameState.GetFrameNumber()), 1u);
+    RHISubmissionTicket next = executor->SubmitFrame(schedule.groups, &viewport);
+    EXPECT_TRUE(next.IsValid());
+    if (next.IsValid())
+    {
+        EXPECT_TRUE(next.Wait().presented);
+    }
+}
+
+TEST_P(RHIScheduledSubmissionTest, GroupPreservesPresentPreparationCause)
+{
+    RejectedPresentViewport& surface = rejectedSurface.emplace();
+    surface.rejectPreparation        = true;
+    const SmallVector<RHICommandContextType, 1> queues{RHICommandContextType::eGraphics};
+    TestOwnedSchedule                           schedule(*executor, queues);
+    schedule.lists[0]->Draw(3, 1, 0, 0);
+    const RHIBatchResult result = executor->SubmitFrame(schedule.groups, &surface, schedule.state).Wait();
+    ASSERT_EQ(result.groups.size(), 1u);
+    EXPECT_EQ(result.cause.code, surface.error.code);
+    EXPECT_EQ(result.groups[0].cause.code, surface.error.code);
+}
+
 TEST_P(RHIScheduledSubmissionTest, PresentationRejectionAfterComputeIsFatalAndRetainsOwners)
 {
     const SmallVector<RHICommandContextType, 1> queues{RHICommandContextType::eAsyncCompute};
@@ -552,5 +609,18 @@ TEST_P(RHIScheduledSubmissionTest, FirstFrameGroupRejectionBlocksSubsequentFrame
     EXPECT_EQ(viewport.preparePresents, 0u);
     EXPECT_TRUE(executor->AreSubmissionsBlocked());
     EXPECT_FALSE(executor->SubmitFrame(schedule.groups, &viewport).IsValid());
+    const RHIBatchResult blocked = executor->SubmitGroups(schedule.groups, {});
+    EXPECT_EQ(blocked.cause.code, executor->GetTerminalError().code);
+}
+
+TEST_F(RHIExecutorTest, ShutdownRejectsNewGroupsBeforeTakingOwnership)
+{
+    executor->Destroy();
+    const HeapVector<RHICommandContextType> queues;
+    RefCountPtr<RHISubmissionState>         state  = MakeRefCountPtr<RHISubmissionState>(queues);
+    const RHIBatchResult                    result = executor->SubmitGroups({}, state);
+    EXPECT_EQ(result.submission, RHISubmissionResult::eRejected);
+    EXPECT_EQ(result.cause.code, RHIErrorCode::eCancelled);
+    EXPECT_FALSE(state->IsQueued());
 }
 } // namespace

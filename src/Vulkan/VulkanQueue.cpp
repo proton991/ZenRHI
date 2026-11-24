@@ -29,11 +29,23 @@ VulkanQueue::VulkanQueue(VulkanDevice* pDevice, uint32_t familyIndex, uint32_t q
     if (m_pDevice->SupportsTimelineSemaphore())
     {
         m_pTimelineSemaphore = ZEN_NEW() VulkanSemaphore(m_pDevice, VK_SEMAPHORE_TYPE_TIMELINE, 0);
-
-        ZEN_RHI_VERIFY_MSG_F(!m_pTimelineSemaphore->GetError().IsFailure(),
-                             "Required queue timeline semaphore creation failed: {}",
-                             m_pTimelineSemaphore->GetError().nativeCode);
     }
+}
+
+RHIError VulkanQueue::GetCreationError() const
+{
+    RHIError error;
+    if (!m_handle)
+    {
+        error = MakeRHIError(RHIErrorCode::eBackendFailure, "vkGetDeviceQueue", __FILE__, __LINE__);
+    }
+    else if (m_pDevice->SupportsTimelineSemaphore())
+    {
+        error = m_pTimelineSemaphore
+                  ? m_pTimelineSemaphore->GetError()
+                  : MakeRHIError(RHIErrorCode::eOutOfHostMemory, "Allocate queue timeline semaphore", __FILE__, __LINE__);
+    }
+    return error;
 }
 
 VulkanQueue::~VulkanQueue()
@@ -188,6 +200,12 @@ void VulkanQueue::ReleaseWorkload(VulkanWorkload* pWorkload)
         pWorkload->m_lifetimeIds.clear();
 
         pWorkload->m_resources.Reset();
+        if (pWorkload->m_ownsBindlessTransaction)
+        {
+            GVulkanRHI->GetBindlessDescriptorPoolManager()->ReleaseTransferredTransaction(pWorkload->m_bindlessTransaction);
+        }
+        pWorkload->m_bindlessTransaction     = 0;
+        pWorkload->m_ownsBindlessTransaction = false;
 
         pWorkload->m_submissionSerial   = 0;
 
@@ -214,6 +232,10 @@ void VulkanQueue::DestroyWorkload(VulkanWorkload* pWorkload)
 {
     if (pWorkload != nullptr)
     {
+        if (pWorkload->m_ownsBindlessTransaction)
+        {
+            GVulkanRHI->GetBindlessDescriptorPoolManager()->ReleaseTransferredTransaction(pWorkload->m_bindlessTransaction);
+        }
         GVulkanRHI->GetLifetimeTracker().ReleaseRecordings(pWorkload->m_lifetimeIds);
 
         pWorkload->m_lifetimeIds.clear();
@@ -359,7 +381,8 @@ RHISubmissionResult VulkanQueue::SubmitWorkloadsWithFences(uint64_t& lastSubmiss
 
         GVulkanRHI->GetExecutionCounterStorage().Increment(GVulkanRHI->GetExecutionCounterStorage().submissions);
 
-        const VkResult result = vkQueueSubmit(m_handle, 1, &submitInfo, submitFence);
+        PrepareBindlessWrites(MakeVecView(&pWorkload, 1));
+        const VkResult result = TimedRHICall(RHIWorkerTime::eSubmission, vkQueueSubmit, m_handle, 1, &submitInfo, submitFence);
 
         if (result != VK_SUCCESS)
         {
@@ -526,9 +549,41 @@ void VulkanQueue::AppendTimelineSubmitWorkload(VulkanWorkload* pWorkload, Timeli
     outSubmitBatch.submitInfos.emplace_back(submitInfo);
 }
 
+void VulkanQueue::PrepareBindlessWrites(std::span<VulkanWorkload*> workloads)
+{
+    VulkanBindlessDescriptorPoolManager* manager = GVulkanRHI->GetBindlessDescriptorPoolManager();
+    bool                                 staged  = false;
+    for (const VulkanWorkload* workload : workloads)
+    {
+        if (workload->m_bindlessTransaction != 0)
+        {
+            manager->PrepareTransaction(workload->m_bindlessTransaction);
+            staged = true;
+        }
+    }
+    if (staged)
+    {
+        manager->Flush();
+    }
+}
+
+void VulkanQueue::AcceptTransferredTransactions(VulkanWorkload* workload)
+{
+    if (workload->m_ownsBindlessTransaction)
+    {
+        GVulkanRHI->GetBindlessDescriptorPoolManager()->ResolveTransaction(workload->m_bindlessTransaction, true);
+        workload->m_ownsBindlessTransaction = false;
+    }
+    for (VulkanWorkload* merged : workload->m_mergedWorkloads)
+    {
+        AcceptTransferredTransactions(merged);
+    }
+}
+
 void VulkanQueue::QueueSubmittedWorkload(VulkanWorkload* pWorkload, uint64_t submissionSerial)
 {
     pWorkload->m_submissionSerial = submissionSerial;
+    AcceptTransferredTransactions(pWorkload);
 
     // One acceptance path for every tracked resource, including merged recordings.
     GVulkanRHI->GetLifetimeTracker().SubmitRecordings(pWorkload->m_lifetimeIds, this, submissionSerial);
@@ -579,6 +634,7 @@ RHISubmissionResult VulkanQueue::SubmitWorkloadsWithTimelineSemaphore(uint64_t& 
     {
         WorkloadMergeResult mergeResult;
 
+        PrepareBindlessWrites(workloadsToSubmit);
         MergeWorkloads(workloadsToSubmit, mergeResult);
 
         TimelineSubmitBatch submitBatch;
@@ -587,8 +643,9 @@ RHISubmissionResult VulkanQueue::SubmitWorkloadsWithTimelineSemaphore(uint64_t& 
 
         GVulkanRHI->GetExecutionCounterStorage().Increment(GVulkanRHI->GetExecutionCounterStorage().submissions);
 
-        const VkResult result = vkQueueSubmit(m_handle, static_cast<uint32_t>(submitBatch.submitInfos.size()),
-                                              submitBatch.submitInfos.data(), VK_NULL_HANDLE);
+        const VkResult result =
+            TimedRHICall(RHIWorkerTime::eSubmission, vkQueueSubmit, m_handle,
+                         static_cast<uint32_t>(submitBatch.submitInfos.size()), submitBatch.submitInfos.data(), VK_NULL_HANDLE);
 
         if (result != VK_SUCCESS)
         {
@@ -720,11 +777,6 @@ void VulkanQueue::ProcessPendingWorkloads(uint64_t timeToWaitNS, uint64_t maxSub
                     completedValue = pWorkload->m_submissionSerial;
                 }
             }
-
-            if (result == VK_SUCCESS)
-            {
-                m_lastCompletedSerial = std::max(m_lastCompletedSerial.load(), completedValue);
-            }
         }
         else
         {
@@ -760,12 +812,9 @@ void VulkanQueue::ProcessPendingWorkloads(uint64_t timeToWaitNS, uint64_t maxSub
             AppendCommandBufferPool(cmdBufferPoolsToTrim, pCmdBuffer->GetCommandBufferPool());
         }
 
-        if (m_lastCompletedSerial < pWorkload->m_submissionSerial)
-        {
-            m_lastCompletedSerial = pWorkload->m_submissionSerial;
-        }
-
+        const uint64_t retired = pWorkload->m_submissionSerial;
         ReleaseWorkload(pWorkload);
+        m_lastCompletedSerial.store(retired, std::memory_order_release);
     }
 
     // Trim once per pool after retiring all currently completed workloads.

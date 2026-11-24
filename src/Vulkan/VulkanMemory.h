@@ -22,7 +22,11 @@ public:
 
     ~VulkanMemoryAllocator();
 
-    void Init(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, bool bufferDeviceAddress, bool memoryBudget = false);
+    VkResult Init(VkInstance       instance,
+                  VkPhysicalDevice gpu,
+                  VkDevice         device,
+                  bool             bufferDeviceAddress,
+                  bool             memoryBudget = false);
 
     void BeginFrame(uint32_t frame);
 

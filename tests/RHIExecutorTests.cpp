@@ -195,6 +195,61 @@ TEST_F(RHIExecutorTest, RejectionStopsAlreadyQueuedDependentBatches)
     EXPECT_EQ(rhi->graphics.drawCount, 0u);
 }
 
+namespace
+{
+struct CancellationFrameProbe
+{
+    static inline std::string message;
+    static void               Capture(RHIMessageSeverity, std::string_view text) noexcept
+    {
+        if (text.starts_with("RHI stopped at frame"))
+        {
+            message.assign(text);
+        }
+    }
+
+    void Advance()
+    {
+        GRHIFrameState.Advance();
+        started.Signal();
+        while (!done.load(std::memory_order_relaxed))
+        {
+            GRHIFrameState.Advance();
+        }
+    }
+    RHIThreadEvent    started;
+    std::atomic<bool> done{};
+};
+} // namespace
+
+TEST_F(RHIExecutorTest, CancellationPrintsOneCoherentFrameWhileWorkerAdvances)
+{
+    executor->EndFrame();
+    executor->FlushRHIThread();
+    const uint64_t           publishedFrame = ToValue(GRHIFrameState.GetFrameNumber());
+    CancellationFrameProbe   probe;
+    const RHIMessageCallback previous = GetRHIMessageCallback();
+    CancellationFrameProbe::message.clear();
+    SetRHIMessageCallback(CancellationFrameProbe::Capture);
+    GetRHIThread().Dispatch(std::bind_front(&CancellationFrameProbe::Advance, &probe));
+    probe.started.Wait();
+    std::thread stopper([] { GetRHIThread().Stop(); });
+    while (!GetRHIThread().IsStopping())
+    {
+        std::this_thread::yield();
+    }
+    const RHIBatchResult result = executor->SubmitGroups({}, {});
+    probe.done.store(true);
+    stopper.join();
+    SetRHIMessageCallback(previous);
+    EXPECT_EQ(result.cause.code, RHIErrorCode::eCancelled);
+    unsigned long long frame = 0;
+    unsigned int       slot  = 0;
+    ASSERT_EQ(std::sscanf(CancellationFrameProbe::message.c_str(), "RHI stopped at frame %llu (slot %u)", &frame, &slot), 2);
+    EXPECT_EQ(frame, publishedFrame);
+    EXPECT_EQ(frame % GRHIFrameState.GetNumFramesInFlight(), slot);
+}
+
 TEST_F(RHIExecutorTest, RollbackReleasesNewReferencesAndKeepsEarlierCommands)
 {
     RHIBufferCreateInfo info{};

@@ -18,7 +18,20 @@ struct [[nodiscard]] RHIProgressResult
 };
 
 class DynamicRHI;
-DynamicRHI* CreateRHI(const RHIDeviceDesc& description);
+struct RHIAdapterInfo
+{
+    std::string name;
+    uint32_t    vendorID{};
+    uint32_t    deviceID{};
+    uint32_t    driverVersion{};
+    uint32_t    apiVersion{};
+    std::string unsupportedReason;
+};
+
+// Startup calls are externally serialized. Enumeration needs no logical device.
+RHIResult<std::vector<RHIAdapterInfo>> EnumerateRHIAdapters(const RHIDeviceDesc& description);
+RHIResult<DynamicRHI*>                 CreateRHIChecked(const RHIDeviceDesc& description);
+DynamicRHI*                            CreateRHI(const RHIDeviceDesc& description);
 
 class DynamicRHI
 {
@@ -131,6 +144,12 @@ public:
     virtual RHIPipeline* CreatePipeline(const RHIRayTracingPipelineCreateInfo& createInfo)
     {
         return nullptr;
+    }
+
+    // Snapshot a healthy device. The caller bounds the complete blob and owns its persistence.
+    virtual RHIError SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes)
+    {
+        return MakeRHIError(RHIErrorCode::eUnsupported, "SnapshotPipelineCache", __FILE__, __LINE__);
     }
 
     virtual void DestroyPipeline(RHIPipeline* pPipeline)                      = 0;

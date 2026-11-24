@@ -60,6 +60,7 @@ uint64_t QueryBufferAllocationSize(const VkBufferCreateInfo& info)
 
 RHIBuffer* VulkanRHI::CreateBuffer(const RHIBufferCreateInfo& createInfo)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::eResource);
     return GVulkanRHI->GetResourceFactory()->CreateBuffer(createInfo);
 }
 

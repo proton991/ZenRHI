@@ -413,6 +413,64 @@ TEST_P(VulkanQueueWaitTest, StopsAtRequestedSerialAndDoesNotWaitDuringPolling)
     });
 }
 
+TEST_P(VulkanQueueWaitTest, BoundedWaitRetiresOnlyTheRequestedPrefix)
+{
+    WithQueue([](zen::VulkanQueue& queue) {
+        QueueDriver::completed = 3;
+        EXPECT_TRUE(queue.WaitForCompletion(1, 0));
+        EXPECT_EQ(queue.GetLastCompletedSerial(), 1u);
+        EXPECT_TRUE(queue.WaitForCompletion(3, 0));
+        EXPECT_EQ(queue.GetLastCompletedSerial(), 3u);
+    });
+}
+
+TEST(VulkanFencePoolTest, ReusedFenceMatchesItsRequestedNativeState)
+{
+    zen::test::VulkanSession session;
+    zen::VulkanDevice&       device  = *session.rhi.GetDevice();
+    zen::VulkanFenceManager& manager = *device.GetFenceManager();
+    zen::VulkanFence*        fence   = manager.CreateFence();
+    ASSERT_NE(fence, nullptr);
+    manager.ReleaseFence(fence);
+    fence = manager.CreateFence(true);
+    ASSERT_NE(fence, nullptr);
+    EXPECT_EQ(vkGetFenceStatus(device.GetVkHandle(), fence->GetVkHandle()), VK_SUCCESS);
+    manager.ReleaseFence(fence);
+}
+
+TEST(VulkanFencePoolTest, UnpolledGpuSignalIsResetBeforeReuse)
+{
+    zen::test::VulkanSession session;
+    zen::VulkanDevice&       device  = *session.rhi.GetDevice();
+    zen::VulkanFenceManager& manager = *device.GetFenceManager();
+    zen::VulkanFence*        fence   = manager.CreateFence();
+    ASSERT_NE(fence, nullptr);
+    ASSERT_EQ(vkQueueSubmit(device.GetGfxQueue()->GetVkHandle(), 0, nullptr, fence->GetVkHandle()), VK_SUCCESS);
+    ASSERT_EQ(vkDeviceWaitIdle(device.GetVkHandle()), VK_SUCCESS);
+    manager.ReleaseFence(fence);
+    fence = manager.CreateFence();
+    ASSERT_NE(fence, nullptr);
+    EXPECT_EQ(vkGetFenceStatus(device.GetVkHandle(), fence->GetVkHandle()), VK_NOT_READY);
+    manager.ReleaseFence(fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LoseFenceReset(VkDevice, uint32_t, const VkFence*)
+{
+    return VK_ERROR_DEVICE_LOST;
+}
+
+TEST(VulkanFencePoolTest, LostDeviceDuringResetDiscardsFence)
+{
+    zen::test::VulkanSession session;
+    zen::VulkanFenceManager& manager = *session.rhi.GetDevice()->GetFenceManager();
+    zen::VulkanFence*        fence   = manager.CreateFence(true);
+    ASSERT_NE(fence, nullptr);
+    ScopedVulkanFunction failure(vkResetFences, LoseFenceReset);
+    manager.ReleaseFence(fence);
+    EXPECT_TRUE(session.rhi.HasDeviceLoss());
+    EXPECT_EQ(session.rhi.GetTerminalError().code, zen::RHIErrorCode::eDeviceLost);
+}
+
 TEST_P(VulkanQueueWaitTest, TimeoutDoesNotBlockSubmissionsOrPublishCompletion)
 {
     WithQueue(&VulkanQueueWaitTest::CheckTimeout);

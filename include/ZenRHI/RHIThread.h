@@ -15,6 +15,7 @@
 #include <atomic>
 #include "ZenFoundation/Utils/Errors.h"
 #include "RHIError.h"
+#include "RHIExecutionCounters.h"
 
 namespace zen
 {
@@ -22,6 +23,14 @@ enum class RHIExecutionMode
 {
     eInline,
     eThreaded
+};
+
+struct RHIThreadActivity
+{
+    std::atomic<uint64_t> completed{};
+    std::atomic<uint64_t> queued{};
+    std::atomic<int64_t>  taskStartedMS{};
+    std::atomic<uint32_t> threadID{};
 };
 
 // Manual-reset event. Windows waits service sent messages required by Vulkan WSI.
@@ -42,6 +51,7 @@ public:
     void Reset();
 
     void Wait() const;
+    void Wait(const char* operation, const RHIThreadActivity& activity) const;
 
 private:
 #if defined(ZEN_WIN32)
@@ -109,6 +119,11 @@ public:
 
     bool IsCurrentThread() const;
 
+    const RHIThreadActivity& GetActivity() const
+    {
+        return m_activity;
+    }
+
     void CheckOwnership() const;
 
     bool HasTaskFailure() const;
@@ -130,6 +145,8 @@ public:
     template <typename Function, typename... Args>
     RHIResult<std::invoke_result_t<Function, Args...>> InvokeChecked(Function&& function, Args&&... args)
     {
+        RHIWorkerTimer blocked(RHIWorkerTime::eCallerBlocked,
+                               RHIOptions::GetInstance().WorkerTimingEnabled() && !IsCurrentThread());
         using Value                                                 = std::invoke_result_t<Function, Args...>;
         using Result                                                = RHIResult<Value>;
         SharedPtr<std::promise<Result>, MultiThreadCounter> promise = MakeShared<std::promise<Result>, MultiThreadCounter>();
@@ -169,7 +186,7 @@ public:
 
         if (admission)
         {
-            completion->Wait();
+            completion->Wait("synchronous RHI call", m_activity);
         }
 
         return future.get();
@@ -200,11 +217,12 @@ private:
                 completion->Signal();
             });
         ZEN_RHI_VERIFY_MSG(accepted, "Synchronous RHI invocation after cleanup admission closed");
-        completion->Wait();
+        completion->Wait("synchronous RHI call", m_activity);
         return result.get();
     }
 
-    void Run();
+    void              Run();
+    RHIThreadActivity m_activity;
 
     struct Task
     {
@@ -227,6 +245,9 @@ private:
     mutable std::mutex             m_mutex;
     std::condition_variable        m_available;
     RHIThreadEvent                 m_space{true};
+#if !defined(ZEN_WIN32)
+    RHIThreadEvent m_workerExited;
+#endif
     Queue<Task>                    m_tasks;
     std::function<void()>          m_finalizer;
     size_t                         m_capacity{64};

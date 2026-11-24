@@ -48,6 +48,8 @@ foreach(shader IN ITEMS
     binding_push_constants.comp
     recording_uniform.frag
     recording_uniform.comp
+    review_matrix.vert
+    review_array.vert
     recording_vertex.vert
     async_resources.comp
     binding_texel.comp
@@ -87,7 +89,7 @@ add_executable(ZenRHIVulkanTests
     VulkanQueueSelectionTests.cpp)
 target_link_libraries(ZenRHIVulkanTests PRIVATE GTest::gtest_main)
 
-if(TARGET spirv-reflect)
+if(TARGET spirv-reflect AND NOT ZENRHI_INSTALL)
     target_link_libraries(ZenRHIVulkanTests PRIVATE spirv-reflect)
 else()
     target_include_directories(ZenRHIVulkanTests PRIVATE "${spirv_reflect_SOURCE_DIR}")
@@ -105,6 +107,7 @@ add_executable(ZenRHIVulkanIntegrationTests
     VulkanShaderLayoutIntegrationTests.cpp
     VulkanCommandValidationIntegrationTests.cpp
     VulkanSwapchainIntegrationTests.cpp
+    VulkanValidationProbe.cpp
     VulkanProductionFailureTests.cpp
     VulkanBindingIntegrationTests.cpp
     VulkanCapabilityIntegrationTests.cpp
@@ -133,13 +136,21 @@ endforeach()
 set_tests_properties(ZenRHICoreTests ZenRHIVulkanTests PROPERTIES LABELS unit)
 set_tests_properties(ZenRHIVulkanIntegrationTests PROPERTIES LABELS "vulkan;integration" TIMEOUT 300)
 
+option(ZENRHI_RUN_INSTALLED_TESTS "Execute the relocated SDK programs on a native desktop" OFF)
 if(ZENRHI_INSTALL AND ZenFoundation_DIR)
     add_test(NAME ZenRHIRelocatedConsumer COMMAND "${CMAKE_COMMAND}"
         "-DRHI_BUILD=${ZenRHI_BINARY_DIR}" "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/package"
+        "-DRUN_INSTALLED_TESTS=${ZENRHI_RUN_INSTALLED_TESTS}" "-DSDL3_DIR=${SDL3_DIR}"
         "-DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/consumer" "-DGENERATOR=${CMAKE_GENERATOR}"
         "-DFOUNDATION_DIR=${ZenFoundation_DIR}" "-DSPDLOG_DIR=${spdlog_DIR}" "-DCONFIG=$<CONFIG>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/RelocatedConsumer.cmake")
-    set_tests_properties(ZenRHIRelocatedConsumer PROPERTIES LABELS package)
+    add_test(NAME ZenRHIEmbeddedPackage COMMAND "${CMAKE_COMMAND}" -S "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embedded"
+        -B "${CMAKE_CURRENT_BINARY_DIR}/embedded-package" -G "${CMAKE_GENERATOR}" "-DCMAKE_BUILD_TYPE=$<CONFIG>"
+        "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}" "-DZenFoundation_DIR=${ZenFoundation_DIR}" "-Dspdlog_DIR=${spdlog_DIR}"
+        "-DFETCHCONTENT_SOURCE_DIR_SPIRV_REFLECT=${spirv_reflect_SOURCE_DIR}" "-DFETCHCONTENT_SOURCE_DIR_VOLK=${volk_SOURCE_DIR}"
+        "-DFETCHCONTENT_SOURCE_DIR_VMA=${vma_SOURCE_DIR}")
+
+    set_tests_properties(ZenRHIRelocatedConsumer ZenRHIEmbeddedPackage PROPERTIES LABELS package)
 endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -147,3 +158,18 @@ add_test(NAME ZenRHIPublicAPI COMMAND "${Python3_EXECUTABLE}" "${ZenRHI_SOURCE_D
     --foundation-include "$<TARGET_PROPERTY:ZenFoundation::Foundation,INTERFACE_INCLUDE_DIRECTORIES>" COMMAND_EXPAND_LISTS)
 add_test(NAME ZenRHIPublicAPIChecker COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/test_public_api.py")
 set_tests_properties(ZenRHIPublicAPI ZenRHIPublicAPIChecker PROPERTIES LABELS policy)
+
+option(ZENRHI_BUILD_REFLECTION_FUZZER "Build the MSVC libFuzzer shader-reflection target" OFF)
+if(ZENRHI_BUILD_REFLECTION_FUZZER AND MSVC)
+    add_executable(ZenRHIReflectionFuzzer ReflectionFuzzer.cpp)
+    target_link_libraries(ZenRHIReflectionFuzzer PRIVATE ZenRHI::Core Vulkan::SPIRV-Tools)
+    # Keep coverage instrumentation and libFuzzer's default main out of the SDK and unit-test binaries.
+    target_sources(ZenRHIReflectionFuzzer PRIVATE "../src/Core/RHIShaderUtil.cpp")
+    if(TARGET spirv-reflect AND NOT ZENRHI_INSTALL)
+        target_link_libraries(ZenRHIReflectionFuzzer PRIVATE spirv-reflect)
+    else()
+        target_sources(ZenRHIReflectionFuzzer PRIVATE "${spirv_reflect_SOURCE_DIR}/spirv_reflect.c")
+        target_include_directories(ZenRHIReflectionFuzzer PRIVATE "${spirv_reflect_SOURCE_DIR}")
+    endif()
+    target_compile_options(ZenRHIReflectionFuzzer PRIVATE /fsanitize=fuzzer)
+endif()

@@ -48,9 +48,10 @@ public:
     explicit VulkanDevice(VkPhysicalDevice gpu);
 
     // Empty means the device satisfies the backend's minimum capability profile.
-    static std::string GetUnsupportedReason(VkPhysicalDevice gpu);
+    static std::string GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* error = nullptr);
 
-    void Init();
+    void     Init();
+    RHIError InitChecked();
 
     void Destroy();
 
@@ -175,7 +176,8 @@ public:
     void WaitForIdle();
 
 private:
-    void SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& extensions);
+    RHIError InitializeSupportedDevice();
+    RHIError SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& extensions);
 
     VkPhysicalDevice m_gpu{VK_NULL_HANDLE};
 

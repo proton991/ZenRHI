@@ -15,6 +15,7 @@
 #include "Vulkan/VulkanDescriptorPool.h"
 
 #include <algorithm>
+#include "VulkanFaultReport.h"
 
 namespace zen
 {
@@ -53,21 +54,107 @@ void VulkanDevice::UnregisterDiagnosticBuffer(FVulkanCommandBuffer* buffer)
                               m_diagnosticBuffers.end());
 }
 
+namespace
+{
+// Device cache files contain the driver bytes followed by their length and checksum, both little endian on Windows x64.
+struct CacheTrailer
+{
+    uint64_t length;
+    uint64_t checksum;
+};
+
+uint64_t CacheChecksum(std::span<const uint8_t> data)
+{
+    uint64_t hash = 14695981039346656037ull;
+    for (uint8_t byte : data)
+    {
+        hash = (hash ^ byte) * 1099511628211ull;
+    }
+    return hash;
+}
+
+std::span<const uint8_t> CachePayload(std::span<const uint8_t> seed, const VkPhysicalDeviceProperties& gpu)
+{
+    std::span<const uint8_t> payload;
+    if (seed.size() >= sizeof(VkPipelineCacheHeaderVersionOne) + sizeof(CacheTrailer))
+    {
+        VkPipelineCacheHeaderVersionOne header{};
+        CacheTrailer                    trailer{};
+        const size_t                    length = seed.size() - sizeof(trailer);
+        std::memcpy(&header, seed.data(), sizeof(header));
+        std::memcpy(&trailer, seed.data() + length, sizeof(trailer));
+        if (trailer.length == length && header.headerSize == sizeof(header)
+            && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && header.vendorID == gpu.vendorID
+            && header.deviceID == gpu.deviceID
+            && std::memcmp(header.pipelineCacheUUID, gpu.pipelineCacheUUID, VK_UUID_SIZE) == 0
+            && trailer.checksum == CacheChecksum(seed.first(length)))
+        {
+            payload = seed.first(length);
+        }
+    }
+    return payload;
+}
+} // namespace
+
+RHIError VulkanRHI::SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes)
+{
+    RHIError              error = GetTerminalError();
+    const VkPipelineCache cache = m_pDevice->GetPipelineCache();
+    size_t                size{};
+    if (!error.IsFailure() && cache == VK_NULL_HANDLE)
+    {
+        error = MakeRHIError(RHIErrorCode::eUnsupported, "Device has no pipeline cache", __FILE__, __LINE__);
+    }
+    if (!error.IsFailure())
+    {
+        error = MakeVulkanError(vkGetPipelineCacheData(GetVkDevice(), cache, &size, nullptr), "Query pipeline cache size");
+        if (!error.IsFailure()
+            && (size < sizeof(VkPipelineCacheHeaderVersionOne) || size > byteLimit || byteLimit - size < sizeof(CacheTrailer)))
+        {
+            error =
+                MakeRHIError(RHIErrorCode::eInvalidArgument, "Pipeline cache outside snapshot size limit", __FILE__, __LINE__);
+        }
+    }
+    if (!error.IsFailure())
+    {
+        std::vector<uint8_t> snapshot(size + sizeof(CacheTrailer));
+        const VkResult       result = vkGetPipelineCacheData(GetVkDevice(), cache, &size, snapshot.data());
+        if (result == VK_SUCCESS)
+        {
+            const CacheTrailer trailer{size, CacheChecksum(std::span(snapshot).first(size))};
+            snapshot.resize(size + sizeof(trailer));
+            std::memcpy(snapshot.data() + size, &trailer, sizeof(trailer));
+            bytes.swap(snapshot);
+        }
+        else
+        {
+            error = result == VK_INCOMPLETE ? RHIError{RHIErrorCode::eBackendFailure, result,
+                                                       "Incomplete pipeline cache snapshot", __FILE__, __LINE__}
+                                            : MakeVulkanError(result, "vkGetPipelineCacheData");
+        }
+    }
+    return error;
+}
+
 void VulkanDevice::ReportDeviceLoss(const char* operation)
 {
     if (!m_faultReported)
     {
         m_faultReported = true;
 
-        std::fprintf(stderr, "RHI device lost: operation=%s gpu=%s vendor=%u device=%u driver=%u\n", operation,
-                     m_gpuProps.deviceName, m_gpuProps.vendorID, m_gpuProps.deviceID, m_gpuProps.driverVersion);
-
-        for (const FVulkanCommandBuffer* buffer : m_diagnosticBuffers)
+        VulkanFaultReport report;
+        report.Append("RHI device lost: operation={} gpu={} vendor={} device={} driver={}\n", operation, m_gpuProps.deviceName,
+                      m_gpuProps.vendorID, m_gpuProps.deviceID, m_gpuProps.driverVersion);
+        for (uint32_t i = 0; i < ToUnderlying(RHICommandContextType::eMax); ++i)
         {
-            buffer->ReportBreadcrumbs();
+            const VulkanQueue* queue = GetQueue(static_cast<RHICommandContextType>(i));
+            if (queue)
+            {
+                report.Append("queue={}:{} submitted={} completed={}\n", queue->GetFamilyIndex(), queue->GetQueueIndex(),
+                              queue->GetLastSubmittedSerial(), queue->GetLastCompletedSerial());
+            }
         }
-
-        if (m_extensionFlags.hasDeviceFault && vkGetDeviceFaultInfoEXT != nullptr
+        if (m_device && m_extensionFlags.hasDeviceFault && vkGetDeviceFaultInfoEXT != nullptr
             && RHIOptions::GetInstance().DeviceLossDiagnostics())
         {
             // Fixed storage remains usable after allocation failure. VK_INCOMPLETE
@@ -78,37 +165,39 @@ void VulkanDevice::ReportDeviceLoss(const char* operation)
 
             VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
 
-            counts.addressInfoCount = 64;
-
-            counts.vendorInfoCount  = 16;
-
+            VkResult             result = vkGetDeviceFaultInfoEXT(m_device, &counts, nullptr);
             VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
-
-            info.pAddressInfos    = addresses;
-
-            info.pVendorInfos     = vendors;
-
-            const VkResult result = vkGetDeviceFaultInfoEXT(m_device, &counts, &info);
-
-            std::fprintf(stderr, "RHI device fault result=%d description=%s\n", int(result), info.description);
-
+            if (result == VK_SUCCESS)
+            {
+                counts.addressInfoCount = std::min(counts.addressInfoCount, 64u);
+                counts.vendorInfoCount  = std::min(counts.vendorInfoCount, 16u);
+                counts.vendorBinarySize = 0;
+                info.pAddressInfos      = addresses;
+                info.pVendorInfos       = vendors;
+                result                  = vkGetDeviceFaultInfoEXT(m_device, &counts, &info);
+            }
+            if (result != VK_SUCCESS && result != VK_INCOMPLETE)
+            {
+                counts.addressInfoCount = counts.vendorInfoCount = 0;
+                info.description[0]                              = 0;
+            }
+            report.Append("RHI device fault result={} description={}\n", int(result), info.description);
             for (uint32_t i = 0; i < std::min(counts.addressInfoCount, 64u); ++i)
             {
-                std::fprintf(stderr, "fault address=%llu precision=%llu type=%u\n",
-                             static_cast<unsigned long long>(addresses[i].reportedAddress),
-                             static_cast<unsigned long long>(addresses[i].addressPrecision),
-                             uint32_t(addresses[i].addressType));
+                report.Append("fault address={} precision={} type={}\n", addresses[i].reportedAddress,
+                              addresses[i].addressPrecision, uint32_t(addresses[i].addressType));
             }
-
             for (uint32_t i = 0; i < std::min(counts.vendorInfoCount, 16u); ++i)
             {
-                std::fprintf(stderr, "vendor fault=%s code=%llu data=%llu\n", vendors[i].description,
-                             static_cast<unsigned long long>(vendors[i].vendorFaultCode),
-                             static_cast<unsigned long long>(vendors[i].vendorFaultData));
+                report.Append("vendor fault={} code={} data={}\n", vendors[i].description, vendors[i].vendorFaultCode,
+                              vendors[i].vendorFaultData);
             }
         }
-
-        std::fflush(stderr);
+        for (const FVulkanCommandBuffer* buffer : m_diagnosticBuffers)
+        {
+            buffer->ReportBreadcrumbs(report);
+        }
+        report.Publish();
     }
 }
 
@@ -117,7 +206,7 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice gpu) : m_device(VK_NULL_HANDLE), m_g
     vkGetPhysicalDeviceProperties(m_gpu, &m_gpuProps);
 }
 
-std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu)
+std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* error)
 {
     std::string reason;
 
@@ -132,7 +221,7 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu)
 
     if (reason.empty())
     {
-        const HeapVector<VkExtensionProperties> extensions = VulkanDeviceExtension::GetSupportedExtensions(gpu);
+        const HeapVector<VkExtensionProperties> extensions = VulkanDeviceExtension::GetSupportedExtensions(gpu, error);
 
         for (const char* required : {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME})
         {
@@ -185,13 +274,9 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu)
         {
             reason = "The dynamicRendering feature is required";
         }
-        else if (!indexing.runtimeDescriptorArray || !indexing.descriptorBindingPartiallyBound
-                 || !indexing.descriptorBindingUpdateUnusedWhilePending
-                 || !indexing.descriptorBindingSampledImageUpdateAfterBind
-                 || !indexing.shaderSampledImageArrayNonUniformIndexing)
+        else if (const char* missing = MissingDescriptorIndexingFeature(indexing))
         {
-            reason =
-                "Descriptor indexing with partially bound, variable, update-after-bind sampled images and nonuniform indexing is required";
+            reason = fmt::format("The {} descriptor indexing feature is required", missing);
         }
     }
 
@@ -302,13 +387,25 @@ RHIQueueCopyCapabilities VulkanRHI::GetQueueCopyCapabilities(RHICommandContextTy
  */
 void VulkanDevice::Init()
 {
-    const std::string unsupportedReason = GetUnsupportedReason(m_gpu);
+    const RHIError error = InitChecked();
+    ZEN_RHI_VERIFY_MSG_F(!error.IsFailure(), "{} failed ({})", error.operation, error.nativeCode);
+}
 
-    if (!unsupportedReason.empty())
+RHIError VulkanDevice::InitChecked()
+{
+    RHIError          error;
+    const std::string reason = GetUnsupportedReason(m_gpu, &error);
+    if (!error.IsFailure() && !reason.empty())
     {
-        ZEN_RHI_VERIFY_MSG_F(false, "Cannot initialize Vulkan device '{}': {}", m_gpuProps.deviceName, unsupportedReason);
+        ZEN_RHI_LOG_ERROR("Cannot initialize Vulkan device '{}': {}", m_gpuProps.deviceName, reason);
+        error = MakeRHIError(RHIErrorCode::eUnsupported, "Vulkan device profile", __FILE__, __LINE__);
     }
+    return error.IsFailure() ? error : InitializeSupportedDevice();
+}
 
+RHIError VulkanDevice::InitializeSupportedDevice()
+{
+    RHIError error;
     // query base features
     vkGetPhysicalDeviceFeatures(m_gpu, &m_physicalDeviceFeatures);
 
@@ -320,13 +417,13 @@ void VulkanDevice::Init()
 
     vkGetPhysicalDeviceQueueFamilyProperties(m_gpu, &count, nullptr);
 
-    ZEN_RHI_VERIFY(count > 0);
+    ZEN_ASSERT(count > 0);
 
     m_queueFamilyProps.resize(count);
 
     vkGetPhysicalDeviceQueueFamilyProperties(m_gpu, &count, m_queueFamilyProps.data());
 
-    VulkanDeviceExtensionArray extensionArray = VulkanDeviceExtension::GetEnabledExtensions(this);
+    VulkanDeviceExtensionArray extensionArray = VulkanDeviceExtension::GetEnabledExtensions(this, &error);
 
     if (GVulkanRHI->GetInstanceExtensionFlags().hasGetPhysicalDeviceProperties)
     {
@@ -402,14 +499,23 @@ void VulkanDevice::Init()
         vkGetPhysicalDeviceProperties2(m_gpu, &properties);
     }
 
-    SetupDevice(extensionArray);
-
-    m_pFenceManager    = ZEN_NEW() VulkanFenceManager(this);
-
-    m_pSemaphoreManger = ZEN_NEW() VulkanSemaphoreManager(this);
+    if (!error.IsFailure())
+    {
+        error = SetupDevice(extensionArray);
+    }
+    if (!error.IsFailure())
+    {
+        m_pFenceManager    = ZEN_NEW() VulkanFenceManager(this);
+        m_pSemaphoreManger = ZEN_NEW() VulkanSemaphoreManager(this);
+        if (!m_pFenceManager || !m_pSemaphoreManger)
+        {
+            error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate Vulkan synchronization managers");
+        }
+    }
+    return error;
 }
 
-void VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& extensions)
+RHIError VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& extensions)
 {
     VkDeviceCreateInfo deviceInfo;
 
@@ -560,45 +666,68 @@ void VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& ext
 
     const VkResult result       = vkCreateDevice(m_gpu, &deviceInfo, nullptr, &m_device);
 
-    if (result != VK_SUCCESS)
+    RHIError error              = MakeVulkanError(result, "vkCreateDevice");
+    if (!error.IsFailure())
     {
-        ZEN_RHI_VERIFY_MSG_F(false, "vkCreateDevice failed: {}", int32_t(result));
+        ZEN_RHI_LOG_INFO("Vulkan Device Created");
+
+        // display extension info
+        for (NameID extension : m_extensions)
+        {
+            ZEN_RHI_LOG_INFO("Enabled Device Extension: {}", extension.CStr());
+        }
+
+        // load device func
+        volkLoadDevice(m_device);
+
+        // Keep native compilation data for pipeline recreation during this device's lifetime.
+        // Flags stay zero so the driver synchronizes concurrent pipeline creation internally.
+        VkPipelineCacheCreateInfo pipelineCacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+
+        const std::span<const uint8_t> seed    = RHIOptions::GetInstance().PipelineCacheSeed();
+        const std::span<const uint8_t> payload = CachePayload(seed, m_gpuProps);
+        pipelineCacheInfo.initialDataSize      = payload.size();
+        pipelineCacheInfo.pInitialData         = payload.data();
+        if (!seed.empty())
+        {
+            ZEN_RHI_LOG_INFO("Vulkan pipeline cache seed: {} of {} bytes accepted", payload.size(), seed.size());
+        }
+        const VkResult cacheResult = vkCreatePipelineCache(m_device, &pipelineCacheInfo, nullptr, &m_pipelineCache);
+
+        if (cacheResult != VK_SUCCESS)
+        {
+            m_pipelineCache = VK_NULL_HANDLE;
+
+            if (cacheResult == VK_ERROR_DEVICE_LOST)
+            {
+                error = MakeVulkanError(cacheResult, "vkCreatePipelineCache");
+            }
+            ZEN_RHI_LOG_WARN("Vulkan pipeline cache unavailable ({}); creating pipelines without a cache",
+                             int32_t(cacheResult));
+        }
     }
-
-    ZEN_RHI_LOG_INFO("Vulkan Device Created");
-
-    // display extension info
-    for (NameID extension : m_extensions)
+    if (!error.IsFailure())
     {
-        ZEN_RHI_LOG_INFO("Enabled Device Extension: {}", extension.CStr());
+        m_pGfxQueue = ZEN_NEW() VulkanQueue(this, queues.graphics.familyIndex, queues.graphics.queueIndex);
+        error       = m_pGfxQueue ? m_pGfxQueue->GetCreationError()
+                                  : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanQueue");
+        if (!error.IsFailure())
+        {
+            m_pComputeQueue = ZEN_NEW() VulkanQueue(this, queues.compute.familyIndex, queues.compute.queueIndex);
+            error           = m_pComputeQueue ? m_pComputeQueue->GetCreationError()
+                                              : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanQueue");
+        }
+        if (!error.IsFailure())
+        {
+            m_pTransferQueue = ZEN_NEW() VulkanQueue(this, queues.transfer.familyIndex, queues.transfer.queueIndex);
+            error            = m_pTransferQueue ? m_pTransferQueue->GetCreationError()
+                                                : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanQueue");
+        }
+        ZEN_RHI_LOG_INFO("Vulkan queues: graphics={}:{}; compute={}:{}; transfer={}:{}", queues.graphics.familyIndex,
+                         queues.graphics.queueIndex, queues.compute.familyIndex, queues.compute.queueIndex,
+                         queues.transfer.familyIndex, queues.transfer.queueIndex);
     }
-
-    // load device func
-    volkLoadDevice(m_device);
-
-    // Keep native compilation data for pipeline recreation during this device's lifetime.
-    // Flags stay zero so the driver synchronizes concurrent pipeline creation internally.
-    VkPipelineCacheCreateInfo pipelineCacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-
-    const VkResult cacheResult = vkCreatePipelineCache(m_device, &pipelineCacheInfo, nullptr, &m_pipelineCache);
-
-    if (cacheResult != VK_SUCCESS)
-    {
-        m_pipelineCache = VK_NULL_HANDLE;
-
-        ZEN_RHI_LOG_WARN("Vulkan pipeline cache unavailable ({}); creating pipelines without a cache", int32_t(cacheResult));
-    }
-
-    // setup queues
-    m_pGfxQueue      = ZEN_NEW() VulkanQueue(this, queues.graphics.familyIndex, queues.graphics.queueIndex);
-
-    m_pComputeQueue  = ZEN_NEW() VulkanQueue(this, queues.compute.familyIndex, queues.compute.queueIndex);
-
-    m_pTransferQueue = ZEN_NEW() VulkanQueue(this, queues.transfer.familyIndex, queues.transfer.queueIndex);
-
-    ZEN_RHI_LOG_INFO("Vulkan queues: graphics={}:{}; compute={}:{}; transfer={}:{}", queues.graphics.familyIndex,
-                     queues.graphics.queueIndex, queues.compute.familyIndex, queues.compute.queueIndex,
-                     queues.transfer.familyIndex, queues.transfer.queueIndex);
+    return error;
 }
 
 void VulkanDevice::SetObjectName(VkObjectType type, uint64_t handle, NameID name)
@@ -623,7 +752,7 @@ void VulkanDevice::WaitForIdle()
 {
     if (m_device != VK_NULL_HANDLE)
     {
-        const VkResult result = vkDeviceWaitIdle(m_device);
+        const VkResult result = TimedRHICall(RHIWorkerTime::eWait, vkDeviceWaitIdle, m_device);
 
         ReportVulkanDeviceLoss(result, "vkDeviceWaitIdle");
 

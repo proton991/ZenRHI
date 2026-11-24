@@ -54,7 +54,7 @@ public:
 
     void EndBreadcrumb();
 
-    void ReportBreadcrumbs() const;
+    void ReportBreadcrumbs(class VulkanFaultReport& report) const;
 
     const RHIError& GetError() const
     {
@@ -181,6 +181,8 @@ private:
     VulkanMemoryAllocation    m_breadcrumbAllocation;
     HeapVector<NameID>        m_breadcrumbNames;
     HeapVector<uint32_t>      m_openBreadcrumbs;
+    bool                      m_registeredForDiagnostics{};
+    HeapVector<NameID>        m_openLabels;
 
     double m_submitTime{0.0f};
 
@@ -317,6 +319,8 @@ private:
     HeapVector<FVulkanCommandBuffer*> m_commandBuffers;
     uint64_t                          m_submissionSerial{0};
     bool                              m_submissionBoundary{false};
+    uint64_t                          m_bindlessTransaction{};
+    bool                              m_ownsBindlessTransaction{};
     VulkanWorkload*                   m_pMergedInto{nullptr};
     HeapVector<VulkanWorkload*>       m_mergedWorkloads;
     HeapVector<uint64_t>              m_lifetimeIds;
@@ -449,8 +453,9 @@ public:
 
     void RecordUniformBufferBlock(uint64_t blockId);
 
-    // Finalize the current workload, then append all staged workloads to the output array.
-    void CollectWorkloads(HeapVector<VulkanWorkload*>& outWorkloads);
+    // Transfer staged workloads and their bindless reservations. A platform batch can
+    // retain transaction ownership until its aggregate submission result is known.
+    void CollectWorkloads(HeapVector<VulkanWorkload*>& outWorkloads, uint64_t* transactionOwner = nullptr);
 
     // Finalize the current workload and submit all staged workloads immediately.
     RHISubmissionResult SubmitRecordedWorkloads();

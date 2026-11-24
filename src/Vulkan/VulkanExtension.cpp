@@ -151,6 +151,32 @@ private:
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
 };
 
+const char* MissingDescriptorIndexingFeature(const VkPhysicalDeviceDescriptorIndexingFeatures& features)
+{
+    const char* missing = nullptr;
+    if (!features.runtimeDescriptorArray)
+    {
+        missing = "runtimeDescriptorArray";
+    }
+    else if (!features.descriptorBindingPartiallyBound)
+    {
+        missing = "descriptorBindingPartiallyBound";
+    }
+    else if (!features.descriptorBindingUpdateUnusedWhilePending)
+    {
+        missing = "descriptorBindingUpdateUnusedWhilePending";
+    }
+    else if (!features.descriptorBindingSampledImageUpdateAfterBind)
+    {
+        missing = "descriptorBindingSampledImageUpdateAfterBind";
+    }
+    else if (!features.shaderSampledImageArrayNonUniformIndexing)
+    {
+        missing = "shaderSampledImageArrayNonUniformIndexing";
+    }
+    return missing;
+}
+
 // Advanced extensions
 /**
  * VK_EXT_descriptor_indexing
@@ -171,11 +197,7 @@ public:
 
     virtual void AfterPhysicalDeviceFeatures() final
     {
-        bool supported = (m_descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE)
-                      && (m_descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE)
-                      && (m_descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE)
-                      && (m_descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending == VK_TRUE)
-                      && (m_descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE);
+        const bool supported = MissingDescriptorIndexingFeature(m_descriptorIndexingFeatures) == nullptr;
 
         SetSupport(supported);
 
@@ -673,24 +695,16 @@ static bool ExtensionNameLess(const VkExtensionProperties& a, const VkExtensionP
     return strcmp(a.extensionName, b.extensionName) < 0;
 }
 
-HeapVector<VkExtensionProperties> VulkanInstanceExtension::GetSupportedInstanceExtensions(NameID layerName)
+HeapVector<VkExtensionProperties> VulkanInstanceExtension::GetSupportedInstanceExtensions(NameID layerName, RHIError* error)
 {
     HeapVector<VkExtensionProperties> extensions;
 
     const char* pLayerName = layerName.IsNone() ? nullptr : layerName.CStr();
 
-    uint32_t count         = 0;
-
-    ZEN_RHI_VERIFY_MSG_F((vkEnumerateInstanceExtensionProperties(pLayerName, &count, nullptr)) == VK_SUCCESS,
-                         "Vulkan operation failed: vkEnumerateInstanceExtensionProperties(pLayerName, &count, nullptr)");
-
-    if (count > 0)
+    const VkResult result  = EnumerateVulkanProperties(extensions, vkEnumerateInstanceExtensionProperties, pLayerName);
+    if (result != VK_SUCCESS && error)
     {
-        extensions.resize(count);
-
-        ZEN_RHI_VERIFY_MSG_F(
-            (vkEnumerateInstanceExtensionProperties(pLayerName, &count, extensions.data())) == VK_SUCCESS,
-            "Vulkan operation failed: vkEnumerateInstanceExtensionProperties(pLayerName, &count, extensions.data())");
+        *error = MakeVulkanError(result, "vkEnumerateInstanceExtensionProperties");
     }
 
     std::sort(extensions.begin(), extensions.end(), ExtensionNameLess);
@@ -715,7 +729,8 @@ static bool HasInstanceExtension(const VulkanInstanceExtensionArray& extensions,
     return supported;
 }
 
-VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensions(InstanceExtensionFlags& extensionFlags)
+VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensions(InstanceExtensionFlags& extensionFlags,
+                                                                                   RHIError*               error)
 {
     VulkanInstanceExtensionArray enabledExtensions;
 
@@ -728,10 +743,11 @@ VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensio
 
     SET_INSTANCE_EXTENSION_FLAG(hasGetPhysicalDeviceProperties);
 
-    ADD_INSTANCE_EXTENSION(VK_KHR_SURFACE_EXTENSION_NAME);
+    enabledExtensions.emplace_back(MakeUnique<VulkanInstanceExtension>(VK_KHR_SURFACE_EXTENSION_NAME, true));
 
     ADD_INSTANCE_EXTENSION(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     ADD_INSTANCE_EXTENSION(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+    ADD_INSTANCE_EXTENSION(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
 
     ADD_INSTANCE_EXTENSION(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
 
@@ -744,7 +760,7 @@ VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensio
 
     VulkanPlatform::AddInstanceExtensions(enabledExtensions);
 
-    FlagExtensionSupported(enabledExtensions, VulkanInstanceExtension::GetSupportedInstanceExtensions());
+    FlagExtensionSupported(enabledExtensions, VulkanInstanceExtension::GetSupportedInstanceExtensions({}, error));
 
     const bool hasSurfaceCapabilities2 =
         HasInstanceExtension(enabledExtensions, NameID(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME));
@@ -771,13 +787,6 @@ VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensio
         {
             extensionFlags.hasDebugUtils = extension->IsEnabledAndSupported();
         }
-
-        if ((name == NameID(VK_KHR_SURFACE_EXTENSION_NAME) || name == NameID("VK_KHR_win32_surface")
-             || name == NameID("VK_EXT_metal_surface"))
-            && !extension->IsEnabledAndSupported())
-        {
-            ZEN_RHI_VERIFY_MSG_F(false, "Required instance extension is missing: {}", name.CStr());
-        }
     }
 
 #undef SET_INSTANCE_EXTENSION_FLAG
@@ -786,22 +795,14 @@ VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensio
     return enabledExtensions;
 }
 
-HeapVector<VkExtensionProperties> VulkanDeviceExtension::GetSupportedExtensions(VkPhysicalDevice gpu)
+HeapVector<VkExtensionProperties> VulkanDeviceExtension::GetSupportedExtensions(VkPhysicalDevice gpu, RHIError* error)
 {
     HeapVector<VkExtensionProperties> extensions;
 
-    uint32_t count = 0;
-
-    ZEN_RHI_VERIFY_MSG_F((vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr)) == VK_SUCCESS,
-                         "Vulkan operation failed: vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr)");
-
-    if (count > 0)
+    const VkResult result = EnumerateVulkanProperties(extensions, vkEnumerateDeviceExtensionProperties, gpu, nullptr);
+    if (result != VK_SUCCESS && error)
     {
-        extensions.resize(count);
-
-        ZEN_RHI_VERIFY_MSG_F(
-            (vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, extensions.data())) == VK_SUCCESS,
-            "Vulkan operation failed: vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, extensions.data())");
+        *error = MakeVulkanError(result, "vkEnumerateDeviceExtensionProperties");
     }
 
     std::sort(extensions.begin(), extensions.end(), ExtensionNameLess);
@@ -809,7 +810,7 @@ HeapVector<VkExtensionProperties> VulkanDeviceExtension::GetSupportedExtensions(
     return extensions;
 }
 
-VulkanDeviceExtensionArray VulkanDeviceExtension::GetEnabledExtensions(VulkanDevice* pDevice)
+VulkanDeviceExtensionArray VulkanDeviceExtension::GetEnabledExtensions(VulkanDevice* pDevice, RHIError* error)
 {
     VulkanDeviceExtensionArray enabledExtensions;
 
@@ -867,7 +868,7 @@ VulkanDeviceExtensionArray VulkanDeviceExtension::GetEnabledExtensions(VulkanDev
         ADD_ADVANCED_DEVICE_EXTENSION(VulkanPipelineExecutableExtension)
     }
 
-    const HeapVector<VkExtensionProperties> supported = GetSupportedExtensions(pDevice->GetPhysicalDeviceHandle());
+    const HeapVector<VkExtensionProperties> supported = GetSupportedExtensions(pDevice->GetPhysicalDeviceHandle(), error);
 
     if (FindExtensionIndex(VK_KHR_OPACITY_MICROMAP_EXTENSION_NAME, supported) >= 0
         && FindExtensionIndex(VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME, supported) >= 0

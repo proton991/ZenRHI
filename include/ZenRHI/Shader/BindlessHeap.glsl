@@ -15,6 +15,15 @@ vec4 SamplerHeap2D(uint imageIdx, uint samplerIdx, vec2 uv)
     return texture(sampler2D(uTexture2DHeap[nonuniformEXT(imageIdx)], uSamplerHeap[nonuniformEXT(samplerIdx)]), uv);
 }
 
+#ifdef ZEN_BINDLESS_CUBE
+layout(set = ZEN_BINDLESS_HEAP_SET, binding = ZEN_BINDLESS_HEAP_BINDING_TEXTURECUBE) uniform textureCube uTextureCubeHeap[];
+
+vec4 SamplerHeapCube(uint imageIdx, uint samplerIdx, vec3 direction)
+{
+    return texture(samplerCube(uTextureCubeHeap[nonuniformEXT(imageIdx)], uSamplerHeap[nonuniformEXT(samplerIdx)]), direction);
+}
+#endif
+
 #ifdef ZEN_BINDLESS_2D_ARRAY
 layout(set     = ZEN_BINDLESS_HEAP_SET,
        binding = ZEN_BINDLESS_HEAP_BINDING_TEXTURE2DARRAY) uniform texture2DArray uTexture2DArrayHeap[];

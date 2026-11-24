@@ -6,6 +6,29 @@
 
 namespace zen
 {
+struct RHIError;
+const char* MissingDescriptorIndexingFeature(const VkPhysicalDeviceDescriptorIndexingFeatures& features);
+
+// The loader may change the list between the count and fill calls.
+template <typename T, typename Query, typename... Args>
+VkResult EnumerateVulkanProperties(HeapVector<T>& items, Query query, Args... args)
+{
+    VkResult result;
+    uint32_t count;
+    do
+    {
+        count  = 0;
+        result = query(args..., &count, nullptr);
+        if (result == VK_SUCCESS && count != 0)
+        {
+            items.resize(count);
+            result = query(args..., &count, items.data());
+        }
+    } while (result == VK_INCOMPLETE);
+    items.resize(result == VK_SUCCESS ? count : 0);
+    return result;
+}
+
 class VulkanDevice;
 
 enum class VulkanAPIVersion : uint32_t
@@ -84,13 +107,16 @@ using VulkanInstanceExtensionArray = HeapVector<UniquePtr<VulkanInstanceExtensio
 class VulkanInstanceExtension : public VulkanExtension
 {
 public:
-    explicit VulkanInstanceExtension(NameID extensionName, EnableMode enableMode = EnableMode::eAuto) :
-        VulkanExtension(extensionName, enableMode)
+    explicit VulkanInstanceExtension(NameID extensionName, bool required = false) :
+        VulkanExtension(extensionName, EnableMode::eAuto), required(required)
     {}
 
-    static HeapVector<VkExtensionProperties> GetSupportedInstanceExtensions(NameID layerName = {});
+    bool required;
 
-    static VulkanInstanceExtensionArray GetEnabledInstanceExtensions(InstanceExtensionFlags& extensionFlags);
+    static HeapVector<VkExtensionProperties> GetSupportedInstanceExtensions(NameID layerName = {}, RHIError* error = nullptr);
+
+    static VulkanInstanceExtensionArray GetEnabledInstanceExtensions(InstanceExtensionFlags& extensionFlags,
+                                                                     RHIError*               error = nullptr);
 };
 
 class VulkanDeviceExtension;
@@ -105,9 +131,9 @@ public:
 
     virtual ~VulkanDeviceExtension() = default;
 
-    static HeapVector<VkExtensionProperties> GetSupportedExtensions(VkPhysicalDevice gpu);
+    static HeapVector<VkExtensionProperties> GetSupportedExtensions(VkPhysicalDevice gpu, RHIError* error = nullptr);
 
-    static VulkanDeviceExtensionArray GetEnabledExtensions(VulkanDevice* pDevice);
+    static VulkanDeviceExtensionArray GetEnabledExtensions(VulkanDevice* pDevice, RHIError* error = nullptr);
 
 #ifdef VK_KHR_get_physical_device_properties2
     virtual void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) {}

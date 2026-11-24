@@ -1,3 +1,4 @@
+#include "ZenRHI/Vulkan/VulkanInterop.h"
 #include "TestShaderModule.h"
 #include "VulkanIntegrationFixture.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
@@ -10,10 +11,116 @@
 #include "ZenRHI/RHIOptions.h"
 #include <gtest/gtest.h>
 #include <filesystem>
+#include "ZenRHI/TestSupport/Validation.h"
+#include "Vulkan/VulkanBuffer.h"
+#include "Vulkan/VulkanQueue.h"
 
 namespace
 {
 using namespace zen;
+
+enum class StartupFault
+{
+    eInstance,
+    eDevice
+};
+StartupFault          startupFault;
+PFN_vkDestroyInstance originalDestroyInstance;
+PFN_vkDestroyDevice   originalDestroyDevice;
+uint32_t              destroyedInstances;
+uint32_t              destroyedDevices;
+
+VKAPI_ATTR void VKAPI_CALL CountDestroyedInstance(VkInstance instance, const VkAllocationCallbacks* allocator)
+{
+    ++destroyedInstances;
+    originalDestroyInstance(instance, allocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL CountDestroyedDevice(VkDevice device, const VkAllocationCallbacks* allocator)
+{
+    ++destroyedDevices;
+    originalDestroyDevice(device, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FailEnumeration(VkInstance, uint32_t*, VkPhysicalDevice*)
+{
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+VKAPI_ATTR void VKAPI_CALL RejectBindless(VkDevice,
+                                          const VkDescriptorSetLayoutCreateInfo*,
+                                          VkDescriptorSetLayoutSupport* support)
+{
+    support->supported = VK_FALSE;
+}
+
+void InjectStartupFault(RHIMessageSeverity, std::string_view message) noexcept
+{
+    if (message.starts_with("Active validation layer="))
+    {
+        originalDestroyInstance = vkDestroyInstance;
+        vkDestroyInstance       = CountDestroyedInstance;
+        if (startupFault == StartupFault::eInstance)
+        {
+            vkEnumeratePhysicalDevices = FailEnumeration;
+        }
+    }
+    if (startupFault == StartupFault::eDevice && message.starts_with("Vulkan queues:"))
+    {
+        originalDestroyDevice           = vkDestroyDevice;
+        vkDestroyDevice                 = CountDestroyedDevice;
+        vkGetDescriptorSetLayoutSupport = RejectBindless;
+    }
+}
+
+TEST(VulkanProductionFailureTest, CheckedStartupRestoresHostAndRetries)
+{
+    const RHIMessageCallback previous = GetRHIMessageCallback();
+    const RHIDeviceDesc      original = RHIOptions::GetInstance();
+    RHIDeviceDesc            desc     = original;
+    desc.messageCallback              = InjectStartupFault;
+    desc.SetPreferredDevice("startup retry test");
+    // Force the same physical adapter as the rest of this hardware run.
+    const char* preferred = std::getenv("ZEN_VULKAN_DEVICE");
+    if (preferred && *preferred)
+    {
+        desc.SetPreferredDevice(preferred);
+    }
+    for (StartupFault fault : {StartupFault::eInstance, StartupFault::eDevice})
+    {
+        destroyedInstances = destroyedDevices = 0;
+        startupFault                          = fault;
+        RHIResult<DynamicRHI*> failed         = CreateRHIChecked(desc);
+        ASSERT_FALSE(failed);
+        EXPECT_EQ(failed.GetError().nativeCode,
+                  fault == StartupFault::eInstance ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_FEATURE_NOT_PRESENT);
+        EXPECT_EQ(destroyedInstances, 1u);
+        EXPECT_EQ(destroyedDevices, fault == StartupFault::eDevice ? 1u : 0u);
+        EXPECT_EQ(GDynamicRHI, nullptr);
+        EXPECT_EQ(GetVulkanDeviceHandles().device, VK_NULL_HANDLE);
+        EXPECT_EQ(GetRHIMessageCallback(), previous);
+        EXPECT_EQ(RHIOptions::GetInstance().PreferredDevice(), original.PreferredDevice());
+    }
+    desc.surfaceExtensions = []() -> std::span<const char* const> {
+        static constexpr const char* names[] = {"VK_ZEN_unavailable_host_surface"};
+        return names;
+    };
+    desc.messageCallback           = previous;
+    RHIResult<DynamicRHI*> missing = CreateRHIChecked(desc);
+    if (missing)
+    {
+        missing.GetValue()->Destroy();
+        ZEN_DELETE(missing.GetValue());
+    }
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.GetError().nativeCode, VK_ERROR_EXTENSION_NOT_PRESENT);
+
+    RHIResult<DynamicRHI*> created = CreateRHIChecked(original);
+    ASSERT_TRUE(created);
+    EXPECT_NE(GetVulkanDeviceHandles().device, VK_NULL_HANDLE);
+    created.GetValue()->Destroy();
+    ZEN_DELETE(created.GetValue());
+}
 
 struct PipelineFailure
 {
@@ -488,9 +595,19 @@ TEST(VulkanProductionFailureTest, DeviceMemoryLimitCapsHeapsBudgetsAndAllocation
     RHIBuffer* first = session.rhi.CreateBuffer(info);
     EXPECT_NE(first, nullptr);
     EXPECT_GE(allocator.GetGPUMemoryStats().deviceLocalBytes, limit / 2);
-    info.size         = limit;
-    RHIBuffer* second = session.rhi.CreateBuffer(info);
-    EXPECT_LE(allocator.GetGPUMemoryStats().deviceLocalBytes, limit);
+    info.size                               = limit;
+    RHIBuffer*                       second = session.rhi.CreateBuffer(info);
+    VkPhysicalDeviceMemoryProperties memory{};
+    vkGetPhysicalDeviceMemoryProperties(session.rhi.GetPhysicalDevice(), &memory);
+    uint64_t cappedDeviceBytes = 0;
+    for (uint32_t i = 0; i < memory.memoryHeapCount; ++i)
+    {
+        if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+        {
+            cappedDeviceBytes += std::min<uint64_t>(limit, memory.memoryHeaps[i].size);
+        }
+    }
+    EXPECT_LE(allocator.GetGPUMemoryStats().deviceLocalBytes, cappedDeviceBytes);
     if (first != nullptr)
     {
         session.rhi.DestroyBuffer(first);
@@ -635,11 +752,21 @@ TEST_P(VulkanProductionDiagnosticsTest, DeviceLossReportsCompletedGpuBreadcrumbA
 
             counts->vendorInfoCount  = 0;
 
-            std::strcpy(info->description, "injected driver fault");
+            if (info)
+            {
+                std::strcpy(info->description, "injected driver fault");
+            }
 
             return VK_SUCCESS;
         });
 
+    FVulkanCommandListContext* active =
+        static_cast<FVulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    const std::string label(180, 'x');
+    for (uint32_t i = 0; i < 100; ++i)
+    {
+        active->RHIBeginDebugLabel(label);
+    }
     testing::internal::CaptureStderr();
 
     ReportVulkanDeviceLoss(VK_ERROR_DEVICE_LOST, "injected submission");
@@ -652,8 +779,13 @@ TEST_P(VulkanProductionDiagnosticsTest, DeviceLossReportsCompletedGpuBreadcrumbA
 
     EXPECT_NE(diagnostic.find("injected driver fault"), std::string::npos);
 
+    EXPECT_NE(diagnostic.find("[report truncated]"), std::string::npos);
     EXPECT_TRUE(session.rhi.AreSubmissionsBlocked());
-
+    for (uint32_t i = 0; i < 100; ++i)
+    {
+        active->RHIEndDebugLabel();
+    }
+    ZEN_DELETE(active);
     ZEN_DELETE(context);
 }
 

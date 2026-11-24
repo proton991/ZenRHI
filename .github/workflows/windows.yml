@@ -6,13 +6,15 @@ jobs:
   rhi:
     runs-on: windows-2022
     env:
-      VULKAN_SDK: C:\VulkanSDK\1.4.304.1
+      VULKAN_SDK: C:\VulkanSDK\1.4.357.0
     strategy:
       matrix:
         # The second entry is the release tag shared by every Zen component of this version.
         foundation: [main, v0.2.0]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/checkout@v4
         with:
           repository: proton991/ZenFoundation
@@ -22,8 +24,8 @@ jobs:
         shell: pwsh
         run: |
           $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK.exe'
-          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.304.1/windows/VulkanSDK-1.4.304.1-Installer.exe' -OutFile $installer
-          $process = Start-Process -FilePath $installer -ArgumentList '--root C:\VulkanSDK\1.4.304.1 --accept-licenses --default-answer --confirm-command install' -Wait -PassThru -WindowStyle Hidden
+          Invoke-WebRequest 'https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkansdk-windows-X64-1.4.357.0.exe' -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList '--root C:\VulkanSDK\1.4.357.0 --accept-licenses --default-answer --confirm-command install' -Wait -PassThru -WindowStyle Hidden
           if ($process.ExitCode -ne 0) { throw "SDK install failed: $($process.ExitCode)" }
           "$env:VULKAN_SDK\Bin" >> $env:GITHUB_PATH
       - uses: ilammy/msvc-dev-cmd@v1
@@ -34,3 +36,36 @@ jobs:
           cmake --build build/ci -j 2
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           ctest --test-dir build/ci --output-on-failure -L "unit|policy"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tag = git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD^
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/check_public_api.py --foundation-include dependencies/ZenFoundation/include --previous-tag $tag
+      - uses: ./.github/actions/software-driver
+        if: matrix.foundation == 'main'
+      - name: Native software-driver acceptance
+        if: matrix.foundation == 'main'
+        shell: pwsh
+        env:
+          VK_LOADER_LAYERS_DISABLE: '~implicit~'
+        run: |
+          $suite = 'build/ci/tests/ZenRHIVulkanIntegrationTests.exe'
+          & $suite --check-device-profile 2>&1 | Tee-Object build/profile.log
+          if ($LASTEXITCODE -eq 77) {
+            if (!(Select-String -Path build/profile.log -Pattern 'Vulkan adapter=.+profile=.+') -or
+                !(Select-String -Path build/profile.log -Pattern 'Active validation layer=')) { exit 1 }
+            Write-Output 'Native suite skipped for the reported device profile'
+            exit 0
+          }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $suite --gtest_output=xml:build/native.xml 2>&1 | Tee-Object build/native.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (!(Select-String -Path build/native.log -SimpleMatch '[       OK ] VulkanValidationTest.OverlappingBufferClears')) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        if: always() && matrix.foundation == 'main'
+        with:
+          name: software-acceptance
+          path: |
+            build/software-driver.txt
+            build/profile.log
+            build/native.xml
+            build/native.log

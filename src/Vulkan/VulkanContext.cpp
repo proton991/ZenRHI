@@ -166,7 +166,7 @@ static uint64_t GetDeviceLocalMemoryBytes(VkPhysicalDevice physicalDevice)
     return deviceLocalMemoryBytes;
 }
 
-static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysicalDevice physicalDevice)
+static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysicalDevice physicalDevice, RHIError& error)
 {
     VulkanPhysicalDeviceCandidateInfo result{};
 
@@ -178,7 +178,7 @@ static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysi
 
     candidateInfo.queueSummary      = GetQueueFamilySummary(physicalDevice);
 
-    candidateInfo.unsupportedReason = VulkanDevice::GetUnsupportedReason(physicalDevice);
+    candidateInfo.unsupportedReason = VulkanDevice::GetUnsupportedReason(physicalDevice, &error);
 
     if (!candidateInfo.unsupportedReason.empty())
     {
@@ -240,9 +240,7 @@ static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysi
 
         candidateInfo.hasSamplerAnisotropy      = physicalDeviceFeatures2.features.samplerAnisotropy == VK_TRUE;
 
-        candidateInfo.hasDescriptorIndexing     = descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE
-                                               && descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE
-                                               && descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
+        candidateInfo.hasDescriptorIndexing      = MissingDescriptorIndexingFeature(descriptorIndexingFeatures) == nullptr;
 
         candidateInfo.hasDynamicRendering       = dynamicRenderingFeatures.dynamicRendering == VK_TRUE;
 
@@ -335,17 +333,72 @@ static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysi
 }
 } // namespace
 
-struct VulkanLayer
+namespace
 {
-    VkLayerProperties                 layerProperties;
-    HeapVector<VkExtensionProperties> layerExtensions;
-};
+std::atomic<uint64_t> processValidationErrors{};
+}
+
+void VulkanRHI::CountValidationMessage(RHIMessageSeverity severity, std::string_view id)
+{
+    std::lock_guard<std::mutex> lock(m_validationMutex);
+    const auto                  entry =
+        std::find_if(m_validationCounts.begin(), m_validationCounts.end(),
+                     [severity, id](const ValidationMessageCount& item) { return severity == item.severity && id == item.id; });
+    if (entry == m_validationCounts.end())
+    {
+        m_validationCounts.push_back({severity, std::string(id), 1});
+    }
+    else
+    {
+        ++entry->count;
+    }
+    if (severity == RHIMessageSeverity::eError)
+    {
+        processValidationErrors.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+uint64_t VulkanRHI::GetValidationCount(RHIMessageSeverity severity, std::string_view id) const
+{
+    std::lock_guard<std::mutex> lock(m_validationMutex);
+    uint64_t                    total = 0;
+    for (const ValidationMessageCount& item : m_validationCounts)
+    {
+        if (severity == item.severity && (id.empty() || id == item.id))
+        {
+            total += item.count;
+        }
+    }
+    return total;
+}
+
+namespace test
+{
+uint64_t GetValidationCount(RHIMessageSeverity severity, std::string_view id)
+{
+    return GVulkanRHI ? GVulkanRHI->GetValidationCount(severity, id) : 0;
+}
+
+uint64_t GetProcessValidationErrors()
+{
+    return processValidationErrors.load(std::memory_order_relaxed);
+}
+} // namespace test
 
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
                                                            VkDebugUtilsMessageTypeFlagsEXT             messageType,
                                                            const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
                                                            void*                                       pUserData)
 {
+    const RHIMessageSeverity severity =
+        (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)     ? RHIMessageSeverity::eError
+        : (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) ? RHIMessageSeverity::eWarning
+                                                                              : RHIMessageSeverity::eInfo;
+    if (pUserData)
+    {
+        static_cast<VulkanRHI*>(pUserData)->CountValidationMessage(severity,
+                                                                   RHIErrorText(pCallbackData->pMessageIdName, "unknown"));
+    }
     if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
     {
         ZEN_RHI_LOG_WARN("{} - {}: {}", pCallbackData->messageIdNumber,
@@ -354,7 +407,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsMessengerCallback(VkDebugUtilsMessageSe
     }
     else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
     {
-        ZEN_RHI_LOG_ERROR("{} - {}: {}", pCallbackData->messageIdNumber,
+        ZEN_RHI_LOG_ERROR("Vulkan validation error {} - {}: {}", pCallbackData->messageIdNumber,
                           RHIErrorText(pCallbackData->pMessageIdName, "unknown message"),
                           RHIErrorText(pCallbackData->pMessage, ""))
     }
@@ -397,41 +450,6 @@ void VulkanRHI::PopulateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfo
     dbgMessengerCI.pUserData       = this;
 }
 
-static HeapVector<VulkanLayer> GetSupportedLayers()
-{
-    HeapVector<VulkanLayer> layers;
-
-    HeapVector<VkLayerProperties> layerProperties;
-
-    uint32_t count = 0;
-
-    ZEN_RHI_VERIFY_MSG_F((vkEnumerateInstanceLayerProperties(&count, nullptr)) == VK_SUCCESS,
-                         "Vulkan operation failed: vkEnumerateInstanceLayerProperties(&count, nullptr)");
-
-    if (count > 0)
-    {
-        layers.resize(count);
-
-        layerProperties.resize(count);
-
-        ZEN_RHI_VERIFY_MSG_F((vkEnumerateInstanceLayerProperties(&count, layerProperties.data())) == VK_SUCCESS,
-                             "Vulkan operation failed: vkEnumerateInstanceLayerProperties(&count, layerProperties.data())");
-
-        for (uint32_t i = 0; i < count; i++)
-        {
-            layers[i].layerProperties = layerProperties[i];
-
-            layers[i].layerExtensions = VulkanInstanceExtension::GetSupportedInstanceExtensions(layerProperties[i].layerName);
-        }
-    }
-
-    std::sort(layers.begin(), layers.end(), [](const VulkanLayer& lhs, const VulkanLayer& rhs) {
-        return strcmp(lhs.layerProperties.layerName, rhs.layerProperties.layerName) < 0;
-    });
-
-    return layers;
-}
-
 static void FlagInstanceExtensionSupported(VulkanInstanceExtensionArray& instanceExtensions, NameID extensionName)
 {
     for (UniquePtr<VulkanInstanceExtension>& extension : instanceExtensions)
@@ -443,58 +461,45 @@ static void FlagInstanceExtensionSupported(VulkanInstanceExtensionArray& instanc
     }
 }
 
-void VulkanRHI::SetupInstanceLayers(VulkanInstanceExtensionArray& instanceExtensions)
+RHIError VulkanRHI::SetupInstanceLayers(VulkanInstanceExtensionArray& instanceExtensions)
 {
-    HeapVector<VulkanLayer> supportedLayers = GetSupportedLayers();
-
-    for (VulkanLayer const& layer : supportedLayers)
-    {
-        ZEN_RHI_LOG_INFO("Supported Layer: {}", layer.layerProperties.layerName);
-    }
-
-    // Add Debug Layer
-    const NameID debugLayerName("VK_LAYER_KHRONOS_validation");
-
+    RHIError error;
     if (RHIOptions::GetInstance().ValidationEnabled())
     {
-        bool valid = true;
-
-        int index  = -1;
-
-        for (uint32_t i = 0; i < supportedLayers.size(); i++)
+        HeapVector<VkLayerProperties> layers;
+        const VkResult                result = EnumerateVulkanProperties(layers, vkEnumerateInstanceLayerProperties);
+        error                                = MakeVulkanError(result, "vkEnumerateInstanceLayerProperties");
+        const char* name                     = "VK_LAYER_KHRONOS_validation";
+        for (const VkLayerProperties& layer : layers)
         {
-            if (strcmp(supportedLayers[i].layerProperties.layerName, debugLayerName.CStr()) == 0)
+            if (strcmp(layer.layerName, name) == 0)
             {
-                index = i;
+                m_instanceLayers.emplace_back(name);
+                m_validationLayer = layer;
+                HeapVector<VkExtensionProperties> extensions =
+                    VulkanInstanceExtension::GetSupportedInstanceExtensions(name, &error);
+                for (const VkExtensionProperties& extension : extensions)
+                {
+                    FlagInstanceExtensionSupported(instanceExtensions, extension.extensionName);
+                }
+                break;
             }
         }
-
-        if (index == -1)
+        if (!error.IsFailure() && m_instanceLayers.empty())
         {
-            ZEN_RHI_LOG_ERROR("Requested {} layer not supported!", debugLayerName.CStr());
-
-            valid = false;
-        }
-
-        if (valid)
-        {
-            m_instanceLayers.push_back(debugLayerName);
-
-            for (VkExtensionProperties& extension : supportedLayers[index].layerExtensions)
+            ZEN_RHI_LOG_WARN("Requested {} layer not supported!", name);
+            if (RHIOptions::GetInstance().ValidationMode() == RHIValidationMode::eRequired)
             {
-                FlagInstanceExtensionSupported(instanceExtensions, extension.extensionName);
+                error = MakeVulkanError(VK_ERROR_LAYER_NOT_PRESENT, "VK_LAYER_KHRONOS_validation");
             }
         }
     }
-
-    for (NameID layer : m_instanceLayers)
-    {
-        ZEN_RHI_LOG_INFO("Enabled Instance Layer: {}", layer.CStr());
-    }
+    return error;
 }
 
-void VulkanRHI::SetupInstanceExtensions(VulkanInstanceExtensionArray& instanceExtensions)
+RHIError VulkanRHI::SetupInstanceExtensions(VulkanInstanceExtensionArray& instanceExtensions)
 {
+    RHIError error;
     for (UniquePtr<VulkanInstanceExtension>& extension : instanceExtensions)
     {
         if (extension->IsEnabledAndSupported())
@@ -507,10 +512,17 @@ void VulkanRHI::SetupInstanceExtensions(VulkanInstanceExtensionArray& instanceEx
 
             ZEN_RHI_LOG_INFO("Enabled Instance Extension: {}", extension->GetName().CStr());
         }
+        else if (extension->required)
+        {
+            ZEN_RHI_LOG_ERROR("Required instance extension is missing: {}", extension->GetName().CStr());
+            error = MakeVulkanError(VK_ERROR_EXTENSION_NOT_PRESENT, "Select Vulkan instance extensions");
+            break;
+        }
     }
+    return error;
 }
 
-void VulkanRHI::CreateInstance()
+RHIError VulkanRHI::CreateInstance()
 {
     VkApplicationInfo appInfo;
 
@@ -526,12 +538,19 @@ void VulkanRHI::CreateInstance()
 
     appInfo.pEngineName        = "ZenEngine";
 
+    RHIError                     error;
     VulkanInstanceExtensionArray instanceExtensions =
-        VulkanInstanceExtension::GetEnabledInstanceExtensions(m_instanceExtensionFlags);
+        VulkanInstanceExtension::GetEnabledInstanceExtensions(m_instanceExtensionFlags, &error);
 
-    SetupInstanceLayers(instanceExtensions);
+    if (!error.IsFailure())
+    {
+        error = SetupInstanceLayers(instanceExtensions);
+    }
 
-    SetupInstanceExtensions(instanceExtensions);
+    if (!error.IsFailure())
+    {
+        error = SetupInstanceExtensions(instanceExtensions);
+    }
 
     VkDebugUtilsMessengerCreateInfoEXT debugMessengerCI;
 
@@ -591,56 +610,57 @@ void VulkanRHI::CreateInstance()
             ? static_cast<const void*>(&validationFeatures)
             : (m_instanceExtensionFlags.hasDebugUtils ? &debugMessengerCI : nullptr);
 
-    const VkResult result = vkCreateInstance(&instanceInfo, nullptr, &m_instance);
-
-    if (result != VK_SUCCESS)
+    const bool layerSettings =
+        validationEnabled && HasExtensionEnabled(m_instanceExtensions, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+    const VkBool32               enabled    = VK_TRUE;
+    const VkBool32               disabled   = VK_FALSE;
+    const char*                  layer      = "VK_LAYER_KHRONOS_validation";
+    const VkLayerSettingEXT      settings[] = {{layer, "validate_sync", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &enabled},
+                                               {layer, "enable_message_limit", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1, &disabled}};
+    VkLayerSettingsCreateInfoEXT settingsInfo{VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT};
+    if (layerSettings)
     {
-        ZEN_RHI_VERIFY_MSG_F(false, "vkCreateInstance failed: {}", int32_t(result));
+        settingsInfo.pNext        = instanceInfo.pNext;
+        settingsInfo.settingCount = uint32_t(std::size(settings));
+        settingsInfo.pSettings    = settings;
+        instanceInfo.pNext        = &settingsInfo;
     }
-
-    volkLoadInstance(m_instance);
-
-    // setup debug messenger callback
-    if (m_instanceExtensionFlags.hasDebugUtils)
+    if (!error.IsFailure() && RHIOptions::GetInstance().ValidationMode() == RHIValidationMode::eRequired
+        && (!layerSettings || !m_instanceExtensionFlags.hasDebugUtils))
     {
-        const VkResult messengerResult = vkCreateDebugUtilsMessengerEXT(m_instance, &debugMessengerCI, nullptr, &m_messenger);
-
-        if (messengerResult != VK_SUCCESS)
+        error = MakeVulkanError(VK_ERROR_EXTENSION_NOT_PRESENT, "Required Vulkan validation settings and messenger");
+    }
+    if (!error.IsFailure())
+    {
+        error = MakeVulkanError(vkCreateInstance(&instanceInfo, nullptr, &m_instance), "vkCreateInstance");
+    }
+    if (!error.IsFailure())
+    {
+        volkLoadInstance(m_instance);
+        if (m_instanceExtensionFlags.hasDebugUtils)
         {
-            ZEN_RHI_VERIFY_MSG_F(false, "vkCreateDebugUtilsMessengerEXT failed: {}", int32_t(messengerResult));
+            error = MakeVulkanError(vkCreateDebugUtilsMessengerEXT(m_instance, &debugMessengerCI, nullptr, &m_messenger),
+                                    "vkCreateDebugUtilsMessengerEXT");
+        }
+        if (!error.IsFailure() && layerSettings && m_messenger)
+        {
+            ZEN_RHI_LOG_INFO(
+                "Active validation layer={} spec={} implementation={} requested_validate_sync=true requested_enable_message_limit=false",
+                layer, m_validationLayer.specVersion, m_validationLayer.implementationVersion);
         }
     }
-
-    ZEN_RHI_VERIFY(m_instance != VK_NULL_HANDLE);
-
-    ZEN_RHI_LOG_INFO("Vulkan Instance Created");
+    return error;
 }
 
-void VulkanRHI::SelectGPU()
+RHIError VulkanRHI::SelectGPU(std::vector<RHIAdapterInfo>* adapters)
 {
-    uint32_t gpuCount = 0;
-
-    VkResult result   = vkEnumeratePhysicalDevices(m_instance, &gpuCount, nullptr);
-
-    if (result != VK_SUCCESS || gpuCount == 0)
-    {
-        ZEN_RHI_VERIFY_MSG_F(false, "No Vulkan physical devices are available (result {})", int32_t(result));
-    }
-
     HeapVector<VkPhysicalDevice> physicalDevices;
+    const VkResult               result = EnumerateVulkanProperties(physicalDevices, vkEnumeratePhysicalDevices, m_instance);
+    RHIError                     error  = MakeVulkanError(result, "vkEnumeratePhysicalDevices");
 
-    physicalDevices.resize(gpuCount);
+    uint32_t selectedIndex              = 0;
 
-    result = vkEnumeratePhysicalDevices(m_instance, &gpuCount, physicalDevices.data());
-
-    if (result != VK_SUCCESS)
-    {
-        ZEN_RHI_VERIFY_MSG_F(false, "vkEnumeratePhysicalDevices failed: {}", int32_t(result));
-    }
-
-    uint32_t selectedIndex   = 0;
-
-    bool foundValidCandidate = false;
+    bool foundValidCandidate            = false;
 
     VulkanPhysicalDeviceCandidateInfo selectedCandidateInfo{};
 
@@ -658,11 +678,21 @@ void VulkanRHI::SelectGPU()
 
     for (uint32_t i = 0; i < physicalDevices.size(); i++)
     {
-        const VulkanPhysicalDeviceCandidateInfo candidateInfo = EvaluatePhysicalDeviceCandidate(physicalDevices[i]);
+        const VulkanPhysicalDeviceCandidateInfo candidateInfo = EvaluatePhysicalDeviceCandidate(physicalDevices[i], error);
+        if (error.IsFailure())
+        {
+            break;
+        }
 
         ZEN_RHI_LOG_INFO("Found Vulkan Compatible GPU: {} ({})", candidateInfo.properties.deviceName,
                          GetPhysicalDeviceTypeName(candidateInfo.properties.deviceType));
 
+        if (adapters)
+        {
+            const VkPhysicalDeviceProperties& gpu = candidateInfo.properties;
+            adapters->push_back({gpu.deviceName, gpu.vendorID, gpu.deviceID, gpu.driverVersion, gpu.apiVersion,
+                                 candidateInfo.unsupportedReason});
+        }
         if (!candidateInfo.isValid)
         {
             ZEN_RHI_LOG_WARN("Rejecting GPU '{}': {}", candidateInfo.properties.deviceName, candidateInfo.unsupportedReason);
@@ -704,23 +734,33 @@ void VulkanRHI::SelectGPU()
         }
     }
 
-    if (!foundValidCandidate)
+    if (!error.IsFailure() && !adapters)
     {
-        ZEN_RHI_VERIFY_MSG_F(
-            false, "No Vulkan device satisfies the required Vulkan 1.2, dynamic rendering and descriptor indexing profile.\n{}",
-            rejectionReasons);
+        if (foundValidCandidate)
+        {
+            if (!preferredDevice.empty() && !selectedPreferred)
+            {
+                ZEN_RHI_LOG_WARN("No valid Vulkan GPU name contains '{}'; using the highest-scoring device", preferredDevice);
+            }
+            ZEN_RHI_LOG_INFO("Selected Vulkan GPU: {} ({}, score={}, localMemory={} MiB, vendor={}, driver={}, api={})",
+                             selectedCandidateInfo.properties.deviceName,
+                             GetPhysicalDeviceTypeName(selectedCandidateInfo.properties.deviceType),
+                             selectedCandidateInfo.score, selectedCandidateInfo.deviceLocalMemoryBytes / (1024ull * 1024ull),
+                             selectedCandidateInfo.properties.vendorID, selectedCandidateInfo.properties.driverVersion,
+                             selectedCandidateInfo.properties.apiVersion);
+            m_pDevice = ZEN_NEW() VulkanDevice(physicalDevices[selectedIndex]);
+            if (!m_pDevice)
+            {
+                error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanDevice");
+            }
+        }
+        else
+        {
+            ZEN_RHI_LOG_ERROR("No Vulkan device satisfies the required profile. {}", rejectionReasons);
+            error = MakeRHIError(RHIErrorCode::eUnsupported, "Select Vulkan physical device", __FILE__, __LINE__);
+        }
     }
-
-    if (!preferredDevice.empty() && !selectedPreferred)
-    {
-        ZEN_RHI_LOG_WARN("No valid Vulkan GPU name contains '{}'; using the highest-scoring device", preferredDevice);
-    }
-
-    ZEN_RHI_LOG_INFO("Selected Vulkan GPU: {} ({}, score={}, localMemory={} MiB)", selectedCandidateInfo.properties.deviceName,
-                     GetPhysicalDeviceTypeName(selectedCandidateInfo.properties.deviceType), selectedCandidateInfo.score,
-                     selectedCandidateInfo.deviceLocalMemoryBytes / (1024ull * 1024ull));
-
-    m_pDevice = ZEN_NEW() VulkanDevice(physicalDevices[selectedIndex]);
+    return error;
 }
 
 VulkanRHI::VulkanRHI() : m_resourceAllocator(ZEN_DEFAULT_PAGESIZE, false)
@@ -728,21 +768,15 @@ VulkanRHI::VulkanRHI() : m_resourceAllocator(ZEN_DEFAULT_PAGESIZE, false)
 #if defined(ZEN_MACOS)
     setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 1);
 #endif
-
-    if (volkInitialize() != VK_SUCCESS)
-    {
-        ZEN_RHI_VERIFY_MSG_F(false, "Failed to initialize volk!");
-    }
-
-    m_resourceAllocator.Init();
-
-    GVkMemAllocator = ZEN_NEW() VulkanMemoryAllocator();
-
-    GVulkanRHI      = this;
+    m_loaderResult = volkInitialize();
 }
 
 VulkanRHI::~VulkanRHI()
 {
+    if (m_loaderResult == VK_SUCCESS)
+    {
+        volkFinalize();
+    }
     if (GVulkanRHI == this)
     {
         GVulkanRHI = nullptr;
@@ -784,14 +818,67 @@ IRHICommandContext* VulkanRHI::GetTransferCommandContext()
 
 void VulkanRHI::Init()
 {
-    m_pResourceFactory = ZEN_NEW() VulkanResourceFactory();
+    const RHIError error = InitChecked();
+    ZEN_RHI_VERIFY_MSG_F(!error.IsFailure(), "{} failed ({})", error.operation, error.nativeCode);
+}
 
-    CreateInstance();
+RHIError VulkanRHI::InitChecked(std::vector<RHIAdapterInfo>* adapters)
+{
+    RHIError error = MakeVulkanError(m_loaderResult, "volkInitialize");
+    GVulkanRHI     = this;
+    if (!error.IsFailure())
+    {
+        error = CreateInstance();
+    }
+    if (!error.IsFailure())
+    {
+        error = SelectGPU(adapters);
+    }
+    if (!error.IsFailure() && !adapters)
+    {
+        m_resourceAllocator.Init();
+        m_pResourceFactory = ZEN_NEW() VulkanResourceFactory();
+        error = m_pResourceFactory ? m_pDevice->InitChecked()
+                                   : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanResourceFactory");
+        if (!error.IsFailure())
+        {
+            PopulateGPUInfo();
+            GVkMemAllocator = ZEN_NEW() VulkanMemoryAllocator();
+            error = GVkMemAllocator
+                      ? MakeVulkanError(GVkMemAllocator->Init(m_instance, GetPhysicalDevice(), GetVkDevice(),
+                                                              m_pDevice->GetExtensionFlags().hasBufferDeviceAddress != 0,
+                                                              m_pDevice->GetExtensionFlags().hasMemoryBudget != 0),
+                                        "vmaCreateAllocator")
+                      : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanMemoryAllocator");
+        }
+        if (!error.IsFailure())
+        {
+            m_pDescriptorPoolManager2        = ZEN_NEW() VulkanDescriptorPoolManager2(m_pDevice);
+            m_pBindlessDescriptorPoolManager = ZEN_NEW() VulkanBindlessDescriptorPoolManager();
+            error = m_pDescriptorPoolManager2 && m_pBindlessDescriptorPoolManager
+                      ? m_pBindlessDescriptorPoolManager->InitChecked()
+                      : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate Vulkan descriptor pool managers");
+        }
+        if (!error.IsFailure())
+        {
+            m_gpuInfo.bindlessHeapCapacities = m_pBindlessDescriptorPoolManager->GetCapacities();
+            m_pUniformBufferAllocator        = ZEN_NEW() VulkanUniformBufferAllocator();
+            if (!m_pUniformBufferAllocator)
+            {
+                error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanUniformBufferAllocator");
+            }
+        }
+        if (!error.IsFailure())
+        {
+            m_pUniformBufferAllocator->Init(RHIFrameState::kMaxFramesInFlight, 4 * 1024 * 1024, 8);
+            m_initialized = true;
+        }
+    }
+    return error;
+}
 
-    SelectGPU();
-
-    m_pDevice->Init();
-
+void VulkanRHI::PopulateGPUInfo()
+{
     const VkPhysicalDeviceProperties properties = m_pDevice->GetPhysicalDeviceProperties();
 
     const VkPhysicalDeviceLimits& limits        = properties.limits;
@@ -943,22 +1030,6 @@ void VulkanRHI::Init()
         rayQuery.maxOpacitySubdivisionLevel = micromap.maxOpacity4StateSubdivisionLevel;
         rayQuery.maxMicromapTriangles       = micromap.maxMicromapTriangles;
     }
-
-    GVkMemAllocator->Init(m_instance, m_pDevice->GetPhysicalDeviceHandle(), m_pDevice->GetVkHandle(),
-                          m_pDevice->GetExtensionFlags().hasBufferDeviceAddress != 0,
-                          m_pDevice->GetExtensionFlags().hasMemoryBudget != 0);
-
-    m_pDescriptorPoolManager2        = ZEN_NEW() VulkanDescriptorPoolManager2(m_pDevice);
-
-    m_pBindlessDescriptorPoolManager = ZEN_NEW() VulkanBindlessDescriptorPoolManager();
-
-    m_pBindlessDescriptorPoolManager->Init();
-
-    m_gpuInfo.bindlessHeapCapacities = m_pBindlessDescriptorPoolManager->GetCapacities();
-
-    m_pUniformBufferAllocator        = ZEN_NEW() VulkanUniformBufferAllocator();
-
-    m_pUniformBufferAllocator->Init(RHIFrameState::kMaxFramesInFlight, 4 * 1024 * 1024, 8);
 }
 
 RHIBindlessHandle VulkanRHI::RegisterBindlessResource(RHIResource* pResource, uint32_t slotIndex)
@@ -1109,6 +1180,8 @@ void VulkanRHI::ReleaseNativeGPUFrameRecording()
 
 void VulkanRHI::Destroy()
 {
+    const bool wasInitialized = m_initialized;
+    m_initialized             = false;
     if (m_gpuFrameTiming != nullptr)
     {
         m_gpuFrameTiming->Seal(RHIGPUTimingStatus::eDiscarded);
@@ -1116,7 +1189,10 @@ void VulkanRHI::Destroy()
         m_gpuFrameTiming.Reset();
     }
 
-    WaitDeviceIdle();
+    if (wasInitialized)
+    {
+        WaitDeviceIdle();
+    }
 
     DestroyPlatformCommandListPool();
 

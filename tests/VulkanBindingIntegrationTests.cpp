@@ -870,6 +870,10 @@ TEST_F(VulkanBindingIntegrationTest, UnpopulatedPartiallyBoundSetIsResolved)
     EXPECT_EQ(firstSet, 1u);
     ASSERT_EQ(sets.size(), 1u);
     EXPECT_NE(sets[0], VK_NULL_HANDLE);
+    RHIBatchedShaderParameters emptyFirst;
+    emptyFirst.AddResourceParam(*pipeline->GetShader()->GetSRDByLocation(1, 0), nullptr, nullptr, 0);
+    ASSERT_TRUE(state.SetShaderParameters(emptyFirst.GetView(), 0, 0));
+    EXPECT_TRUE(state.FlushPendingDescriptorWrites(context, sets, firstSet, offsets));
     // An empty partially-bound array can be bound, but its unpopulated elements cannot be accessed.
     EXPECT_TRUE(offsets.empty());
 }
@@ -1890,6 +1894,18 @@ protected:
         m_previous = RHIOptions::GetInstance().BindlessHeapCapacities();
         RHIBindlessHeapCapacities capacities;
         capacities.slots.fill(UINT32_MAX);
+        // This test creates real descriptor pools. Some drivers advertise billions of descriptors,
+        // which would require tens of GiB of host-side slot bookkeeping to exercise the native maximum.
+        RHIBindlessHeapCapacities fitted{};
+        {
+            test::VulkanSession probe;
+            ASSERT_TRUE(
+                FitBindlessHeapCapacities(probe.rhi.GetDevice()->GetDescriptorIndexingProperties(), capacities, fitted));
+        }
+        if (fitted.GetImageSlots() + fitted.Get(RHIBindlessHeapType::eSampler) > 2u * 1024u * 1024u)
+        {
+            GTEST_SKIP() << "Native maximum exceeds the test allocation budget of two million descriptors";
+        }
         ASSERT_TRUE(RHIOptions::GetInstance().SetBindlessHeapCapacities(capacities));
         VulkanBindingIntegrationTest::SetUp();
     }

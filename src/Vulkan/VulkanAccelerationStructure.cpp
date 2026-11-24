@@ -121,6 +121,7 @@ RHIAccelerationStructureBuildSizes VulkanRHI::GetAccelerationStructureBuildSizes
 
 RHIAccelerationStructure* VulkanRHI::CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info)
 {
+    RHIWorkerTimer timer(RHIWorkerTime::eResource);
     return GetResourceFactory()->CreateAccelerationStructure(info);
 }
 

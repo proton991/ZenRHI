@@ -1,0 +1,12 @@
+diff --git a/src/Vulkan/VkPipeline.cpp b/src/Vulkan/VkPipeline.cpp
+index f466254..07822a3 100644
+--- a/src/Vulkan/VkPipeline.cpp
++++ b/src/Vulkan/VkPipeline.cpp
+@@ -712,6 +712,7 @@ void ComputePipeline::run(uint32_t baseGroupX, uint32_t baseGroupY, uint32_t bas
+                           const vk::Pipeline::PushConstantStorage &pushConstants)
+ {
+ 	ASSERT_OR_RETURN(program != nullptr);
++	DescriptorSet::PrepareForSampling(descriptorSetObjects, layout, device);
+ 	program->run(
+ 	    descriptorSetObjects, descriptorSets, descriptorDynamicOffsets, pushConstants,
+ 	    baseGroupX, baseGroupY, baseGroupZ,

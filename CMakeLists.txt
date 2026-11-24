@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.23)
+cmake_minimum_required(VERSION 3.24)
 project(ZenRHI VERSION 0.2.0 LANGUAGES C CXX)
 # Zen components are released together: each one requires the matching ZenFoundation major.minor.
 set(ZENRHI_FOUNDATION_ABI "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
@@ -6,7 +6,7 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 include(FetchContent)
 option(ZENRHI_BUILD_TESTS "Build RHI tests" ${PROJECT_IS_TOP_LEVEL})
-option(ZENRHI_BUILD_EXAMPLES "Build the SDL3 Triangle example" ${PROJECT_IS_TOP_LEVEL})
+option(ZENRHI_BUILD_EXAMPLES "Build Triangle and the compute examples" ${PROJECT_IS_TOP_LEVEL})
 option(ZENRHI_INSTALL "Install ZenRHI and CMake package files" ${PROJECT_IS_TOP_LEVEL})
 
 if(NOT TARGET ZenFoundation::Foundation)
@@ -29,7 +29,7 @@ get_target_property(foundation_abi ZenFoundation::Foundation INTERFACE_ZenFounda
 if(NOT foundation_abi STREQUAL ZENRHI_FOUNDATION_ABI)
     message(FATAL_ERROR "${PROJECT_NAME} ${PROJECT_VERSION} requires ZenFoundation ${ZENRHI_FOUNDATION_ABI}.x, found ABI ${foundation_abi}")
 endif()
-find_package(Vulkan REQUIRED)
+find_package(Vulkan REQUIRED COMPONENTS SPIRV-Tools)
 add_library(ZenRHICore STATIC
     src/Core/DynamicRHI.cpp
     src/Core/RHICommandList.cpp
@@ -39,7 +39,11 @@ add_library(ZenRHICore STATIC
     src/Core/RHIRayTracing.cpp
     src/Core/RHIResource.cpp
     src/Core/RHIShaderUtil.cpp
-    src/Core/RHIThread.cpp)
+    src/Core/RHIThread.cpp
+    src/Core/ThreadStack.cpp)
+if(WIN32)
+    target_link_libraries(ZenRHICore PRIVATE dbghelp)
+endif()
 add_library(ZenRHIVulkan STATIC
     src/Vulkan/Platform/VulkanMacOSPlatform.cpp
     src/Vulkan/Platform/VulkanWindowBridge.cpp
@@ -82,7 +86,7 @@ target_compile_features(ZenRHICore PUBLIC cxx_std_20)
 target_include_directories(ZenRHICore PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_include_directories(ZenRHIVulkan PRIVATE src "${Vulkan_INCLUDE_DIRS}")
 target_include_directories(ZenRHI PRIVATE src "${Vulkan_INCLUDE_DIRS}")
-target_link_libraries(ZenRHICore PUBLIC ZenFoundation::Foundation)
+target_link_libraries(ZenRHICore PUBLIC ZenFoundation::Foundation PRIVATE Vulkan::SPIRV-Tools)
 target_link_libraries(ZenRHIVulkan PUBLIC ZenRHICore Vulkan::Headers)
 target_link_libraries(ZenRHI PUBLIC ZenRHIVulkan)
 target_compile_definitions(ZenRHIVulkan PRIVATE VK_NO_PROTOTYPES)
@@ -97,11 +101,14 @@ if(ZENRHI_BUILD_TESTS)
 endif()
 if(ZENRHI_BUILD_EXAMPLES)
     add_subdirectory(examples/Triangle)
+    add_subdirectory(examples/Compute)
 endif()
 if(ZENRHI_INSTALL)
     set(package_dir "${CMAKE_INSTALL_LIBDIR}/cmake/ZenRHI")
     install(FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/ZenRHI/Version.h" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/ZenRHI")
     install(TARGETS ZenRHICore ZenRHIVulkan ZenRHI EXPORT ZenRHITargets)
+    install(FILES ProgrammingGuide.md DESTINATION "${CMAKE_INSTALL_DOCDIR}")
+    install(FILES include/ZenRHI/README.md DESTINATION "${CMAKE_INSTALL_DOCDIR}/include/ZenRHI")
     install(DIRECTORY include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" PATTERN "*.md" EXCLUDE)
     install(TARGETS ZenRHITestSupport EXPORT ZenRHITestSupportTargets)
     install(DIRECTORY test-support/include/ DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
