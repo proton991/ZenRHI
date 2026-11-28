@@ -1,12 +1,9 @@
 #pragma once
-#include "Vulkan/VulkanPipeline.h"
 #include "Vulkan/VulkanSetLayout.h"
 #include "ZenRHI/RHIShaderParameters.h"
 #include "ZenFoundation/Templates/FlatHashMap.h"
 #include "ZenFoundation/Templates/HeapVector.h"
-#include "ZenFoundation/Utils/Mutex.h"
 #include <algorithm>
-#include <atomic>
 #include <span>
 
 namespace zen

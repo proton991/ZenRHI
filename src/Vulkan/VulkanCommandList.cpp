@@ -654,7 +654,7 @@ void VulkanCommandContextBase::FinalizePendingWorkload()
 RHISubmissionResult VulkanCommandContextBase::SubmitRecordedWorkloads()
 {
     m_pQueue->GetDevice()->GetRHI()->SetSubmissionError({});
-    ZEN_RHI_VERIFY_MSG(!m_pQueue->HasPendingSubmissions(), "Immediate submission cannot interleave with a platform-list flush");
+    ZEN_RHI_VERIFY_MSG(!m_pQueue->HasPendingSubmissions(), "Immediate submission cannot interleave with a pending batch");
     RHISubmissionResult result = RHISubmissionResult::eSuccess;
 
     HeapVector<VulkanWorkload*> workloads;
@@ -665,8 +665,9 @@ RHISubmissionResult VulkanCommandContextBase::SubmitRecordedWorkloads()
     if (m_recordingError.IsFailure())
     {
         m_pQueue->GetDevice()->GetRHI()->SetSubmissionError(m_recordingError);
-        result =
-            m_recordingError.code == RHIErrorCode::eDeviceLost ? RHISubmissionResult::eFatal : RHISubmissionResult::eRejected;
+        result = m_recordingError.code == RHIErrorCode::eDeviceLost || m_pQueue->GetDevice()->GetRHI()->AreSubmissionsBlocked()
+                   ? RHISubmissionResult::eFatal
+                   : RHISubmissionResult::eRejected;
 
         for (VulkanWorkload* workload : workloads)
         {
@@ -702,6 +703,10 @@ RHISubmissionResult VulkanCommandContextBase::SubmitRecordedWorkloads()
             {
                 m_pQueue->ProcessPendingWorkloads(0);
             }
+        }
+        else if (m_pQueue->GetDevice()->GetRHI()->AreSubmissionsBlocked())
+        {
+            result = RHISubmissionResult::eFatal;
         }
     }
 
@@ -1916,8 +1921,9 @@ RHISubmissionResult VulkanRHI::SubmitCommandLists(std::span<RHICommandList*> lis
     {
         SetSubmissionError(translated.error);
 
-        result =
-            translated.error.code == RHIErrorCode::eDeviceLost ? RHISubmissionResult::eFatal : RHISubmissionResult::eRejected;
+        // A blocked device is terminal whatever error blocked it; only an unblocked rejection may be retried.
+        result = translated.error.code == RHIErrorCode::eDeviceLost || AreSubmissionsBlocked() ? RHISubmissionResult::eFatal
+                                                                                               : RHISubmissionResult::eRejected;
     }
 
     return result;

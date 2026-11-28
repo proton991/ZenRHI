@@ -224,9 +224,7 @@ void VulkanSampler::Destroy()
 {
     vkDestroySampler(m_pRHI->GetVkDevice(), m_vkSampler, nullptr);
 
-    this->~VulkanSampler();
-
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 
 RHITexture* VulkanRHI::CreateTexture(const RHITextureCreateInfo& createInfo)
@@ -421,9 +419,7 @@ void VulkanTexture::Destroy()
         m_pRHI->GetMemoryAllocator()->FreeImage(m_vkImage, m_memAlloc);
     }
 
-    this->~VulkanTexture();
-
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 
 RHIResult<VulkanTextureView*> VulkanTextureView::CreateObject(VulkanTexture*                  pTexture,
@@ -481,9 +477,7 @@ void VulkanTextureView::Destroy()
         m_vkImageView = nullptr;
     }
 
-    this->~VulkanTextureView();
-
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 
 } // namespace zen

@@ -11,9 +11,7 @@
 #include "Core/RHIValidation.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanDevice.h"
-#include "Vulkan/VulkanDescriptorAllocator.h"
 #include "Vulkan/VulkanBindlessHeap.h"
-#include "Vulkan/VulkanTypes.h"
 #include "ZenFoundation/Templates/HeapVector.h"
 #include "ZenFoundation/Utils/Errors.h"
 #include "ZenFoundation/Utils/Helpers.h"
@@ -383,9 +381,7 @@ void VulkanPipeline::Destroy()
 {
     vkDestroyPipeline(m_pRHI->GetVkDevice(), m_vkPipeline, nullptr);
 
-    this->~VulkanPipeline();
-
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 
 RHIError VulkanPipeline::InitGraphics(const RHIRenderingLayout& layout)

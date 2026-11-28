@@ -11,9 +11,8 @@
 #include "Core/RHIValidation.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanDevice.h"
-#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "Vulkan/VulkanSetLayout.h"
 #include "Vulkan/VulkanBindlessHeap.h"
-#include "Vulkan/VulkanTypes.h"
 #include "ZenFoundation/Templates/HeapVector.h"
 #include "ZenFoundation/Utils/Errors.h"
 #include "ZenFoundation/Utils/Helpers.h"
@@ -502,8 +501,6 @@ void VulkanShader::BuildVertexInput(const RHIShaderGroupInfo& sgInfo)
 
 bool VulkanShader::CreatePipelineLayout(const RHIShaderGroupInfo& sgInfo)
 {
-    bool ready = true;
-
     VkPipelineLayoutCreateInfo pipelineLayoutCI;
 
     InitVkStruct(pipelineLayoutCI, VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
@@ -534,24 +531,21 @@ bool VulkanShader::CreatePipelineLayout(const RHIShaderGroupInfo& sgInfo)
         pipelineLayoutCI.pPushConstantRanges    = &prc;
     }
 
-    if (ready)
+    const VkResult result = vkCreatePipelineLayout(m_pRHI->GetVkDevice(), &pipelineLayoutCI, nullptr, &m_pipelineLayout);
+
+    const bool ready      = result == VK_SUCCESS;
+
+    if (!ready)
     {
-        const VkResult result = vkCreatePipelineLayout(m_pRHI->GetVkDevice(), &pipelineLayoutCI, nullptr, &m_pipelineLayout);
+        m_pRHI->CheckDeviceLoss(result, "vkCreatePipelineLayout");
 
-        ready                 = result == VK_SUCCESS;
+        ZEN_RHI_LOG_ERROR("vkCreatePipelineLayout failed: {}", GetResultString(result));
 
-        if (!ready)
+        if (m_pipelineLayout != VK_NULL_HANDLE)
         {
-            m_pRHI->CheckDeviceLoss(result, "vkCreatePipelineLayout");
+            vkDestroyPipelineLayout(m_pRHI->GetVkDevice(), m_pipelineLayout, nullptr);
 
-            ZEN_RHI_LOG_ERROR("vkCreatePipelineLayout failed: {}", GetResultString(result));
-
-            if (m_pipelineLayout != VK_NULL_HANDLE)
-            {
-                vkDestroyPipelineLayout(m_pRHI->GetVkDevice(), m_pipelineLayout, nullptr);
-
-                m_pipelineLayout = VK_NULL_HANDLE;
-            }
+            m_pipelineLayout = VK_NULL_HANDLE;
         }
     }
 
@@ -580,8 +574,6 @@ void VulkanShader::Destroy()
         vkDestroyPipelineLayout(m_pRHI->GetVkDevice(), m_pipelineLayout, nullptr);
     }
 
-    this->~VulkanShader();
-
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 } // namespace zen

@@ -1,5 +1,4 @@
 #pragma once
-#include "ZenFoundation/Templates/Queue.h"
 #include "ZenFoundation/Templates/SmallVector.h"
 #include "VulkanCommon.h"
 #include "ZenRHI/RHIResource.h"

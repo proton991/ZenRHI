@@ -219,6 +219,9 @@ protected:
 
         EXPECT_TRUE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
+        // A device blocked by an error other than device loss stays terminal for later batches.
+        EXPECT_EQ(queue.GetDevice()->GetRHI()->FlushAllGPUCommands(), zen::RHISubmissionResult::eFatal);
+
         EXPECT_EQ(serial, 0u);
 
         EXPECT_EQ(queue.GetLastCompletedSerial(), 0u);

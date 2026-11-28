@@ -5,6 +5,7 @@
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanDescriptorState.h"
 #include "Vulkan/VulkanDevice.h"
+#include "Vulkan/VulkanPipeline.h"
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <memory>

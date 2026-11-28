@@ -236,8 +236,6 @@ void VulkanDescriptorSetState::SetPipeline(VulkanPipeline* pPipeline)
 
         m_setStates.resize(shader != nullptr ? shader->GetNumDescriptorSetLayouts() : 0);
 
-        m_packedValueBuffers.clear();
-
         m_cacheRevision          = 0;
 
         m_pPipeline              = pPipeline;
@@ -438,29 +436,6 @@ RHIStatus VulkanDescriptorSetState::FlushPendingDescriptorWrites(VulkanCommandLi
     }
 
     return status;
-}
-
-void VulkanDescriptorSetState::Reset()
-{
-    m_parametersValid = true;
-
-    ClearAllSetStates();
-
-    m_setStates.clear();
-
-    m_packedValueBuffers.clear();
-
-
-    m_cacheRevision          = 0;
-
-    m_pPipeline              = nullptr;
-    m_pipelineIdentity       = 0;
-
-    m_lastWorkloadGeneration = 0;
-
-    m_resolvedSets.clear();
-
-    m_resolvedOffsets.clear();
 }
 
 RHIStatus VulkanDescriptorSetState::ResolveSet(uint32_t setIdx)

@@ -205,7 +205,7 @@ static VkCompositeAlphaFlagBitsKHR ChooseCompositeAlpha(VkCompositeAlphaFlagBits
         {
             if ((compositeAlpha & supported) != 0)
             {
-                ZEN_RHI_LOG_WARN("(Swapchain) Composite alpha '{}' not supported. Selecting '{}.", VkToString(request),
+                ZEN_RHI_LOG_WARN("(Swapchain) Composite alpha '{}' not supported. Selecting '{}'.", VkToString(request),
                                  VkToString(compositeAlpha));
 
                 selected = compositeAlpha;

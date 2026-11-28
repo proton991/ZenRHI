@@ -96,9 +96,7 @@ void VulkanViewport::Destroy()
 {
     DestroySwapchain(nullptr);
 
-    this->~VulkanViewport();
-
-    VersatileResource::Free(m_pDevice->GetRHI()->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pDevice->GetRHI(), this);
 }
 
 bool VulkanViewport::CreateSwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo)

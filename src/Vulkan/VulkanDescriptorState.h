@@ -24,8 +24,6 @@ public:
                                            uint32_t&                    outFirstSet,
                                            HeapVector<uint32_t>&        outDynamicOffsets);
 
-    void Reset();
-
 private:
     VulkanRHI* m_pRHI{nullptr};
 

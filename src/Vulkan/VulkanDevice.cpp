@@ -258,6 +258,8 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, const RHIDe
         }
     }
 
+    bool cubeArrays = false;
+
     if (reason.empty())
     {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
@@ -275,6 +277,8 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, const RHIDe
         indexing.pNext = &timeline;
 
         vkGetPhysicalDeviceFeatures2(gpu, &features);
+
+        cubeArrays = features.features.imageCubeArray == VK_TRUE;
 
         if (!dynamic.dynamicRendering)
         {
@@ -300,13 +304,8 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, const RHIDe
 
         vkGetPhysicalDeviceProperties2(gpu, &properties2);
 
-        VkPhysicalDeviceFeatures coreFeatures{};
-
-        vkGetPhysicalDeviceFeatures(gpu, &coreFeatures);
-
-        const RHIBindlessHeapCapacities capacities =
-            GetBindlessHeapRequest(desc.BindlessHeapCapacities(), coreFeatures.imageCubeArray == VK_TRUE);
-        RHIBindlessHeapCapacities fitted = kNoBindlessHeaps;
+        const RHIBindlessHeapCapacities capacities = GetBindlessHeapRequest(desc.BindlessHeapCapacities(), cubeArrays);
+        RHIBindlessHeapCapacities       fitted     = kNoBindlessHeaps;
 
         if (!FitBindlessHeapCapacities(limits, capacities, fitted))
         {

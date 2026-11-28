@@ -299,6 +299,11 @@ void RHIThread::Stop(std::function<void()> finalizer)
     m_threaded.store(false, std::memory_order_release);
 }
 
+void RHIThread::CloseCleanupAdmission()
+{
+    m_cleanupClosed.store(true, std::memory_order_release);
+}
+
 void RHIThread::ExecuteFinalizer(std::function<void()> finalizer)
 {
     // Releases from the finalizer are RHI-thread work, as they are on the worker.

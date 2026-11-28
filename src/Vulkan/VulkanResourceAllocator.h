@@ -42,6 +42,17 @@ template <typename T, typename... Args> T* NewVulkanResource(VulkanRHI* pRHI, Ar
     return resource;
 }
 
+// Destroys a resource made by NewVulkanResource and returns its storage. The allocator is read before the destructor
+// runs, because the resource's members end with it.
+template <typename T> void DeleteVulkanResource(VulkanRHI* pRHI, T* resource)
+{
+    PagedAllocator<VersatileResource>& allocator = pRHI->GetResourceAllocator();
+
+    resource->~T();
+
+    VersatileResource::Free(allocator, resource);
+}
+
 // Keeps a resource whose initialisation succeeded; otherwise releases it and returns the error.
 template <typename T> RHIResult<T*> KeepIfInitialized(T* resource, const RHIError& error)
 {

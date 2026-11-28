@@ -23,7 +23,8 @@ struct RHIAdapterInfo
     std::string unsupportedReason;
 };
 
-// Startup calls are externally serialized. Enumeration needs no logical device.
+// Startup calls are externally serialized. Enumeration needs no logical device. One backend is live per process:
+// while one is, both calls fail with eInvalidArgument and leave it untouched.
 RHIResult<std::vector<RHIAdapterInfo>> EnumerateRHIAdapters(const RHIDeviceDesc& description);
 RHIResult<DynamicRHI*>                 CreateRHIChecked(const RHIDeviceDesc& description);
 DynamicRHI*                            CreateRHI(const RHIDeviceDesc& description);
@@ -329,6 +330,4 @@ private:
         }
     }
 };
-
-// Global instance pointer
 } // namespace zen

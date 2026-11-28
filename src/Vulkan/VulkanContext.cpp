@@ -12,6 +12,7 @@
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanMemory.h"
 #include "Vulkan/VulkanPipeline.h"
+#include <atomic>
 #include <cstdlib>
 
 namespace zen
@@ -19,6 +20,9 @@ namespace zen
 
 namespace
 {
+// volk keeps the loader and the device entry points in process-wide tables, so one VulkanRHI owns them at a time.
+std::atomic<bool> loaderClaimed{false};
+
 static bool HasExtensionEnabled(const HeapVector<NameID>& extensions, NameID extensionName)
 {
     return std::find(extensions.begin(), extensions.end(), extensionName) != extensions.end();
@@ -693,8 +697,10 @@ RHIError VulkanRHI::SelectGPU(std::vector<RHIAdapterInfo>* adapters)
 
 VulkanRHI::VulkanRHI(const RHIDeviceDesc& desc) : m_desc(desc), m_resourceAllocator(ZEN_DEFAULT_PAGESIZE, false)
 {
+    bool unclaimed              = false;
     m_executionCounters.enabled = desc.ExecutionCountersEnabled();
-    m_loaderResult              = volkInitialize();
+    m_ownsLoader                = loaderClaimed.compare_exchange_strong(unclaimed, true);
+    m_loaderResult              = m_ownsLoader ? volkInitialize() : VK_ERROR_INITIALIZATION_FAILED;
 }
 
 VulkanRHI::~VulkanRHI()
@@ -702,6 +708,10 @@ VulkanRHI::~VulkanRHI()
     if (m_loaderResult == VK_SUCCESS)
     {
         volkFinalize();
+    }
+    if (m_ownsLoader)
+    {
+        loaderClaimed.store(false);
     }
 }
 
@@ -748,7 +758,9 @@ IRHICommandContext* VulkanRHI::GetCommandContext(RHICommandContextType contextTy
 
 RHIError VulkanRHI::InitChecked(std::vector<RHIAdapterInfo>* adapters)
 {
-    RHIError error = MakeVulkanError(m_loaderResult, "volkInitialize");
+    RHIError error = m_ownsLoader
+                       ? MakeVulkanError(m_loaderResult, "volkInitialize")
+                       : MakeRHIError(RHIErrorCode::eInvalidArgument, "Vulkan backend already active", __FILE__, __LINE__);
     if (!error.IsFailure())
     {
         error = CreateInstance();
@@ -906,11 +918,8 @@ void VulkanRHI::PopulateGPUInfo()
     rayQuery.graphicsBuild                 = GetQueueCopyCapabilities(RHICommandContextType::eGraphics).compute;
     if (rayQuery.accelerationStructure)
     {
-        VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationProperties{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
-        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-        properties.pNext = &accelerationProperties;
-        vkGetPhysicalDeviceProperties2(m_pDevice->GetPhysicalDeviceHandle(), &properties);
+        const VkPhysicalDeviceAccelerationStructurePropertiesKHR& accelerationProperties =
+            m_pDevice->GetAccelerationStructureProperties();
         rayQuery.scratchAlignment = accelerationProperties.minAccelerationStructureScratchOffsetAlignment;
         rayQuery.maxGeometries    = accelerationProperties.maxGeometryCount;
         rayQuery.maxPrimitives    = accelerationProperties.maxPrimitiveCount;
@@ -1182,5 +1191,7 @@ void VulkanRHI::Destroy()
 
         m_instance = VK_NULL_HANDLE;
     }
+
+    m_runtime->thread.CloseCleanupAdmission();
 }
 } // namespace zen

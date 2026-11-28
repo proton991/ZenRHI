@@ -311,6 +311,7 @@ private:
 
     RHIError          SelectGPU(std::vector<RHIAdapterInfo>* adapters);
     VkResult          m_loaderResult{};
+    bool              m_ownsLoader{};
     bool              m_initialized{};
     VkLayerProperties m_validationLayer{};
 

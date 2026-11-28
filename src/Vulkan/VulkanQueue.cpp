@@ -202,9 +202,9 @@ void VulkanQueue::DestroyWorkload(VulkanWorkload* pWorkload)
     {
         pWorkload->m_ownership.Release(*m_pDevice->GetRHI());
 
-        for (VulkanWorkload* pWorkload : pWorkload->m_mergedWorkloads)
+        for (VulkanWorkload* pMerged : pWorkload->m_mergedWorkloads)
         {
-            DestroyWorkload(pWorkload);
+            DestroyWorkload(pMerged);
         }
 
         pWorkload->m_mergedWorkloads.clear();
@@ -220,18 +220,18 @@ bool VulkanQueue::CanMergeWorkloads(const VulkanWorkload* pPreviousWorkload, con
         && pCurrentWorkload->m_waitSemaphoreInfos.empty();
 }
 
-static RHISubmissionResult SubmissionFailure(VulkanRHI& rhi, VkResult result, bool submittedPrefix)
+static RHISubmissionResult SubmissionFailure(VulkanRHI& rhi, VkResult result)
 {
     rhi.CheckDeviceLoss(result, "vkQueueSubmit");
 
     rhi.SetSubmissionError(MakeVulkanError(result, "vkQueueSubmit", __FILE__, __LINE__));
 
-    ZEN_RHI_LOG_ERROR("Vulkan queue submission failed: {} (submitted prefix: {})", int32_t(result), submittedPrefix);
+    ZEN_RHI_LOG_ERROR("Vulkan queue submission failed: {}", int32_t(result));
 
     // Vulkan guarantees unchanged resource/semaphore state for these errors only.
     const bool rejected = result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-    return rejected && !submittedPrefix ? RHISubmissionResult::eRejected : RHISubmissionResult::eFatal;
+    return rejected ? RHISubmissionResult::eRejected : RHISubmissionResult::eFatal;
 }
 
 void VulkanQueue::DiscardPendingWorkloads(bool uncertain)
@@ -513,7 +513,7 @@ RHISubmissionResult VulkanQueue::SubmitWorkloads(uint64_t& lastSubmissionSerial)
                 m_workloadsPendingSubmit.Push(workload);
             }
 
-            returnValue = SubmissionFailure(*m_pDevice->GetRHI(), result, false);
+            returnValue = SubmissionFailure(*m_pDevice->GetRHI(), result);
         }
         else
         {

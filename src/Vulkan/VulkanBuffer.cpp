@@ -122,9 +122,7 @@ void VulkanBuffer::Destroy()
         m_pRHI->GetMemoryAllocator()->FreeBuffer(m_vkBuffer, m_memAlloc);
     }
 
-    this->~VulkanBuffer();
-
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 
 uint8_t* VulkanBuffer::Map()

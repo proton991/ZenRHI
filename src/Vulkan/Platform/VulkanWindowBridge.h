@@ -10,6 +10,4 @@ void AddWindowInstanceExtensions(HeapVector<UniquePtr<VulkanInstanceExtension>>&
 
 // The window's provider creates the surface. A null window or provider fails.
 RHIResult<VkSurfaceKHR> CreateWindowSurface(VkInstance instance, RHIWindowHandle window);
-
-void DestroyWindowSurface(VkInstance instance, VkSurfaceKHR surface);
 } // namespace zen

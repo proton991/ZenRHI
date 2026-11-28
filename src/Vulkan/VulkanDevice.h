@@ -26,7 +26,7 @@ struct VulkanQueueSharing
 class VulkanDevice
 {
 public:
-    // pRHI owns the device; standalone capability probes may pass null.
+    // pRHI owns the device and must outlive it.
     VulkanDevice(VulkanRHI* pRHI, VkPhysicalDevice gpu);
 
     VulkanRHI* GetRHI() const

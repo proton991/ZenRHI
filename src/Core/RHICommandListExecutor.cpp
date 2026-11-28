@@ -812,8 +812,7 @@ bool RHICommandListExecutor::ExecuteGroups(RHICommandBatch& batch)
 
         size_t end                        = first + 1;
 
-        // The fence path keeps its existing per-group failure behavior. Timeline
-        // submissions atomically accept or reject every batch in this native call.
+        // One native call atomically accepts or rejects every list in it.
         // Logical queues can share a native handle but keep separate pending workloads;
         // flush each logical run before advancing so backend queue-drain order cannot reorder it.
         while (m_submissionQueueCapabilities.asyncSubmissionDependencies && end < batch.groups.size()

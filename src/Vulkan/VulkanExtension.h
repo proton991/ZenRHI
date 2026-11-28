@@ -82,17 +82,6 @@ public:
         m_supported = supported;
     }
 
-    void SetCoreSupport()
-    {
-        m_supported = true;
-        m_core      = true;
-    }
-
-    bool RequiresExtensionName() const
-    {
-        return !m_core;
-    }
-
     bool IsSupported() const
     {
         return m_supported;
@@ -102,7 +91,6 @@ private:
     NameID m_extensionName;
     // supported by driver
     bool m_supported{false};
-    bool m_core{false};
 };
 class VulkanInstanceExtension;
 using VulkanInstanceExtensionArray = HeapVector<UniquePtr<VulkanInstanceExtension>>;

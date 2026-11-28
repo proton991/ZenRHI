@@ -92,6 +92,10 @@ public:
     // the worker has exited, and after Stop returns all work runs inline as it did before Start.
     void Stop(std::function<void()> finalizer = {});
 
+    // A backend torn down without an executor retires itself: cleanup admission closes until Start, so a later
+    // release leaks the object instead of reaching the destroyed backend. Stop with a finalizer already does this.
+    void CloseCleanupAdmission();
+
     // Device creation applies the RHIDeviceDesc stall settings. Zero disables a threshold.
     void SetStallReports(std::chrono::milliseconds report, std::chrono::milliseconds fatal, bool captureStack);
 

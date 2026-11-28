@@ -319,8 +319,7 @@ void VulkanAccelerationStructure::Destroy()
     {
         m_pStorageBuffer->ReleaseReference();
     }
-    this->~VulkanAccelerationStructure();
-    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
+    DeleteVulkanResource(m_pRHI, this);
 }
 
 bool VulkanAccelerationStructure::IsUpdateCompatible(const RHIAccelerationStructureBuildDesc& desc) const

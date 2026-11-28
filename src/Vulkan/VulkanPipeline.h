@@ -108,12 +108,12 @@ private:
     {
         SmallVector<VkVertexInputBindingDescription>   vkBindings;
         SmallVector<VkVertexInputAttributeDescription> vkAttributes;
-        VkPipelineVertexInputStateCreateInfo           stateCI;
+        VkPipelineVertexInputStateCreateInfo           stateCI{};
     } m_vertexInputInfo;
     HeapVector<VkSpecializationMapEntry>         m_spcMapEntries{};
     HeapVector<uint32_t>                         m_specializationData{};
     VkSpecializationInfo                         m_specializationInfo{};
-    VkShaderStageFlags                           m_pushConstantsStageFlags;
+    VkShaderStageFlags                           m_pushConstantsStageFlags{};
     SmallVector<VkPipelineShaderStageCreateInfo> m_stageCreateInfos;
 
     // Shared layouts, one per set; set 0 is the global heap's. Empty unless every set has one.

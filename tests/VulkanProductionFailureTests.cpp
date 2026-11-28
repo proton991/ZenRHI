@@ -57,6 +57,20 @@ VKAPI_ATTR void VKAPI_CALL RejectBindless(VkDevice,
     support->supported = VK_FALSE;
 }
 
+class LateReleaseResource : public RHIResource
+{
+public:
+    LateReleaseResource() : RHIResource(RHIResourceType::eSampler) {}
+
+    uint32_t destroyCalls{0};
+
+protected:
+    void Destroy() override
+    {
+        ++destroyCalls;
+    }
+};
+
 void InjectStartupFault(const RHIMessage& diagnostic) noexcept
 {
     if (diagnostic.text.starts_with("Active validation layer="))
@@ -118,6 +132,47 @@ TEST(VulkanProductionFailureTest, CheckedStartupRestoresHostAndRetries)
     EXPECT_NE(GetVulkanDeviceHandles(*created.GetValue()).device, VK_NULL_HANDLE);
     created.GetValue()->Destroy();
     ZEN_DELETE(created.GetValue());
+}
+
+TEST(VulkanProductionFailureTest, SecondBackendIsRefusedWhileOneIsLive)
+{
+    RHIResult<DynamicRHI*> created = CreateRHIChecked(test::MakeTestDeviceDesc());
+    ASSERT_TRUE(created);
+
+    // The loader and the device entry points are process-wide, so neither call may unload or replace them.
+    RHIResult<std::vector<RHIAdapterInfo>> adapters = EnumerateRHIAdapters(test::MakeTestDeviceDesc());
+    RHIResult<DynamicRHI*>                 second   = CreateRHIChecked(test::MakeTestDeviceDesc());
+    ASSERT_FALSE(adapters);
+    ASSERT_FALSE(second);
+    EXPECT_EQ(adapters.GetError().code, RHIErrorCode::eInvalidArgument);
+    EXPECT_EQ(second.GetError().code, RHIErrorCode::eInvalidArgument);
+
+    created.GetValue()->WaitDeviceIdle();
+    created.GetValue()->Destroy();
+    ZEN_DELETE(created.GetValue());
+
+    EXPECT_TRUE(EnumerateRHIAdapters(test::MakeTestDeviceDesc()));
+}
+
+TEST(VulkanProductionFailureTest, StandaloneTeardownLeaksLateReleases)
+{
+    const bool             strict  = GetRHIStrictTeardownChecks();
+    RHIResult<DynamicRHI*> created = CreateRHIChecked(test::MakeTestDeviceDesc());
+    ASSERT_TRUE(created);
+
+    LateReleaseResource* late = ZEN_NEW() LateReleaseResource();
+    late->BindRuntime(&created.GetValue()->GetRuntime());
+
+    SetRHIStrictTeardownChecks(false);
+    created.GetValue()->Destroy();
+    ZEN_DELETE(created.GetValue());
+
+    // Without an executor the backend closes admission itself, so the release never reaches the deleted backend.
+    EXPECT_EQ(late->ReleaseReference(), 0u);
+    EXPECT_EQ(late->destroyCalls, 0u);
+
+    SetRHIStrictTeardownChecks(strict);
+    ZEN_DELETE(late);
 }
 
 struct PipelineFailure

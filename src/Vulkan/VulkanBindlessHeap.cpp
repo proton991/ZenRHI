@@ -158,6 +158,8 @@ void VulkanBindlessHeap::Destroy()
         slots.clear();
     }
 
+    m_journals.clear();
+
     if (m_pDevice != nullptr)
     {
         const VkDevice device = m_pDevice->GetVkHandle();

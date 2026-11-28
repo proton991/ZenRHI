@@ -48,12 +48,4 @@ RHIResult<VkSurfaceKHR> CreateWindowSurface(VkInstance instance, RHIWindowHandle
     return result == VK_SUCCESS ? RHIResult<VkSurfaceKHR>(surface)
                                 : RHIResult<VkSurfaceKHR>(MakeVulkanError(result, "CreateWindowSurface", __FILE__, __LINE__));
 }
-
-void DestroyWindowSurface(VkInstance instance, VkSurfaceKHR surface)
-{
-    if (instance != VK_NULL_HANDLE && surface != VK_NULL_HANDLE)
-    {
-        vkDestroySurfaceKHR(instance, surface, nullptr);
-    }
-}
 } // namespace zen

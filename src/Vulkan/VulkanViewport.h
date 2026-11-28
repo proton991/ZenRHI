@@ -11,7 +11,7 @@ class VulkanQueue;
 class VulkanDevice;
 class VulkanSemaphore;
 class VulkanTexture;
-struct VulkanCommandListContext;
+class VulkanCommandListContext;
 
 class VulkanViewport : public RHIViewport
 {

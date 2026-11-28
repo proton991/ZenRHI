@@ -360,7 +360,7 @@ void VulkanGPUTimingRecorder::Resolve(VulkanDevice& device)
 
         const uint32_t count = static_cast<uint32_t>(m_scopes.size()) * 2;
 
-        // The queue's fence/timeline proves completion. Never wait for a profiler query.
+        // The queue's timeline proves completion. Never wait for a profiler query.
         const VkResult status =
             vkGetQueryPoolResults(device.GetVkHandle(), m_pool, 0, count, count * sizeof(TimestampValue), values.data(),
                                   sizeof(TimestampValue), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);

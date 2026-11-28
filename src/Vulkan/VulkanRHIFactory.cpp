@@ -9,7 +9,6 @@ namespace
 {
 RHIError InitializeBackend(const RHIDeviceDesc& description, VulkanRHI*& backend, std::vector<RHIAdapterInfo>* adapters)
 {
-    RHIWorkerTimer::SetEnabled(description.WorkerTimingEnabled());
     backend = ZEN_NEW() VulkanRHI(description);
     RHIError error =
         backend ? RHIError{} : MakeRHIError(RHIErrorCode::eOutOfHostMemory, "Allocate VulkanRHI", __FILE__, __LINE__);
@@ -27,6 +26,10 @@ RHIError InitializeBackend(const RHIDeviceDesc& description, VulkanRHI*& backend
         }
         ZEN_DELETE(backend);
         backend = nullptr;
+    }
+    else
+    {
+        RHIWorkerTimer::SetEnabled(description.WorkerTimingEnabled());
     }
     return error;
 }

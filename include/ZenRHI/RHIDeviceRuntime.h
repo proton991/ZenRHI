@@ -7,7 +7,8 @@
 
 namespace zen
 {
-// Hears the stable ID of each buffer and texture after its final release, on the releasing thread.
+// Hears the stable ID of each buffer and texture after its final release. The call runs where the release's cleanup
+// runs: on the device's worker in threaded mode, inline on the releasing thread otherwise.
 class RHIDestructionListener
 {
 public:
