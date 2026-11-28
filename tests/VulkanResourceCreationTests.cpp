@@ -1,6 +1,7 @@
 #include "ZenRHI/RHIResource.h"
 #include "Vulkan/VulkanDescriptorState.h"
 #include "Vulkan/VulkanPipeline.h"
+#include "Vulkan/VulkanSetLayout.h"
 #include "Vulkan/VulkanTypes.h"
 #include "Vulkan/VulkanResourceSharing.h"
 #include "Vulkan/VulkanCopyCapabilities.h"
@@ -39,7 +40,10 @@ template <typename Info> void CheckAllocationStorage()
 
         std::array<uint32_t, 3> consumed{};
 
-        zen::AllocateWithQueueSharing(info, 2, testCase.computeFamily, testCase.transferFamily, testCase.transferUsage, [&] {
+        const zen::VulkanQueueSharing sharing =
+            zen::MakeQueueSharing(2, testCase.computeFamily, testCase.transferFamily, testCase.transferUsage);
+
+        zen::AllocateWithQueueSharing(info, sharing, [&] {
             called = true;
 
             if (testCase.familyCount > 1)
@@ -191,7 +195,7 @@ TEST(VulkanResourceCreationTests, ViewCreateInfoPreservesSelectedMipsAndArraySha
 {
     using namespace zen;
 
-    const RHITextureSubResourceRange range = RHITextureSubResourceRange::Color(2, 0, 3, 4);
+    const RHITextureSubresourceRange range = RHITextureSubresourceRange::Color(2, 0, 3, 4);
 
     const VkImageViewCreateInfo info =
         MakeVkImageViewCreateInfo(RHITextureType::e2D, DataFormat::eR8G8B8A8UNORM, VK_NULL_HANDLE, range);
@@ -209,82 +213,13 @@ TEST(VulkanResourceCreationTests, ViewCreateInfoPreservesSelectedMipsAndArraySha
     EXPECT_EQ(info.subresourceRange.aspectMask, VK_IMAGE_ASPECT_COLOR_BIT);
 
     const VkImageViewCreateInfo depth = MakeVkImageViewCreateInfo(RHITextureType::e2D, DataFormat::eD32SFloat, VK_NULL_HANDLE,
-                                                                  RHITextureSubResourceRange::Depth(1));
+                                                                  RHITextureSubresourceRange::Depth(1));
 
     EXPECT_EQ(depth.viewType, VK_IMAGE_VIEW_TYPE_2D);
 
     EXPECT_EQ(depth.subresourceRange.aspectMask, VK_IMAGE_ASPECT_DEPTH_BIT);
 
     EXPECT_EQ(depth.subresourceRange.baseMipLevel, 1u);
-}
-
-TEST(VulkanDescriptorLayoutTest, CanonicalLayoutIdentityIncludesBindingFlagsAndSamplers)
-{
-    using namespace zen;
-
-    test::ScopedVulkanCall<PFN_vkGetPhysicalDeviceProperties> properties(
-        vkGetPhysicalDeviceProperties, [](VkPhysicalDevice, VkPhysicalDeviceProperties* properties) { *properties = {}; });
-
-    VulkanDevice device(VK_NULL_HANDLE);
-
-    VulkanDescriptorPoolManager2 manager(&device);
-
-    VkDescriptorSetLayoutBinding bindings[] = {{2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-                                               {7, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
-
-    VkDescriptorBindingFlags flags[]        = {VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, 0};
-
-    VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-
-    info.bindingCount       = 2;
-
-    info.pBindings          = bindings;
-
-    const uint32_t original = manager.GetOrCreateLayoutId(info, MakeVecView(flags));
-
-    std::swap(bindings[0], bindings[1]);
-
-    std::swap(flags[0], flags[1]);
-
-    EXPECT_EQ(manager.GetOrCreateLayoutId(info, MakeVecView(flags)), original);
-
-    flags[0] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
-
-    EXPECT_NE(manager.GetOrCreateLayoutId(info, MakeVecView(flags)), original);
-
-    flags[0]                    = 0;
-
-    bindings[1].descriptorCount = 2;
-
-    EXPECT_NE(manager.GetOrCreateLayoutId(info, MakeVecView(flags)), original);
-
-    bindings[1].descriptorCount = 3;
-
-    bindings[1].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
-
-    EXPECT_NE(manager.GetOrCreateLayoutId(info, MakeVecView(flags)), original);
-
-    bindings[1].stageFlags     = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-
-    EXPECT_NE(manager.GetOrCreateLayoutId(info, MakeVecView(flags)), original);
-
-    bindings[1].descriptorType     = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-
-    VkSampler sampler              = reinterpret_cast<VkSampler>(uintptr_t(100));
-
-    bindings[0].pImmutableSamplers = &sampler;
-
-    const uint32_t immutable       = manager.GetOrCreateLayoutId(info, MakeVecView(flags));
-
-    EXPECT_NE(immutable, original);
-
-    sampler = reinterpret_cast<VkSampler>(uintptr_t(101));
-
-    EXPECT_NE(manager.GetOrCreateLayoutId(info, MakeVecView(flags)), immutable);
-
-    manager.Destroy();
 }
 
 TEST(RHIFormatTests, AllDeclaredTexelFormatsHaveSizes)
@@ -414,4 +349,73 @@ TEST(RHIHeaderDeathTest, ColorBlendStateStopsBeyondTheAttachmentLimit)
             blend.AddAttachments(UINT32_MAX);
         },
         message);
+}
+
+TEST(VulkanDescriptorLayoutTest, SetsWithEqualBindingsShareOneLayout)
+{
+    using namespace zen;
+
+    test::ScopedVulkanCall<PFN_vkGetPhysicalDeviceProperties> properties(
+        vkGetPhysicalDeviceProperties, [](VkPhysicalDevice, VkPhysicalDeviceProperties* properties) { *properties = {}; });
+
+    test::ScopedVulkanCall<PFN_vkCreateDescriptorSetLayout> create(
+        vkCreateDescriptorSetLayout,
+        [](VkDevice, const VkDescriptorSetLayoutCreateInfo*, const VkAllocationCallbacks*, VkDescriptorSetLayout* layout) {
+            static uintptr_t next = 0;
+            *layout               = reinterpret_cast<VkDescriptorSetLayout>(++next);
+            return VK_SUCCESS;
+        });
+
+    test::ScopedVulkanCall<PFN_vkDestroyDescriptorSetLayout> destroy(
+        vkDestroyDescriptorSetLayout, [](VkDevice, VkDescriptorSetLayout, const VkAllocationCallbacks*) {});
+
+    VulkanDevice device(nullptr, VK_NULL_HANDLE);
+
+    VulkanSetLayoutCache cache(&device);
+
+    std::vector<RHIShaderResourceDescriptor> set(2);
+
+    set[0].binding                  = 2;
+    set[0].type                     = RHIShaderResourceType::eStorageBuffer;
+    set[0].arraySize                = 3;
+    set[0].stageFlags               = RHIShaderStageFlagBits::eCompute;
+    set[1].binding                  = 7;
+    set[1].type                     = RHIShaderResourceType::eSampler;
+    set[1].arraySize                = 1;
+    set[1].stageFlags               = RHIShaderStageFlagBits::eFragment;
+
+    const VulkanSetLayout* original = cache.GetOrCreate(set);
+
+    ASSERT_NE(original, nullptr);
+
+    // Declaration order and names are not part of a layout.
+    std::swap(set[0], set[1]);
+
+    set[0].name = "Renamed";
+
+    EXPECT_EQ(cache.GetOrCreate(set), original);
+
+    set[1].arraySize = 2;
+
+    EXPECT_NE(cache.GetOrCreate(set)->id, original->id);
+
+    set[1].arraySize  = 3;
+
+    set[1].stageFlags = RHIShaderStageFlagBits::eVertex;
+
+    EXPECT_NE(cache.GetOrCreate(set)->id, original->id);
+
+    set[1].stageFlags              = RHIShaderStageFlagBits::eCompute;
+
+    set[1].type                    = RHIShaderResourceType::eUniformBuffer;
+
+    const VulkanSetLayout* uniform = cache.GetOrCreate(set);
+
+    EXPECT_NE(uniform->id, original->id);
+
+    ASSERT_EQ(uniform->dynamicOffsets.size(), 1u);
+
+    EXPECT_EQ(uniform->dynamicOffsets[0].binding, 2u);
+
+    EXPECT_EQ(uniform->dynamicOffsets[0].count, 3u);
 }

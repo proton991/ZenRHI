@@ -8,73 +8,7 @@
 namespace zen
 {
 class VulkanDevice;
-class VulkanFenceManager;
-class VulkanCommandBuffer;
 class VulkanQueue;
-struct VulkanTexture;
-
-class VulkanFence
-{
-public:
-    explicit VulkanFence(VulkanFenceManager* pOwner, bool createSignaled = false);
-
-    ~VulkanFence() = default;
-
-    VkFence GetVkHandle() const
-    {
-        return m_fence;
-    }
-
-    bool IsSignaled() const
-    {
-        return m_state == State::eSignaled;
-    }
-
-    VulkanFenceManager* GetOwner() const
-    {
-        return m_pOwner;
-    }
-
-private:
-    enum class State
-    {
-        eInitial,
-        eSignaled
-    };
-    VkFence             m_fence{VK_NULL_HANDLE};
-    VulkanFenceManager* m_pOwner{nullptr};
-    State               m_state{State::eInitial};
-
-    friend class VulkanFenceManager;
-};
-
-class VulkanFenceManager
-{
-public:
-    explicit VulkanFenceManager(VulkanDevice* pDevice) : m_pDevice(pDevice) {}
-
-    void Destroy();
-
-    VulkanDevice* GetDevice() const
-    {
-        return m_pDevice;
-    }
-
-    VulkanFence* CreateFence(bool createSignaled = false);
-
-    void ReleaseFence(VulkanFence*& fence);
-
-    VkResult GetFenceStatus(VulkanFence* pFence);
-
-    VkResult WaitForFence(VulkanFence* pFence, uint64_t timeNS);
-
-private:
-    void DestroyFence(VulkanFence* pFence);
-
-    VulkanDevice*            m_pDevice{nullptr};
-    HeapVector<VulkanFence*> m_usedFences;
-    Queue<VulkanFence*>      m_freeFences;
-};
 
 class VulkanSemaphore
 {
@@ -138,23 +72,20 @@ public:
 
     void Destroy();
 
-    VulkanSemaphore* GetOrCreateSemaphore();
+    VulkanSemaphore* CreateBinarySemaphore();
 
     const RHIError& GetLastError() const
     {
         return m_error;
     }
 
-    void ReleaseSemaphore(VulkanSemaphore*& sem);
-
-    // The caller must prove all semaphore operations have completed. Unlike recycling,
-    // destruction also supports an acquired binary semaphore that was never waited on.
+    // The caller must prove all semaphore operations have completed, including an acquired
+    // binary semaphore that was never waited on.
     void DestroySemaphore(VulkanSemaphore*& sem);
 
 private:
     VulkanDevice*                m_pDevice{nullptr};
     HeapVector<VulkanSemaphore*> m_usedSemaphores;
-    Queue<VulkanSemaphore*>      m_freeSemaphores;
     RHIError                     m_error{};
 #if defined(ZEN_DEBUG)
     uint32_t m_allocatedSemaphoreCount{0};

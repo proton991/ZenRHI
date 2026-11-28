@@ -1,5 +1,4 @@
 #include "Core/ShaderReflection.h"
-#include "Vulkan/VulkanPipeline.h"
 #include <fstream>
 #include <limits>
 #include <gtest/gtest.h>
@@ -42,7 +41,7 @@ HeapVector<uint8_t> LoadReflectionFixture(const char* name)
 {
     HeapVector<uint8_t> bytes;
 
-    std::ifstream file(std::string(RDG_REFLECTION_TEST_PATH) + name, std::ios::binary | std::ios::ate);
+    std::ifstream file(std::string(ZENRHI_TEST_SHADER_DIR) + name, std::ios::binary | std::ios::ate);
 
     EXPECT_TRUE(file.is_open());
 
@@ -509,7 +508,7 @@ TEST(ShaderReflectionTests, ArrayHeapShadersReflectAndRejectMismatchedImageDecla
         spirv->SetStageSPIRV(RHIShaderStage::eCompute, HeapVector<uint8_t>(bytes));
         RHIShaderGroupInfo info{};
         ASSERT_TRUE(RHIShaderUtil::ReflectShaderGroupInfo(spirv, kNoDeviceSetLimit, info));
-        EXPECT_TRUE(ValidateShaderLayout(info, kNoDeviceSetLimit));
+        EXPECT_TRUE(RHIShaderUtil::ValidateShaderLayout(info, kNoDeviceSetLimit));
 
         // Remove the array shape from OpTypeImage without changing its descriptor binding.
         // The old heap declarations stay valid; the new array heap must reject the mismatch.
@@ -551,4 +550,43 @@ TEST(ShaderReflectionTests, ReflectionRejectsSetsAtOrBeyondTheDeviceLimit)
     RHIShaderGroupInfo accepted{};
     EXPECT_TRUE(MergeOrAddSRDs(RHIShaderStage::eCompute, descriptor, 6, accepted));
     EXPECT_EQ(accepted.SRDTable.size(), 6u);
+}
+
+TEST(ShaderReflectionTests, LayoutRulesRejectRuntimeArraysReservedSetAndDuplicateNames)
+{
+    // Vulkan's guaranteed minimum, so these layouts are valid on every device.
+    const uint32_t     sets = RHIGPUInfo{}.maxBoundDescriptorSets;
+    RHIShaderGroupInfo info{};
+    info.SRDTable.resize(2);
+    RHIShaderResourceDescriptor binding{};
+    binding.set     = 1;
+    binding.binding = 0;
+    binding.name    = "Block";
+    binding.type    = RHIShaderResourceType::eUniformBuffer;
+    info.SRDTable[1].push_back(binding);
+    EXPECT_TRUE(RHIShaderUtil::ValidateShaderLayout(info, sets));
+    info.SRDTable[1][0].bindless = true;
+    EXPECT_FALSE(RHIShaderUtil::ValidateShaderLayout(info, sets));
+    info.SRDTable[1][0].bindless = false;
+    binding.binding              = 1;
+    info.SRDTable[1].push_back(binding);
+    EXPECT_FALSE(RHIShaderUtil::ValidateShaderLayout(info, sets));
+    info.SRDTable[1].clear();
+    binding.set = 0;
+    info.SRDTable[0].push_back(binding);
+    EXPECT_FALSE(RHIShaderUtil::ValidateShaderLayout(info, sets));
+}
+
+TEST(ShaderReflectionTests, LayoutRulesFollowTheDeviceDescriptorSetLimit)
+{
+    RHIShaderGroupInfo info{};
+    info.SRDTable.resize(10);
+    RHIShaderResourceDescriptor binding{};
+    binding.set  = 9;
+    binding.name = "HighSet";
+    binding.type = RHIShaderResourceType::eStorageBuffer;
+    info.SRDTable[9].push_back(binding);
+    // Ten sets fit a device that binds ten, and exceed one that binds nine; no engine count applies.
+    EXPECT_TRUE(RHIShaderUtil::ValidateShaderLayout(info, 10));
+    EXPECT_FALSE(RHIShaderUtil::ValidateShaderLayout(info, 9));
 }

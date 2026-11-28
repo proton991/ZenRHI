@@ -1,7 +1,6 @@
 #pragma once
 #include <span>
 #include "VulkanHeaders.h"
-#include "ZenFoundation/Templates/VectorView.h"
 #include <algorithm>
 
 namespace zen

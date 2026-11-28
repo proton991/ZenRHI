@@ -2,6 +2,7 @@
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanAccelerationStructure.h"
 #include "Vulkan/VulkanBuffer.h"
+#include "Vulkan/VulkanUniformRing.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanDevice.h"
 #include <gtest/gtest.h>
@@ -57,14 +58,15 @@ struct ScopedDisabledDrawFeatures
 
 TEST(VulkanCommandValidationIntegrationTest, OversizedPackedUniformAllocationFailsWithoutGrowing)
 {
-    test::VulkanSession          session;
-    VulkanUniformBufferAllocator allocator;
+    test::VulkanSession session;
+    VulkanUniformRing   allocator(&session.rhi);
     allocator.Init(1, 4 * 1024 * 1024, 1);
-    EXPECT_FALSE(allocator.Alloc(4 * 1024 * 1024 + 1).IsValid());
+    const RHIResult<VulkanUniformBlock> oversized = allocator.Alloc(4 * 1024 * 1024 + 1);
+    EXPECT_FALSE(oversized);
     EXPECT_EQ(allocator.GetAllocatedBlockCount(0), 0u);
-    EXPECT_EQ(session.rhi.GetLastCreationError().code, RHIErrorCode::eUnsupported);
-    EXPECT_STREQ(session.rhi.GetLastCreationError().operation, "Allocate packed uniform buffer");
-    EXPECT_TRUE(allocator.Alloc(16).IsValid());
+    EXPECT_EQ(oversized.GetError().code, RHIErrorCode::eUnsupported);
+    EXPECT_STREQ(oversized.GetError().operation, "Allocate packed uniform buffer");
+    EXPECT_TRUE(static_cast<bool>(allocator.Alloc(16)));
     allocator.Destroy();
 }
 
@@ -78,9 +80,9 @@ TEST(VulkanCommandValidationIntegrationTest, PushConstantsValidatePayloadAlignme
     RHIResourcePtr<RHIPipeline> pipeline =
         RHIResourcePtr<RHIPipeline>::Adopt(session.rhi.CreatePipeline(RHIComputePipelineCreateInfo{shader.Get()}));
     ASSERT_TRUE(pipeline);
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session.rhi.GetDevice());
-    const uint32_t            values[3]{1, 2, 3};
-    const uint8_t*            bytes = reinterpret_cast<const uint8_t*>(values);
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session.rhi.GetDevice());
+    const uint32_t           values[3]{1, 2, 3};
+    const uint8_t*           bytes = reinterpret_cast<const uint8_t*>(values);
     struct InvalidRange
     {
         const uint8_t* data;
@@ -128,7 +130,7 @@ TEST(VulkanCommandValidationIntegrationTest, UnsupportedIndirectCountAndDynamicF
 {
     test::VulkanSession        session;
     ScopedDisabledDrawFeatures features(session.rhi.GetDevice());
-    FVulkanCommandListContext  context(RHICommandContextType::eGraphics, session.rhi.GetDevice());
+    VulkanCommandListContext   context(RHICommandContextType::eGraphics, session.rhi.GetDevice());
     context.RHIDrawIndexedIndirect(nullptr, nullptr, DataFormat::eR32UInt, 0, 0, 2, 20);
     EXPECT_EQ(context.GetRecordingError().code, RHIErrorCode::eUnsupported);
     context.RHIDiscardRecording();

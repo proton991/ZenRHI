@@ -48,17 +48,17 @@ VKAPI_ATTR VkResult VKAPI_CALL RejectCommandBufferAllocation(VkDevice, const VkC
 
 TEST(VulkanCommandBufferPoolTest, RetryUsesAvailableBufferWhenAllocationIsStillFailing)
 {
-    test::VulkanSession       session;
-    VulkanDevice*             device = session.rhi.GetDevice();
-    VulkanSemaphore           signal(device);
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, device);
-    FVulkanCommandBuffer*     ready = context.GetCommandBuffer();
+    test::VulkanSession      session;
+    VulkanDevice*            device = session.rhi.GetDevice();
+    VulkanSemaphore          signal(device);
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, device);
+    VulkanCommandBuffer*     ready = context.GetCommandBuffer();
     ASSERT_TRUE(ready->IsAllocated());
     context.AddSignalSemaphore(&signal);
     test::ScopedVulkanCall fail(vkAllocateCommandBuffers, RejectCommandBufferAllocation);
     EXPECT_FALSE(context.GetCommandBuffer()->IsAllocated());
     context.RHIDiscardRecording();
-    FVulkanCommandBuffer* retry = context.GetCommandBuffer();
+    VulkanCommandBuffer* retry = context.GetCommandBuffer();
     EXPECT_EQ(retry, ready);
     EXPECT_TRUE(retry->HasBegun());
 }
@@ -98,29 +98,29 @@ protected:
         if (reuseCompletedBuffer)
         {
             // A recently completed buffer stays within the trim cooldown, exercising reset/reuse.
-            FVulkanCommandListContext context(RHICommandContextType::eGraphics, device);
+            VulkanCommandListContext context(RHICommandContextType::eGraphics, device);
 
             context.GetCommandBuffer();
 
             ASSERT_EQ(context.SubmitRecordedWorkloads(), RHISubmissionResult::eSuccess);
 
-            ASSERT_TRUE(context.GetQueue()->WaitForCompletion(context.GetLastSubmittedSerial(), UINT64_MAX));
+            ASSERT_TRUE(context.GetQueue()->WaitForCompletion(context.GetQueue()->GetLastSubmittedSerial(), UINT64_MAX));
         }
 
         const uint32_t buffersPerContext = GetParam() == AbandonedRecordingState::eFinalizedAndRecording ? 2u : 1u;
 
-        FVulkanCommandBufferPool* pool   = nullptr;
+        VulkanCommandBufferPool* pool    = nullptr;
 
         for (uint32_t attempt = 0; attempt < 8; ++attempt)
         {
             SCOPED_TRACE(attempt);
 
-            HeapVector<FVulkanCommandBuffer*> recordings;
+            HeapVector<VulkanCommandBuffer*> recordings;
 
             {
-                FVulkanCommandListContext context(RHICommandContextType::eGraphics, device);
+                VulkanCommandListContext context(RHICommandContextType::eGraphics, device);
 
-                FVulkanCommandBuffer* buffer = context.GetCommandBuffer();
+                VulkanCommandBuffer* buffer = context.GetCommandBuffer();
 
                 recordings.push_back(buffer);
 
@@ -159,7 +159,7 @@ protected:
                 }
             }
 
-            for (FVulkanCommandBuffer* recording : recordings)
+            for (VulkanCommandBuffer* recording : recordings)
             {
                 // Wrappers remain pool-owned even when their native allocation is trimmed.
                 EXPECT_FALSE(recording->HasBegun());
@@ -201,18 +201,18 @@ TEST_P(VulkanCommandBufferOwnershipTest, ContextDestructionPreservesTransferredW
 {
     test::VulkanSession session;
 
-    VulkanDevice* device              = session.rhi.GetDevice();
+    VulkanDevice* device             = session.rhi.GetDevice();
 
-    VulkanQueue* queue                = device->GetGfxQueue();
+    VulkanQueue* queue               = device->GetGfxQueue();
 
-    FVulkanCommandBuffer* transferred = nullptr;
+    VulkanCommandBuffer* transferred = nullptr;
 
-    VkCommandBuffer handle            = VK_NULL_HANDLE;
+    VkCommandBuffer handle           = VK_NULL_HANDLE;
 
-    uint64_t serial                   = 0;
+    uint64_t serial                  = 0;
 
     {
-        FVulkanCommandListContext context(RHICommandContextType::eGraphics, device);
+        VulkanCommandListContext context(RHICommandContextType::eGraphics, device);
 
         transferred = context.GetCommandBuffer();
 
@@ -233,7 +233,7 @@ TEST_P(VulkanCommandBufferOwnershipTest, ContextDestructionPreservesTransferredW
         }
 
         // Only this new recording is abandoned; the queue owns the earlier one.
-        FVulkanCommandBuffer* abandoned = context.GetCommandBuffer();
+        VulkanCommandBuffer* abandoned = context.GetCommandBuffer();
 
         EXPECT_EQ(abandoned->GetCommandBufferPool(), transferred->GetCommandBufferPool());
 
@@ -247,9 +247,9 @@ TEST_P(VulkanCommandBufferOwnershipTest, ContextDestructionPreservesTransferredW
     ASSERT_TRUE(GetParam() ? transferred->IsSubmitted() : transferred->HasEnded());
 
     {
-        FVulkanCommandListContext nextContext(RHICommandContextType::eGraphics, device);
+        VulkanCommandListContext nextContext(RHICommandContextType::eGraphics, device);
 
-        FVulkanCommandBuffer* next = nextContext.GetCommandBuffer();
+        VulkanCommandBuffer* next = nextContext.GetCommandBuffer();
 
         EXPECT_EQ(next->GetCommandBufferPool(), transferred->GetCommandBufferPool());
 

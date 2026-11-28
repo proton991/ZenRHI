@@ -59,7 +59,7 @@ class VulkanPipelineIntegrationTest : public testing::Test
 protected:
     std::unique_ptr<test::VulkanSession>                                   session;
     std::unique_ptr<test::ScopedVulkanCall<PFN_vkCreateGraphicsPipelines>> observe;
-    FVulkanCommandListContext*                                             context{};
+    VulkanCommandListContext*                                              context{};
     VkDebugUtilsMessengerEXT                                               messenger{};
     std::vector<RHIShader*>                                                shaders;
     std::vector<RHIPipeline*>                                              pipelines;
@@ -87,7 +87,7 @@ protected:
 
         ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(session->rhi.GetInstance(), &info, nullptr, &messenger), VK_SUCCESS);
 
-        context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        context = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
     }
 
     void TearDown() override
@@ -129,7 +129,7 @@ protected:
     {
         info.stageFlags.SetFlag(RHIShaderStageToFlagBits(stage));
 
-        zen::test::LoadShaderModule(info, stage, std::filesystem::path(RDG_REFLECTION_TEST_PATH) / file);
+        zen::test::LoadShaderModule(info, stage, std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / file);
     }
 
     VulkanShader* Shader(bool                                                   compute   = false,

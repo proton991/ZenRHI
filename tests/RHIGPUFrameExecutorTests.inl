@@ -22,9 +22,9 @@ public:
         active = timing;
     }
 
-    RHISubmissionResult FlushAllGPUCommands() override
+    RHISubmissionResult SubmitCommandLists(std::span<RHICommandList*> lists) override
     {
-        const bool hasWork = !pendingCommandLists.empty();
+        const bool hasWork = !lists.empty();
 
         RHIGPUTimingPtr interval;
 
@@ -37,7 +37,7 @@ public:
             interval     = active->AddInterval();
         }
 
-        const RHISubmissionResult result = TestRHI::FlushAllGPUCommands();
+        const RHISubmissionResult result = TestRHI::SubmitCommandLists(lists);
 
         if (interval)
         {
@@ -90,15 +90,11 @@ protected:
     {
         destroyed.clear();
 
-        GRHIFrameState.Init(3);
+        timingRHI = ZEN_NEW() FrameTimingTestRHI();
 
-        timingRHI   = ZEN_NEW() FrameTimingTestRHI();
+        rhi       = timingRHI;
 
-        rhi         = timingRHI;
-
-        executor    = ZEN_NEW() RHICommandListExecutor(rhi, RHIExecutionMode::eThreaded);
-
-        GDynamicRHI = executor;
+        executor  = ZEN_NEW() RHICommandListExecutor(rhi, RHIExecutionMode::eThreaded);
     }
 
     void VerifySubmissionFailure(RHISubmissionResult failure, bool partial)
@@ -167,7 +163,7 @@ TEST_F(RHIGPUFrameExecutorTest, FrameMarkersQueueInOrderWithoutWaitingForTheWork
 
     ArmGate();
 
-    GetRHIThread().Dispatch(std::bind_front(&RHISubmissionGate::OnSubmission, &gate));
+    executor->GetRuntime().thread.Dispatch(std::bind_front(&RHISubmissionGate::OnSubmission, &gate));
 
     EXPECT_EQ(gate.entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
 
@@ -262,12 +258,8 @@ TEST(RHIGPUFrameExecutor, ReplayUsesFreshCapturesInInlineAndThreadedModes)
     {
         FrameTimingTestRHI* backend = ZEN_NEW() FrameTimingTestRHI();
 
-        GRHIFrameState.Init(3);
-
         {
             RHICommandListExecutor executor(backend, mode);
-
-            GDynamicRHI = &executor;
 
             RHICommandListPtr commands(RHICommandList::Create(executor.GetCommandContext(RHICommandContextType::eGraphics)));
 
@@ -283,7 +275,7 @@ TEST(RHIGPUFrameExecutor, ReplayUsesFreshCapturesInInlineAndThreadedModes)
 
                 executor.BeginGPUFrameTiming(timing);
 
-                EXPECT_EQ(executor.SubmitBatch(MakeVecView(&replay, 1)), RHISubmissionResult::eSuccess);
+                EXPECT_EQ(executor.SubmitCommandLists(MakeVecView(&replay, 1)), RHISubmissionResult::eSuccess);
 
                 executor.EndGPUFrameTiming(timing, true);
 
@@ -316,8 +308,6 @@ TEST(RHIGPUFrameExecutor, ReplayUsesFreshCapturesInInlineAndThreadedModes)
 
             executor.Destroy();
         }
-
-        GDynamicRHI = nullptr;
     }
 }
 

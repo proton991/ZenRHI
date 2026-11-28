@@ -1,7 +1,5 @@
 #pragma once
 #include <span>
-#include <cstring>
-#include <type_traits>
 #include "ZenRHI/RHICommon.h"
 #include "RHIResource.h"
 #include "ZenFoundation/Templates/VectorView.h"
@@ -162,18 +160,6 @@ public:
         m_bindlessParameters.clear();
     }
 
-    // Preserve offsets and descriptor metadata while giving recorded commands their own bytes.
-    void CopyFrom(const RHIBatchedShaderParameters& source)
-    {
-        if (this != &source)
-        {
-            CopyParameters(m_valueData, source.m_valueData);
-            CopyParameters(m_valueParameters, source.m_valueParameters);
-            CopyParameters(m_resourceParameters, source.m_resourceParameters);
-            CopyParameters(m_bindlessParameters, source.m_bindlessParameters);
-        }
-    }
-
     size_t GetStorageBytes() const
     {
         return m_valueData.capacity() + m_valueParameters.capacity() * sizeof(RHIShaderValueParameter)
@@ -201,17 +187,6 @@ public:
     }
 
 private:
-    template <typename T> static void CopyParameters(HeapVector<T>& destination, const HeapVector<T>& source)
-    {
-        static_assert(std::is_trivially_copyable_v<T>);
-        destination.resize(source.size());
-
-        if (!source.empty())
-        {
-            std::memcpy(destination.data(), source.data(), source.size() * sizeof(T));
-        }
-    }
-
     HeapVector<uint8_t>                    m_valueData;
     HeapVector<RHIShaderValueParameter>    m_valueParameters;
     HeapVector<RHIShaderResourceParameter> m_resourceParameters;

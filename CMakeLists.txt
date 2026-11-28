@@ -31,7 +31,6 @@ if(NOT foundation_abi STREQUAL ZENRHI_FOUNDATION_ABI)
 endif()
 find_package(Vulkan REQUIRED COMPONENTS SPIRV-Tools)
 add_library(ZenRHICore STATIC
-    src/Core/DynamicRHI.cpp
     src/Core/RHICommandList.cpp
     src/Core/RHICommandListExecutor.cpp
     src/Core/RHIGPUFrameTiming.cpp
@@ -39,21 +38,23 @@ add_library(ZenRHICore STATIC
     src/Core/RHIRayTracing.cpp
     src/Core/RHIResource.cpp
     src/Core/RHIShaderUtil.cpp
+    src/Core/RHIValidation.cpp
     src/Core/RHIThread.cpp
     src/Core/ThreadStack.cpp)
 if(WIN32)
     target_link_libraries(ZenRHICore PRIVATE dbghelp)
 endif()
 add_library(ZenRHIVulkan STATIC
-    src/Vulkan/Platform/VulkanMacOSPlatform.cpp
     src/Vulkan/Platform/VulkanWindowBridge.cpp
-    src/Vulkan/Platform/VulkanWindowsPlatform.cpp
     src/Vulkan/VulkanAccelerationStructure.cpp
     src/Vulkan/VulkanBuffer.cpp
+    src/Vulkan/VulkanUniformRing.cpp
     src/Vulkan/VulkanCommandList.cpp
+    src/Vulkan/VulkanCommandRecorders.cpp
     src/Vulkan/VulkanContext.cpp
-    src/Vulkan/VulkanDebug.cpp
-    src/Vulkan/VulkanDescriptorPool.cpp
+    src/Vulkan/VulkanBindlessCapacity.cpp
+    src/Vulkan/VulkanBindlessHeap.cpp
+    src/Vulkan/VulkanDescriptorAllocator.cpp
     src/Vulkan/VulkanDescriptorSetState.cpp
     src/Vulkan/VulkanDevice.cpp
     src/Vulkan/VulkanExtension.cpp
@@ -61,6 +62,8 @@ add_library(ZenRHIVulkan STATIC
     src/Vulkan/VulkanMemory.cpp
     src/Vulkan/VulkanPipeline.cpp
     src/Vulkan/VulkanQueue.cpp
+    src/Vulkan/VulkanSetLayout.cpp
+    src/Vulkan/VulkanShader.cpp
     src/Vulkan/VulkanSwapchain.cpp
     src/Vulkan/VulkanSynchronization.cpp
     src/Vulkan/VulkanTexture.cpp
@@ -68,7 +71,7 @@ add_library(ZenRHIVulkan STATIC
     src/Vulkan/VulkanRHIFactory.cpp
     src/Vulkan/VulkanViewport.cpp
     src/Vulkan/vk_mem_alloc.cpp)
-add_library(ZenRHI STATIC src/RHIFactory.cpp)
+add_library(ZenRHI INTERFACE)
 foreach(part IN ITEMS Core Vulkan)
     add_library(ZenRHI::${part} ALIAS ZenRHI${part})
     set_target_properties(ZenRHI${part} PROPERTIES EXPORT_NAME ${part})
@@ -85,12 +88,11 @@ set_property(TARGET ZenRHICore PROPERTY ZenFoundation_ABI "${ZENRHI_FOUNDATION_A
 target_compile_features(ZenRHICore PUBLIC cxx_std_20)
 target_include_directories(ZenRHICore PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_include_directories(ZenRHIVulkan PRIVATE src "${Vulkan_INCLUDE_DIRS}")
-target_include_directories(ZenRHI PRIVATE src "${Vulkan_INCLUDE_DIRS}")
 target_link_libraries(ZenRHICore PUBLIC ZenFoundation::Foundation PRIVATE Vulkan::SPIRV-Tools)
 target_link_libraries(ZenRHIVulkan PUBLIC ZenRHICore Vulkan::Headers)
-target_link_libraries(ZenRHI PUBLIC ZenRHIVulkan)
-target_compile_definitions(ZenRHIVulkan PRIVATE VK_NO_PROTOTYPES)
-target_compile_definitions(ZenRHI PRIVATE VK_NO_PROTOTYPES)
+target_link_libraries(ZenRHI INTERFACE ZenRHIVulkan)
+target_compile_definitions(ZenRHIVulkan PRIVATE VK_NO_PROTOTYPES ZENRHI_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    ZENRHI_VERSION_MINOR=${PROJECT_VERSION_MINOR} ZENRHI_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 include(cmake/BackendDependencies.cmake)
 
 zen_add_version(ZenRHICore ZenRHI "${PROJECT_SOURCE_DIR}" "${PROJECT_VERSION}")

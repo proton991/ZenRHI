@@ -20,7 +20,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, SceneHeapResetRequiresDrainedRec
 
     ASSERT_TRUE(sampler.IsValid());
 
-    const VkDescriptorSet set = session->rhi.GetBindlessDescriptorPoolManager()->GetGlobalBindlessSet();
+    const VkDescriptorSet set = session->rhi.GetBindlessHeap()->GetGlobalBindlessSet();
 
     const uint64_t recording  = context->RHICaptureBindlessEpoch();
 
@@ -49,7 +49,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, SceneHeapResetRequiresDrainedRec
 
     ASSERT_TRUE(session->rhi.ResetBindlessResources());
 
-    EXPECT_EQ(session->rhi.GetBindlessDescriptorPoolManager()->GetGlobalBindlessSet(), set);
+    EXPECT_EQ(session->rhi.GetBindlessHeap()->GetGlobalBindlessSet(), set);
 
     EXPECT_FALSE(session->rhi.IsBindlessResourceRegistered(image));
 
@@ -116,5 +116,5 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, SceneHeapResetRequiresDrainedRec
 
     textures.back() = nullptr;
 
-    session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+    session->rhi.GetBindlessHeap()->Flush();
 }

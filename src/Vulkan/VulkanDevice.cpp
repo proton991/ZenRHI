@@ -3,7 +3,7 @@
 #include "Vulkan/VulkanDevice.h"
 #include "ZenRHI/RHICommandList.h"
 #include "ZenRHI/RHICommon.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanQueue.h"
 #include "Vulkan/VulkanQueueSelection.h"
@@ -12,43 +12,43 @@
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanSynchronization.h"
 #include "Vulkan/VulkanCopyCapabilities.h"
-#include "Vulkan/VulkanDescriptorPool.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
 
 #include <algorithm>
 #include "VulkanFaultReport.h"
+#include "VulkanResourceSharing.h"
+#include "Vulkan/VulkanBindlessCapacity.h"
 
 namespace zen
 {
-void ReportVulkanDeviceLoss(VkResult result, const char* operation)
+void VulkanRHI::CheckDeviceLoss(VkResult result, const char* operation)
 {
-    if (result == VK_ERROR_DEVICE_LOST && GVulkanRHI != nullptr)
+    if (result == VK_ERROR_DEVICE_LOST)
     {
-        GVulkanRHI->BlockSubmissions({RHIErrorCode::eDeviceLost, int64_t(result), operation, __FILE__, __LINE__});
+        BlockSubmissions({RHIErrorCode::eDeviceLost, int64_t(result), operation, __FILE__, __LINE__});
 
-        if (GVulkanRHI->GetDevice() != nullptr)
+        if (m_pDevice != nullptr)
         {
-            GVulkanRHI->GetDevice()->ReportDeviceLoss(operation);
+            m_pDevice->ReportDeviceLoss(operation);
         }
     }
 }
 
-void ReportVulkanCreationFailure(VkResult result, const char* operation, const char* source, uint32_t line)
+RHIError VulkanRHI::ReportCreationFailure(VkResult result, const char* operation, const char* source, uint32_t line)
 {
-    // MakeVulkanError reports device loss. A result of VK_SUCCESS still failed a post-condition.
-    const RHIError error = MakeVulkanError(result, operation, source, line);
+    CheckDeviceLoss(result, operation);
 
-    if (GVulkanRHI != nullptr)
-    {
-        GVulkanRHI->SetCreationError(RHIErrorOr(error, MakeRHIError(RHIErrorCode::eBackendFailure, operation, source, line)));
-    }
+    // A result of VK_SUCCESS still failed a post-condition.
+    return RHIErrorOr(MakeVulkanError(result, operation, source, line),
+                      MakeRHIError(RHIErrorCode::eBackendFailure, operation, source, line));
 }
 
-void VulkanDevice::RegisterDiagnosticBuffer(FVulkanCommandBuffer* buffer)
+void VulkanDevice::RegisterDiagnosticBuffer(VulkanCommandBuffer* buffer)
 {
     m_diagnosticBuffers.push_back(buffer);
 }
 
-void VulkanDevice::UnregisterDiagnosticBuffer(FVulkanCommandBuffer* buffer)
+void VulkanDevice::UnregisterDiagnosticBuffer(VulkanCommandBuffer* buffer)
 {
     m_diagnosticBuffers.erase(std::remove(m_diagnosticBuffers.begin(), m_diagnosticBuffers.end(), buffer),
                               m_diagnosticBuffers.end());
@@ -133,6 +133,8 @@ RHIError VulkanRHI::SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>
                                             : MakeVulkanError(result, "vkGetPipelineCacheData");
         }
     }
+
+    CheckDeviceLoss(static_cast<VkResult>(error.nativeCode), error.operation);
     return error;
 }
 
@@ -155,7 +157,7 @@ void VulkanDevice::ReportDeviceLoss(const char* operation)
             }
         }
         if (m_device && m_extensionFlags.hasDeviceFault && vkGetDeviceFaultInfoEXT != nullptr
-            && RHIOptions::GetInstance().DeviceLossDiagnostics())
+            && m_pRHI->GetDeviceDesc().DeviceLossDiagnostics())
         {
             // Fixed storage remains usable after allocation failure. VK_INCOMPLETE
             // explicitly reports a truncated report rather than allocating during loss.
@@ -193,7 +195,7 @@ void VulkanDevice::ReportDeviceLoss(const char* operation)
                               vendors[i].vendorFaultData);
             }
         }
-        for (const FVulkanCommandBuffer* buffer : m_diagnosticBuffers)
+        for (const VulkanCommandBuffer* buffer : m_diagnosticBuffers)
         {
             buffer->ReportBreadcrumbs(report);
         }
@@ -201,12 +203,12 @@ void VulkanDevice::ReportDeviceLoss(const char* operation)
     }
 }
 
-VulkanDevice::VulkanDevice(VkPhysicalDevice gpu) : m_device(VK_NULL_HANDLE), m_gpu(gpu)
+VulkanDevice::VulkanDevice(VulkanRHI* pRHI, VkPhysicalDevice gpu) : m_device(VK_NULL_HANDLE), m_pRHI(pRHI), m_gpu(gpu)
 {
     vkGetPhysicalDeviceProperties(m_gpu, &m_gpuProps);
 }
 
-std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* error)
+std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, const RHIDeviceDesc& desc, RHIError* error)
 {
     std::string reason;
 
@@ -214,14 +216,14 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* e
 
     vkGetPhysicalDeviceProperties(gpu, &properties);
 
-    if (properties.apiVersion < VK_API_VERSION_1_2)
+    if (properties.apiVersion < kVulkanApiVersion)
     {
         reason = "Vulkan 1.2 is required";
     }
 
     if (reason.empty())
     {
-        const HeapVector<VkExtensionProperties> extensions = VulkanDeviceExtension::GetSupportedExtensions(gpu, error);
+        const HeapVector<VkExtensionProperties> extensions = GetSupportedDeviceExtensions(gpu, error);
 
         for (const char* required : {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME})
         {
@@ -264,15 +266,23 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* e
 
         VkPhysicalDeviceDescriptorIndexingFeatures indexing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
 
+        VkPhysicalDeviceTimelineSemaphoreFeatures timeline{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+
         features.pNext = &dynamic;
 
         dynamic.pNext  = &indexing;
+
+        indexing.pNext = &timeline;
 
         vkGetPhysicalDeviceFeatures2(gpu, &features);
 
         if (!dynamic.dynamicRendering)
         {
             reason = "The dynamicRendering feature is required";
+        }
+        else if (!timeline.timelineSemaphore)
+        {
+            reason = "The timelineSemaphore feature is required";
         }
         else if (const char* missing = MissingDescriptorIndexingFeature(indexing))
         {
@@ -294,8 +304,9 @@ std::string VulkanDevice::GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* e
 
         vkGetPhysicalDeviceFeatures(gpu, &coreFeatures);
 
-        const RHIBindlessHeapCapacities capacities = GetBindlessHeapRequest(coreFeatures.imageCubeArray == VK_TRUE);
-        RHIBindlessHeapCapacities       fitted     = kNoBindlessHeaps;
+        const RHIBindlessHeapCapacities capacities =
+            GetBindlessHeapRequest(desc.BindlessHeapCapacities(), coreFeatures.imageCubeArray == VK_TRUE);
+        RHIBindlessHeapCapacities fitted = kNoBindlessHeaps;
 
         if (!FitBindlessHeapCapacities(limits, capacities, fitted))
         {
@@ -339,7 +350,7 @@ static std::string GetQueuePropString(const VkQueueFamilyProperties& queueProp)
 
 DataFormat VulkanRHI::GetSupportedDepthFormat()
 {
-    VkFormat defaulFormat{VK_FORMAT_D16_UNORM};
+    VkFormat defaultFormat{VK_FORMAT_D16_UNORM};
 
     const HeapVector<VkFormat> formatList = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
                                              VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D16_UNORM};
@@ -352,13 +363,13 @@ DataFormat VulkanRHI::GetSupportedDepthFormat()
 
         if (formatProps.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
         {
-            defaulFormat = format;
+            defaultFormat = format;
 
             break;
         }
     }
 
-    return static_cast<DataFormat>(defaulFormat);
+    return static_cast<DataFormat>(defaultFormat);
 }
 
 const RHIGPUInfo& VulkanRHI::QueryGPUInfo() const
@@ -385,16 +396,10 @@ RHIQueueCopyCapabilities VulkanRHI::GetQueueCopyCapabilities(RHICommandContextTy
 /**
  * Create VkDevice and initialise
  */
-void VulkanDevice::Init()
-{
-    const RHIError error = InitChecked();
-    ZEN_RHI_VERIFY_MSG_F(!error.IsFailure(), "{} failed ({})", error.operation, error.nativeCode);
-}
-
 RHIError VulkanDevice::InitChecked()
 {
     RHIError          error;
-    const std::string reason = GetUnsupportedReason(m_gpu, &error);
+    const std::string reason = GetUnsupportedReason(m_gpu, m_pRHI->GetDeviceDesc(), &error);
     if (!error.IsFailure() && !reason.empty())
     {
         ZEN_RHI_LOG_ERROR("Cannot initialize Vulkan device '{}': {}", m_gpuProps.deviceName, reason);
@@ -407,10 +412,7 @@ RHIError VulkanDevice::InitializeSupportedDevice()
 {
     RHIError error;
     // query base features
-    vkGetPhysicalDeviceFeatures(m_gpu, &m_physicalDeviceFeatures);
-
-    // query gpu properties
-    vkGetPhysicalDeviceProperties(m_gpu, &m_physicalDeviceProperties);
+    vkGetPhysicalDeviceFeatures(m_gpu, &m_supportedFeatures);
 
     // query queue properties
     uint32_t count = 0;
@@ -423,72 +425,19 @@ RHIError VulkanDevice::InitializeSupportedDevice()
 
     vkGetPhysicalDeviceQueueFamilyProperties(m_gpu, &count, m_queueFamilyProps.data());
 
-    VulkanDeviceExtensionArray extensionArray = VulkanDeviceExtension::GetEnabledExtensions(this, &error);
+    VulkanDeviceExtensionSelection selection = SelectDeviceExtensions(*this, &error);
 
-    if (GVulkanRHI->GetInstanceExtensionFlags().hasGetPhysicalDeviceProperties)
-    {
-        VkPhysicalDeviceFeatures2 physicalDeviceFeatures2;
+    m_extensionFlags                         = selection.flags;
 
-        InitVkStruct(physicalDeviceFeatures2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+    VkPhysicalDeviceProperties2 physicalDeviceProperties2;
 
-        for (UniquePtr<VulkanDeviceExtension>& extension : extensionArray)
-        {
-            if (extension->IsEnabledAndSupported())
-            {
-                extension->BeforePhysicalDeviceFeatures(physicalDeviceFeatures2);
-            }
-        }
+    InitVkStruct(physicalDeviceProperties2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
 
-        vkGetPhysicalDeviceFeatures2(m_gpu, &physicalDeviceFeatures2);
+    InitVkStruct(m_descriptorIndexingProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES);
 
-        for (UniquePtr<VulkanDeviceExtension>& extension : extensionArray)
-        {
-            if (extension->IsEnabledAndSupported())
-            {
-                extension->AfterPhysicalDeviceFeatures();
-            }
-        }
+    physicalDeviceProperties2.pNext = &m_descriptorIndexingProperties;
 
-        VkPhysicalDeviceProperties2 physicalDeviceProperties2;
-
-        InitVkStruct(physicalDeviceProperties2, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
-
-        InitVkStruct(m_descriptorIndexingProperties, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES);
-
-        physicalDeviceProperties2.pNext = &m_descriptorIndexingProperties;
-
-        vkGetPhysicalDeviceProperties2(m_gpu, &physicalDeviceProperties2);
-    }
-
-    // Optional ray-tracing features require the complete enabled dependency chain.
-    m_extensionFlags.hasAccelerationStructure &= !RHIOptions::GetInstance().RayTracingDisabled();
-
-    m_extensionFlags.hasAccelerationStructure &=
-        m_extensionFlags.hasBufferDeviceAddress && m_extensionFlags.hasDeferredHostOperation;
-
-    m_extensionFlags.hasRaytracingPipeline   &= m_extensionFlags.hasAccelerationStructure;
-    m_extensionFlags.hasInvocationReorderEXT &= m_extensionFlags.hasRaytracingPipeline;
-    m_extensionFlags.hasInvocationReorderNV &=
-        m_extensionFlags.hasRaytracingPipeline && !m_extensionFlags.hasInvocationReorderEXT;
-
-    m_extensionFlags.hasRayQuery        &= m_extensionFlags.hasAccelerationStructure;
-    m_extensionFlags.hasOpacityMicromap &= m_extensionFlags.hasRayQuery;
-
-    for (const UniquePtr<VulkanDeviceExtension>& extension : extensionArray)
-    {
-        const NameID name = extension->GetName();
-
-        if ((name == NameID(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) && !m_extensionFlags.hasAccelerationStructure)
-            || (name == NameID(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) && !m_extensionFlags.hasRaytracingPipeline)
-            || (name == NameID(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)
-                && !m_extensionFlags.hasInvocationReorderEXT)
-            || (name == NameID(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME) && !m_extensionFlags.hasInvocationReorderNV)
-            || (name == NameID(VK_KHR_RAY_QUERY_EXTENSION_NAME) && !m_extensionFlags.hasRayQuery)
-            || (name == NameID(VK_KHR_OPACITY_MICROMAP_EXTENSION_NAME) && !m_extensionFlags.hasOpacityMicromap))
-        {
-            extension->SetSupport(false);
-        }
-    }
+    vkGetPhysicalDeviceProperties2(m_gpu, &physicalDeviceProperties2);
 
     if (m_extensionFlags.hasAccelerationStructure)
     {
@@ -501,13 +450,12 @@ RHIError VulkanDevice::InitializeSupportedDevice()
 
     if (!error.IsFailure())
     {
-        error = SetupDevice(extensionArray);
+        error = SetupDevice(selection);
     }
     if (!error.IsFailure())
     {
-        m_pFenceManager    = ZEN_NEW() VulkanFenceManager(this);
-        m_pSemaphoreManger = ZEN_NEW() VulkanSemaphoreManager(this);
-        if (!m_pFenceManager || !m_pSemaphoreManger)
+        m_pSemaphoreManager = ZEN_NEW() VulkanSemaphoreManager(this);
+        if (!m_pSemaphoreManager)
         {
             error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate Vulkan synchronization managers");
         }
@@ -515,24 +463,16 @@ RHIError VulkanDevice::InitializeSupportedDevice()
     return error;
 }
 
-RHIError VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& extensions)
+RHIError VulkanDevice::SetupDevice(VulkanDeviceExtensionSelection& selection)
 {
     VkDeviceCreateInfo deviceInfo;
 
     InitVkStruct(deviceInfo, VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
 
-    for (UniquePtr<VulkanDeviceExtension>& extension : extensions)
-    {
-        if (extension->IsEnabledAndSupported())
-        {
-            if (extension->RequiresExtensionName())
-            {
-                m_extensions.emplace_back(extension->GetName());
-            }
+    m_extensions = selection.names;
 
-            extension->BeforeCreateDevice(deviceInfo);
-        }
-    }
+    // The enabled features chain lives in the selection, which outlives vkCreateDevice.
+    deviceInfo.pNext = selection.enabledFeatures.Link(selection.enabled);
 
     // set up queue info
     HeapVector<VkDeviceQueueCreateInfo> deviceQueueInfos;
@@ -617,56 +557,58 @@ RHIError VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>&
 
     VkPhysicalDeviceFeatures enabledFeatures{};
 
-    enabledFeatures.independentBlend               = m_physicalDeviceFeatures.independentBlend;
+    enabledFeatures.independentBlend               = m_supportedFeatures.independentBlend;
 
-    enabledFeatures.dualSrcBlend                   = m_physicalDeviceFeatures.dualSrcBlend;
+    enabledFeatures.dualSrcBlend                   = m_supportedFeatures.dualSrcBlend;
 
-    enabledFeatures.geometryShader                 = m_physicalDeviceFeatures.geometryShader;
+    enabledFeatures.geometryShader                 = m_supportedFeatures.geometryShader;
 
-    enabledFeatures.fragmentStoresAndAtomics       = m_physicalDeviceFeatures.fragmentStoresAndAtomics;
+    enabledFeatures.fragmentStoresAndAtomics       = m_supportedFeatures.fragmentStoresAndAtomics;
 
-    enabledFeatures.vertexPipelineStoresAndAtomics = m_physicalDeviceFeatures.vertexPipelineStoresAndAtomics;
+    enabledFeatures.vertexPipelineStoresAndAtomics = m_supportedFeatures.vertexPipelineStoresAndAtomics;
 
-    enabledFeatures.samplerAnisotropy              = m_physicalDeviceFeatures.samplerAnisotropy;
-    enabledFeatures.textureCompressionBC           = m_physicalDeviceFeatures.textureCompressionBC;
-    enabledFeatures.imageCubeArray                 = m_physicalDeviceFeatures.imageCubeArray;
+    enabledFeatures.samplerAnisotropy              = m_supportedFeatures.samplerAnisotropy;
+    enabledFeatures.textureCompressionBC           = m_supportedFeatures.textureCompressionBC;
+    enabledFeatures.imageCubeArray                 = m_supportedFeatures.imageCubeArray;
     enabledFeatures.shaderInt64                    = m_extensionFlags.hasBufferInt64Atomics;
-    enabledFeatures.fullDrawIndexUint32            = m_physicalDeviceFeatures.fullDrawIndexUint32;
+    enabledFeatures.fullDrawIndexUint32            = m_supportedFeatures.fullDrawIndexUint32;
 
-    enabledFeatures.fillModeNonSolid               = m_physicalDeviceFeatures.fillModeNonSolid;
+    enabledFeatures.fillModeNonSolid               = m_supportedFeatures.fillModeNonSolid;
 
-    enabledFeatures.depthClamp                     = m_physicalDeviceFeatures.depthClamp;
+    enabledFeatures.depthClamp                     = m_supportedFeatures.depthClamp;
 
-    enabledFeatures.depthBiasClamp                 = m_physicalDeviceFeatures.depthBiasClamp;
+    enabledFeatures.depthBiasClamp                 = m_supportedFeatures.depthBiasClamp;
 
-    enabledFeatures.wideLines                      = m_physicalDeviceFeatures.wideLines;
+    enabledFeatures.wideLines                      = m_supportedFeatures.wideLines;
 
-    enabledFeatures.sampleRateShading              = m_physicalDeviceFeatures.sampleRateShading;
+    enabledFeatures.sampleRateShading              = m_supportedFeatures.sampleRateShading;
 
-    enabledFeatures.alphaToOne                     = m_physicalDeviceFeatures.alphaToOne;
+    enabledFeatures.alphaToOne                     = m_supportedFeatures.alphaToOne;
 
-    enabledFeatures.depthBounds                    = m_physicalDeviceFeatures.depthBounds;
+    enabledFeatures.depthBounds                    = m_supportedFeatures.depthBounds;
 
-    enabledFeatures.logicOp                        = m_physicalDeviceFeatures.logicOp;
+    enabledFeatures.logicOp                        = m_supportedFeatures.logicOp;
 
-    enabledFeatures.multiDrawIndirect              = m_physicalDeviceFeatures.multiDrawIndirect;
+    enabledFeatures.multiDrawIndirect              = m_supportedFeatures.multiDrawIndirect;
 
-    enabledFeatures.drawIndirectFirstInstance      = m_physicalDeviceFeatures.drawIndirectFirstInstance;
+    enabledFeatures.drawIndirectFirstInstance      = m_supportedFeatures.drawIndirectFirstInstance;
 
     // The current graphics pipeline contract has no patch-control-point state.
     enabledFeatures.tessellationShader = VK_FALSE;
 
     enabledFeatures.robustBufferAccess =
-        RHIOptions::GetInstance().RobustBufferAccessEnabled() ? m_physicalDeviceFeatures.robustBufferAccess : VK_FALSE;
+        m_pRHI->GetDeviceDesc().RobustBufferAccessEnabled() ? m_supportedFeatures.robustBufferAccess : VK_FALSE;
 
     // Capability queries describe features actually enabled on this logical device.
-    m_physicalDeviceFeatures    = enabledFeatures;
+    m_enabledFeatures           = enabledFeatures;
 
-    deviceInfo.pEnabledFeatures = &m_physicalDeviceFeatures;
+    deviceInfo.pEnabledFeatures = &m_enabledFeatures;
 
     const VkResult result       = vkCreateDevice(m_gpu, &deviceInfo, nullptr, &m_device);
 
-    RHIError error              = MakeVulkanError(result, "vkCreateDevice");
+    m_pRHI->CheckDeviceLoss(result, "vkCreateDevice");
+
+    RHIError error = MakeVulkanError(result, "vkCreateDevice");
     if (!error.IsFailure())
     {
         ZEN_RHI_LOG_INFO("Vulkan Device Created");
@@ -684,7 +626,7 @@ RHIError VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>&
         // Flags stay zero so the driver synchronizes concurrent pipeline creation internally.
         VkPipelineCacheCreateInfo pipelineCacheInfo{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
 
-        const std::span<const uint8_t> seed    = RHIOptions::GetInstance().PipelineCacheSeed();
+        const std::span<const uint8_t> seed    = m_pRHI->GetDeviceDesc().PipelineCacheSeed();
         const std::span<const uint8_t> payload = CachePayload(seed, m_gpuProps);
         pipelineCacheInfo.initialDataSize      = payload.size();
         pipelineCacheInfo.pInitialData         = payload.data();
@@ -700,6 +642,8 @@ RHIError VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>&
 
             if (cacheResult == VK_ERROR_DEVICE_LOST)
             {
+                m_pRHI->CheckDeviceLoss(cacheResult, "vkCreatePipelineCache");
+
                 error = MakeVulkanError(cacheResult, "vkCreatePipelineCache");
             }
             ZEN_RHI_LOG_WARN("Vulkan pipeline cache unavailable ({}); creating pipelines without a cache",
@@ -726,6 +670,12 @@ RHIError VulkanDevice::SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>&
         ZEN_RHI_LOG_INFO("Vulkan queues: graphics={}:{}; compute={}:{}; transfer={}:{}", queues.graphics.familyIndex,
                          queues.graphics.queueIndex, queues.compute.familyIndex, queues.compute.queueIndex,
                          queues.transfer.familyIndex, queues.transfer.queueIndex);
+
+        for (bool transferUsage : {false, true})
+        {
+            m_queueSharing[transferUsage ? 1 : 0] = MakeQueueSharing(queues.graphics.familyIndex, queues.compute.familyIndex,
+                                                                     queues.transfer.familyIndex, transferUsage);
+        }
     }
     return error;
 }
@@ -742,7 +692,7 @@ void VulkanDevice::SetObjectName(VkObjectType type, uint64_t handle, NameID name
 
     info.pObjectName  = name.IsNone() ? nullptr : name.CStr();
 
-    if (GVulkanRHI->GetInstanceExtensionFlags().hasDebugUtils && vkSetDebugUtilsObjectNameEXT != nullptr)
+    if (m_pRHI->GetInstanceExtensionFlags().hasDebugUtils && vkSetDebugUtilsObjectNameEXT != nullptr)
     {
         vkSetDebugUtilsObjectNameEXT(m_device, &info);
     }
@@ -754,7 +704,7 @@ void VulkanDevice::WaitForIdle()
     {
         const VkResult result = TimedRHICall(RHIWorkerTime::eWait, vkDeviceWaitIdle, m_device);
 
-        ReportVulkanDeviceLoss(result, "vkDeviceWaitIdle");
+        m_pRHI->CheckDeviceLoss(result, "vkDeviceWaitIdle");
 
         if (result != VK_SUCCESS)
         {
@@ -763,11 +713,6 @@ void VulkanDevice::WaitForIdle()
 
             // Device loss ends the lifetime wait without establishing valid contents/serials.
             ZEN_RHI_LOG_ERROR("Vulkan device idle wait failed: {}", int32_t(result));
-
-            if (GVulkanRHI->GetDevice() == this)
-            {
-                GVulkanRHI->BlockSubmissions(MakeVulkanError(result, "vkDeviceWaitIdle", __FILE__, __LINE__));
-            }
         }
         else
         {
@@ -796,13 +741,13 @@ VkResult VulkanDevice::AcquireGPUTimingPool(VkQueryPool& pool)
 
         m_freeTimingPools.pop_back();
     }
-    else if (m_timingPools.size() < FVulkanCommandBuffer::kMaxGPUTimingPools)
+    else if (m_timingPools.size() < VulkanGPUTimingRecorder::kMaxPools)
     {
         VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
 
         info.queryType  = VK_QUERY_TYPE_TIMESTAMP;
 
-        info.queryCount = 2 * FVulkanCommandBuffer::kMaxGPUTimingScopes;
+        info.queryCount = 2 * VulkanGPUTimingRecorder::kMaxScopes;
 
         result          = vkCreateQueryPool(m_device, &info, nullptr, &pool);
 
@@ -845,18 +790,11 @@ void VulkanDevice::Destroy()
 {
     DestroyQueues();
 
-    if (m_pSemaphoreManger != nullptr)
+    if (m_pSemaphoreManager != nullptr)
     {
-        m_pSemaphoreManger->Destroy();
+        m_pSemaphoreManager->Destroy();
 
-        ZEN_DELETE(m_pSemaphoreManger);
-    }
-
-    if (m_pFenceManager != nullptr)
-    {
-        m_pFenceManager->Destroy();
-
-        ZEN_DELETE(m_pFenceManager);
+        ZEN_DELETE(m_pSemaphoreManager);
     }
 
     if (m_device != VK_NULL_HANDLE)
@@ -897,7 +835,8 @@ RHIQueueCapabilities VulkanDevice::GetQueueCapabilities() const
         capabilities.computeSupported =
             compute != nullptr && (GetQueueFamilyProperties(compute->GetFamilyIndex()).queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
 
-        capabilities.asyncSubmissionDependencies = SupportsTimelineSemaphore();
+        // Every queue signals a timeline semaphore, so other queues wait for it on the GPU.
+        capabilities.asyncSubmissionDependencies = true;
 
         for (uint32_t i = 0; i < capabilities.queueIds.size(); ++i)
         {
@@ -925,16 +864,16 @@ RHIQueueCapabilities VulkanDevice::GetQueueCapabilities() const
 bool VulkanRHI::PrepareSubmissionDependencies(IRHICommandContext*                      context,
                                               std::span<const RHISubmissionDependency> dependencies)
 {
-    GetRHIThread().CheckOwnership();
+    m_runtime->thread.CheckOwnership();
 
     if (!m_submissionBlocked)
     {
         SetSubmissionError({});
     }
 
-    bool result                         = context != nullptr && !m_submissionBlocked;
+    bool result                        = context != nullptr && !m_submissionBlocked;
 
-    FVulkanCommandListContext* consumer = static_cast<FVulkanCommandListContext*>(context);
+    VulkanCommandListContext* consumer = static_cast<VulkanCommandListContext*>(context);
 
     for (const RHISubmissionDependency& dependency : dependencies)
     {
@@ -953,15 +892,8 @@ bool VulkanRHI::PrepareSubmissionDependencies(IRHICommandContext*               
             if (result && serial != 0 && producer->GetLastCompletedSerial() < serial
                 && producer->GetVkHandle() != consumer->GetQueue()->GetVkHandle())
             {
-                if (SupportsAsyncSubmissionDependencies())
-                {
-                    consumer->AddWaitSemaphore(VkPipelineStageFlags(RHISubmissionDependency::kWaitStage),
-                                               producer->m_pTimelineSemaphore, serial);
-                }
-                else
-                {
-                    result = producer->WaitForCompletion(serial, UINT64_MAX);
-                }
+                consumer->AddWaitSemaphore(VkPipelineStageFlags(RHISubmissionDependency::kWaitStage),
+                                           producer->m_pTimelineSemaphore, serial);
             }
         }
     }
@@ -1000,11 +932,11 @@ uint64_t VulkanRHI::QueryLastCompletedSerial(RHICommandContextType contextType)
     return pQueue != nullptr ? pQueue->GetLastCompletedSerial() : 0;
 }
 
-bool VulkanRHI::WaitForCompletion(RHICommandContextType contextType, uint64_t submissionSerial, uint64_t timeoutNS)
+RHIWaitResult VulkanRHI::WaitForCompletion(RHICommandContextType contextType, uint64_t submissionSerial, uint64_t timeoutNS)
 {
     VulkanQueue* pQueue = m_pDevice->GetQueue(contextType);
 
-    return pQueue != nullptr && pQueue->WaitForCompletion(submissionSerial, timeoutNS);
+    return MakeWaitResult(pQueue != nullptr && pQueue->WaitForCompletion(submissionSerial, timeoutNS));
 }
 
 void VulkanRHI::WaitDeviceIdle()

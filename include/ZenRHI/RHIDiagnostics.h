@@ -11,12 +11,29 @@ enum class RHIMessageSeverity
     eWarning,
     eError
 };
-using RHIMessageCallback = void (*)(RHIMessageSeverity severity, std::string_view message) noexcept;
+// One diagnostic. Validation-layer messages carry their message id (a VUID or a hazard name); RHI logs carry none.
+// The views are valid for the duration of the callback.
+struct RHIMessage
+{
+    RHIMessageSeverity severity{RHIMessageSeverity::eInfo};
+    std::string_view   id;
+    std::string_view   text;
+};
 
-// The device may report on any calling or worker thread. The view is valid for the duration of the callback.
-void               ReportRHIMessage(RHIMessageSeverity severity, std::string_view message) noexcept;
+using RHIMessageCallback = void (*)(const RHIMessage& message) noexcept;
+
+// The device may report on any calling or worker thread. Without a callback, messages go to stderr.
+void               ReportRHIMessage(const RHIMessage& message) noexcept;
+void               ReportRHIMessage(RHIMessageSeverity severity, std::string_view text) noexcept;
 RHIMessageCallback GetRHIMessageCallback() noexcept;
 void               SetRHIMessageCallback(RHIMessageCallback callback) noexcept;
+
+// RHI resources or command contexts that outlive backend teardown are ownership bugs. Strict checks
+// abort through the verification path; otherwise teardown logs and continues, so a leak does not turn
+// a shipping build's exit into a crash. Process-wide, because the checks also run after the backend
+// is gone. Debug builds default to strict.
+void SetRHIStrictTeardownChecks(bool enabled) noexcept;
+bool GetRHIStrictTeardownChecks() noexcept;
 
 [[noreturn]] inline void RHIVerificationFailure(const char* expression, const char* file, int line, const char* message)
 {

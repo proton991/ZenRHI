@@ -1,5 +1,6 @@
 #include <span>
 #include "ZenRHI/RHICommandListExecutor.h"
+#include "VulkanIntegrationFixture.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanQueue.h"
 #include "Vulkan/VulkanRHI.h"
@@ -91,17 +92,15 @@ protected:
 
     void SetUp() override
     {
-        backend                                = ZEN_NEW() VulkanRHI();
+        backend                                = ZEN_NEW() VulkanRHI(test::MakeTestDeviceDesc());
 
         HiddenTransferFamily::originalProcAddr = vkGetInstanceProcAddr;
 
         {
             test::ScopedVulkanCall<PFN_vkGetInstanceProcAddr> procAddr(vkGetInstanceProcAddr, &HiddenTransferFamily::ProcAddr);
 
-            backend->Init();
+            zen::test::InitOrAbort(*backend);
         }
-
-        GDynamicRHI = backend;
 
         VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
 
@@ -113,11 +112,7 @@ protected:
 
         ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(backend->GetInstance(), &info, nullptr, &messenger), VK_SUCCESS);
 
-        executor    = ZEN_NEW() RHICommandListExecutor(backend, GetParam());
-
-        GDynamicRHI = executor;
-
-        GetRHIThread().Invoke(&RHIFrameState::Init, &GRHIFrameState, 3);
+        executor = ZEN_NEW() RHICommandListExecutor(backend, GetParam());
 
         source   = Buffer(RHIBufferAllocateType::eCPUWrite);
 
@@ -144,12 +139,7 @@ protected:
 
         submissions.clear();
 
-        const VulkanDevice* device = backend->GetDevice();
-
-        if (!device->SupportsTimelineSemaphore())
-        {
-            GTEST_SKIP() << "Grouped runs require timeline submissions";
-        }
+        const VulkanDevice* device  = backend->GetDevice();
 
         const VulkanQueue* transfer = device->GetQueue(RHICommandContextType::eTransfer);
 
@@ -193,10 +183,6 @@ protected:
             ZEN_DELETE(backend);
         }
 
-        GDynamicRHI = nullptr;
-
-        GVulkanRHI  = nullptr;
-
         // Release the static capture buffer before the allocator's shutdown report.
         submissions = {};
     }
@@ -229,7 +215,7 @@ protected:
 
         test::ScopedVulkanCall<PFN_vkQueueSubmit> submitHook(vkQueueSubmit, &Submit);
 
-        ASSERT_EQ(executor->SubmitBatch(MakeVecView(&list, 1)), RHISubmissionResult::eSuccess);
+        ASSERT_EQ(executor->SubmitCommandLists(MakeVecView(&list, 1)), RHISubmissionResult::eSuccess);
 
         ASSERT_EQ(submissions.size(), 1u);
 

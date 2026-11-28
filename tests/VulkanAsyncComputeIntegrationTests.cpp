@@ -19,12 +19,12 @@ namespace
 {
 using namespace zen;
 
-class VulkanAsyncComputeIntegrationTest : public testing::TestWithParam<bool>
+class VulkanAsyncComputeIntegrationTest : public testing::Test
 {
 protected:
     std::unique_ptr<test::VulkanSession>   session;
     VkDebugUtilsMessengerEXT               messenger{};
-    HeapVector<FVulkanCommandListContext*> contexts;
+    HeapVector<VulkanCommandListContext*>  contexts;
     HeapVector<VulkanBuffer*>              buffers;
     HeapVector<VulkanTexture*>             textures;
     HeapVector<VulkanSemaphore*>           semaphores;
@@ -36,10 +36,11 @@ protected:
     static inline PFN_vkCreateImage        createImage;
     static inline uint32_t                 bufferCreateCalls;
     static inline uint32_t                 imageCreateCalls;
+    static inline const VulkanDevice*      activeDevice;
 
     template <typename Info> static void CheckSharing(const Info& info, bool transfer)
     {
-        const VulkanDevice* device = GVulkanRHI->GetDevice();
+        const VulkanDevice* device = activeDevice;
 
         const uint32_t families[]  = {device->GetGfxQueue()->GetFamilyIndex(), device->GetComputeQueue()->GetFamilyIndex(),
                                       device->GetTransferQueue()->GetFamilyIndex()};
@@ -72,17 +73,9 @@ protected:
     void SetUp() override
     {
         session              = std::make_unique<test::VulkanSession>();
+        activeDevice         = session->rhi.GetDevice();
 
         VulkanDevice* device = session->rhi.GetDevice();
-
-        if (GetParam())
-        {
-            ASSERT_TRUE(device->SupportsTimelineSemaphore());
-        }
-        else
-        {
-            device->GetExtensionFlags().hasTimelineSemaphore = 0;
-        }
 
         VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
 
@@ -105,8 +98,7 @@ protected:
             GTEST_SKIP() << "Requires a compute family distinct from graphics and transfer";
         }
 
-        std::printf("Async sharing: graphics=%u compute=%u transfer=%u, completion=%s\n", graphics, compute, transfer,
-                    GetParam() ? "timeline" : "fence");
+        std::printf("Async sharing: graphics=%u compute=%u transfer=%u\n", graphics, compute, transfer);
     }
 
     void TearDown() override
@@ -115,7 +107,7 @@ protected:
         {
             session->rhi.WaitDeviceIdle();
 
-            for (FVulkanCommandListContext* context : contexts)
+            for (VulkanCommandListContext* context : contexts)
             {
                 ZEN_DELETE(context);
             }
@@ -148,7 +140,7 @@ protected:
             if (originalAllocator)
             {
                 // All resources created under observation have been destroyed above.
-                GVkMemAllocator = originalAllocator;
+                VulkanRHITestAccess::ReplaceMemoryAllocator(session->rhi, originalAllocator);
 
                 observedAllocator.reset();
             }
@@ -159,9 +151,9 @@ protected:
         }
     }
 
-    FVulkanCommandListContext* Context(RHICommandContextType type)
+    VulkanCommandListContext* Context(RHICommandContextType type)
     {
-        FVulkanCommandListContext* context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(type));
+        VulkanCommandListContext* context = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(type));
 
         contexts.push_back(context);
 
@@ -212,10 +204,10 @@ protected:
         return texture;
     }
 
-    void InitializeLayout(FVulkanCommandListContext* context,
-                          VulkanTexture*             texture,
-                          VkPipelineStageFlags       dstStage,
-                          VkAccessFlags              dstAccess)
+    void InitializeLayout(VulkanCommandListContext* context,
+                          VulkanTexture*            texture,
+                          VkPipelineStageFlags      dstStage,
+                          VkAccessFlags             dstAccess)
     {
         VulkanPipelineBarrier barrier;
 
@@ -225,7 +217,7 @@ protected:
         barrier.Execute(context->GetCommandBuffer()->GetVkHandle(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dstStage);
     }
 
-    bool Submit(FVulkanCommandListContext* context)
+    bool Submit(VulkanCommandListContext* context)
     {
         bool returnValue{};
 
@@ -263,11 +255,11 @@ protected:
         return returnValue;
     }
 
-    bool Handoff(FVulkanCommandListContext* source, FVulkanCommandListContext* destination)
+    bool Handoff(VulkanCommandListContext* source, VulkanCommandListContext* destination)
     {
         bool returnValue{};
 
-        VulkanSemaphore* semaphore = session->rhi.GetDevice()->GetSemaphoreManager()->GetOrCreateSemaphore();
+        VulkanSemaphore* semaphore = session->rhi.GetDevice()->GetSemaphoreManager()->CreateBinarySemaphore();
 
         semaphores.push_back(semaphore);
 
@@ -288,11 +280,11 @@ protected:
         return returnValue;
     }
 
-    void Dispatch(FVulkanCommandListContext* context,
-                  VulkanBuffer*              data,
-                  VulkanTexture*             texture,
-                  VulkanBuffer*              output,
-                  bool                       initialize)
+    void Dispatch(VulkanCommandListContext* context,
+                  VulkanBuffer*             data,
+                  VulkanTexture*            texture,
+                  VulkanBuffer*             output,
+                  bool                      initialize)
     {
         if (pipeline == nullptr)
         {
@@ -301,7 +293,7 @@ protected:
             info.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
 
             zen::test::LoadShaderModule(info, RHIShaderStage::eCompute,
-                                        std::filesystem::path(RDG_REFLECTION_TEST_PATH) / "async_resources.comp.spv");
+                                        std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / "async_resources.comp.spv");
 
             shader   = session->rhi.CreateShader(info);
 
@@ -328,12 +320,12 @@ protected:
         context->RHIDispatch(1, 1, 1);
     }
 
-    void Readback(FVulkanCommandListContext* context,
-                  VulkanBuffer*              output,
-                  uint32_t                   expectedBuffer,
-                  uint32_t                   expectedImage,
-                  VkPipelineStageFlags       srcStage  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                  VkAccessFlags              srcAccess = VK_ACCESS_SHADER_WRITE_BIT)
+    void Readback(VulkanCommandListContext* context,
+                  VulkanBuffer*             output,
+                  uint32_t                  expectedBuffer,
+                  uint32_t                  expectedImage,
+                  VkPipelineStageFlags      srcStage  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VkAccessFlags             srcAccess = VK_ACCESS_SHADER_WRITE_BIT)
     {
         VulkanPipelineBarrier barrier;
 
@@ -357,7 +349,7 @@ protected:
     }
 };
 
-TEST_P(VulkanAsyncComputeIntegrationTest, TransferBufferCanBeClearedOnSeparateComputeQueue)
+TEST_F(VulkanAsyncComputeIntegrationTest, TransferBufferCanBeClearedOnSeparateComputeQueue)
 {
     VulkanBuffer* buffer = Buffer(RHIBufferUsageFlagBits::eTransferDstBuffer);
 
@@ -367,14 +359,14 @@ TEST_P(VulkanAsyncComputeIntegrationTest, TransferBufferCanBeClearedOnSeparateCo
 
     buffer->Unmap();
 
-    FVulkanCommandListContext* compute = Context(RHICommandContextType::eAsyncCompute);
+    VulkanCommandListContext* compute = Context(RHICommandContextType::eAsyncCompute);
 
     compute->RHIClearBuffer(buffer, 0, 8);
 
     Readback(compute, buffer, 0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 }
 
-TEST_P(VulkanAsyncComputeIntegrationTest, NativeAllocationsIncludeAllPermittedFamilies)
+TEST_F(VulkanAsyncComputeIntegrationTest, NativeAllocationsIncludeAllPermittedFamilies)
 {
     createBuffer      = vkCreateBuffer;
 
@@ -407,14 +399,12 @@ TEST_P(VulkanAsyncComputeIntegrationTest, NativeAllocationsIncludeAllPermittedFa
     // VMA caches the entry points at initialization. Use a fresh public allocator so
     // RHI CreateBuffer/CreateTexture reach these forwarding observers, then restore
     // the session allocator in TearDown after freeing the observed resources.
-    observedAllocator = std::make_unique<VulkanMemoryAllocator>();
+    observedAllocator = std::make_unique<VulkanMemoryAllocator>(&session->rhi);
 
     observedAllocator->Init(session->rhi.GetInstance(), session->rhi.GetPhysicalDevice(), session->rhi.GetVkDevice(),
-                            session->rhi.GetDevice()->GetExtensionFlags().hasBufferDeviceAddress != 0);
+                            {session->rhi.GetDevice()->GetExtensionFlags().hasBufferDeviceAddress != 0});
 
-    originalAllocator = GVkMemAllocator;
-
-    GVkMemAllocator   = observedAllocator.get();
+    originalAllocator = VulkanRHITestAccess::ReplaceMemoryAllocator(session->rhi, observedAllocator.get());
 
     for (bool transfer : {false, true})
     {
@@ -428,17 +418,17 @@ TEST_P(VulkanAsyncComputeIntegrationTest, NativeAllocationsIncludeAllPermittedFa
     EXPECT_GE(imageCreateCalls, 2u);
 }
 
-TEST_P(VulkanAsyncComputeIntegrationTest, StorageOnlyResourcesSurviveGraphicsComputeRoundTrip)
+TEST_F(VulkanAsyncComputeIntegrationTest, StorageOnlyResourcesSurviveGraphicsComputeRoundTrip)
 {
-    VulkanBuffer* data                  = Buffer(RHIBufferUsageFlagBits::eStorageBuffer);
+    VulkanBuffer* data                 = Buffer(RHIBufferUsageFlagBits::eStorageBuffer);
 
-    VulkanTexture* texture              = Texture(false);
+    VulkanTexture* texture             = Texture(false);
 
-    VulkanBuffer* output                = Buffer(RHIBufferUsageFlagBits::eStorageBuffer);
+    VulkanBuffer* output               = Buffer(RHIBufferUsageFlagBits::eStorageBuffer);
 
-    FVulkanCommandListContext* graphics = Context(RHICommandContextType::eGraphics);
+    VulkanCommandListContext* graphics = Context(RHICommandContextType::eGraphics);
 
-    FVulkanCommandListContext* compute  = Context(RHICommandContextType::eAsyncCompute);
+    VulkanCommandListContext* compute  = Context(RHICommandContextType::eAsyncCompute);
 
     InitializeLayout(graphics, texture, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -456,19 +446,19 @@ TEST_P(VulkanAsyncComputeIntegrationTest, StorageOnlyResourcesSurviveGraphicsCom
     Readback(graphics, output, 21, 27);
 }
 
-TEST_P(VulkanAsyncComputeIntegrationTest, TransferResourcesSurviveTransferComputeGraphicsHandoff)
+TEST_F(VulkanAsyncComputeIntegrationTest, TransferResourcesSurviveTransferComputeGraphicsHandoff)
 {
-    VulkanBuffer* data                  = Buffer(RHIBufferUsageFlagBits::eStorageBuffer, true);
+    VulkanBuffer* data                 = Buffer(RHIBufferUsageFlagBits::eStorageBuffer, true);
 
-    VulkanTexture* texture              = Texture(true);
+    VulkanTexture* texture             = Texture(true);
 
-    VulkanBuffer* output                = Buffer(RHIBufferUsageFlagBits::eStorageBuffer);
+    VulkanBuffer* output               = Buffer(RHIBufferUsageFlagBits::eStorageBuffer);
 
-    FVulkanCommandListContext* transfer = Context(RHICommandContextType::eTransfer);
+    VulkanCommandListContext* transfer = Context(RHICommandContextType::eTransfer);
 
-    FVulkanCommandListContext* compute  = Context(RHICommandContextType::eAsyncCompute);
+    VulkanCommandListContext* compute  = Context(RHICommandContextType::eAsyncCompute);
 
-    FVulkanCommandListContext* graphics = Context(RHICommandContextType::eGraphics);
+    VulkanCommandListContext* graphics = Context(RHICommandContextType::eGraphics);
 
     InitializeLayout(transfer, texture, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
@@ -541,7 +531,7 @@ struct ConsumerTransitionObserver
     }
 };
 
-TEST_P(VulkanAsyncComputeIntegrationTest, ConsumerTransitionAfterAcceptedProducerUsesLegalLocalScope)
+TEST_F(VulkanAsyncComputeIntegrationTest, ConsumerTransitionAfterAcceptedProducerUsesLegalLocalScope)
 {
     ConsumerTransitionObserver::original = vkCmdPipelineBarrier;
 
@@ -570,9 +560,9 @@ TEST_P(VulkanAsyncComputeIntegrationTest, ConsumerTransitionAfterAcceptedProduce
 
     data->Unmap();
 
-    FVulkanCommandListContext* graphics = Context(RHICommandContextType::eGraphics);
+    VulkanCommandListContext* graphics = Context(RHICommandContextType::eGraphics);
 
-    FVulkanCommandListContext* compute  = Context(RHICommandContextType::eAsyncCompute);
+    VulkanCommandListContext* compute  = Context(RHICommandContextType::eAsyncCompute);
 
     RHITextureTransition transition{};
 
@@ -647,7 +637,7 @@ struct AliasSubmitObserver
     }
 };
 
-TEST_P(VulkanAsyncComputeIntegrationTest, NativeQueueAliasKeepsUploadBarriersWithoutSemaphoreWait)
+TEST_F(VulkanAsyncComputeIntegrationTest, NativeQueueAliasKeepsUploadBarriersWithoutSemaphoreWait)
 {
     VulkanBuffer* data                          = Buffer(RHIBufferUsageFlagBits::eStorageBuffer, true);
 
@@ -662,9 +652,9 @@ TEST_P(VulkanAsyncComputeIntegrationTest, NativeQueueAliasKeepsUploadBarriersWit
     upload->Unmap();
 
     // Two command pools/contexts on the same native compute queue. The producer records uploads.
-    FVulkanCommandListContext* producer = Context(RHICommandContextType::eAsyncCompute);
+    VulkanCommandListContext* producer = Context(RHICommandContextType::eAsyncCompute);
 
-    FVulkanCommandListContext* consumer = Context(RHICommandContextType::eAsyncCompute);
+    VulkanCommandListContext* consumer = Context(RHICommandContextType::eAsyncCompute);
 
     producer->RHIClearBuffer(data, 0, 8);
 
@@ -735,5 +725,4 @@ TEST_P(VulkanAsyncComputeIntegrationTest, NativeQueueAliasKeepsUploadBarriersWit
     EXPECT_EQ(AliasSubmitObserver::waits, 0u);
 }
 
-INSTANTIATE_TEST_SUITE_P(TimelineAndFence, VulkanAsyncComputeIntegrationTest, testing::Bool());
 } // namespace

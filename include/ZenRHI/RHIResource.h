@@ -1,4 +1,5 @@
 #pragma once
+#include "ZenRHI/RHIDeviceRuntime.h"
 #include <vector>
 #include <span>
 #include "ZenRHI/RHIDiagnostics.h"
@@ -28,16 +29,15 @@ enum class RHIResourceType : uint32_t
     eSampler               = 5,
     eShader                = 6,
     ePipeline              = 7,
-    eDescriptorSet         = 8,
-    eAccelerationStructure = 9,
-    eMax                   = 10
+    eAccelerationStructure = 8,
+    eMax                   = 9
 };
 
 // Factories return one owning reference; use RHIResourcePtr<T>::Adopt(created).
 // The RHIResourcePtr pointer constructor adds a reference to an existing owner.
 // Raw RHI callers own resource lifetime: retain resources until every recorded use
 // is discarded or completes on the GPU. ReleaseReference/Destroy* do not wait.
-class RHIResource
+class RHIResource : public RHIDeviceChild
 {
 public:
     virtual ~RHIResource();
@@ -76,7 +76,7 @@ public:
         {
             std::atomic_thread_fence(std::memory_order_acquire);
             // A rejected release never reaches the destroyed backend; non-strict checks leak the object.
-            const bool accepted = GetRHIThread().DispatchCleanup([this] { Destroy(); });
+            const bool accepted = DispatchCleanup([this] { Destroy(); });
             VerifyTeardownOwnership(accepted, "Resource released after RHI cleanup admission closed", __FILE__, __LINE__);
         }
 
@@ -104,8 +104,6 @@ public:
     }
 
 protected:
-    virtual void Init()    = 0;
-
     virtual void Destroy() = 0;
 
     NameID m_resourceTag;
@@ -284,30 +282,12 @@ class RHIViewport : public RHIResource
 public:
     virtual ~RHIViewport() = default;
 
-    // The whole color backbuffer must be in eColorAttachment/eReadWrite on the graphics
-    // queue, with writes visible at eColorAttachmentOutput. The copy restores this state.
-    virtual void PrepareForPresent(RHICommandList* pCmdList) = 0;
+    // Records the copy into the backbuffer. The whole color backbuffer must be in eColorAttachment/eReadWrite on
+    // the graphics queue, with writes visible at eColorAttachmentOutput. The copy restores this state.
+    virtual RHIStatus PrepareForPresent(RHICommandList* commands) = 0;
 
-    virtual bool Present()                                   = 0;
-
-    virtual RHIStatus PrepareForPresentChecked(RHICommandList* commands)
-    {
-        PrepareForPresent(commands);
-
-        return {};
-    }
-
-    virtual RHIPresentResult PresentChecked()
-    {
-        const bool presented = Present();
-
-        return {NeedsRecreation() ? RHISurfaceOutcome::eRecreate
-                : presented       ? RHISurfaceOutcome::eReady
-                                  : RHISurfaceOutcome::eIncomplete,
-                presented ? RHIPresentAcceptance::eEnqueued : RHIPresentAcceptance::eNotAttempted,
-                {},
-                presented};
-    }
+    // Presents the submitted copy. Recreation stays with the host, which reads NeedsRecreation between frames.
+    virtual RHIPresentResult Present()                                  = 0;
 
     virtual uint32_t GetWidth() const                                   = 0;
 
@@ -319,24 +299,24 @@ public:
 
     virtual RHITexture* GetColorBackBuffer()                            = 0;
 
-    virtual RHITextureSubResourceRange GetColorBackBufferRange()        = 0;
+    virtual RHITextureSubresourceRange GetColorBackBufferRange()        = 0;
 
     virtual RHITexture* GetDepthStencilBackBuffer()                     = 0;
 
-    virtual RHITextureSubResourceRange GetDepthStencilBackBufferRange() = 0;
+    virtual RHITextureSubresourceRange GetDepthStencilBackBufferRange() = 0;
 
     // Called on the window-owning thread after outstanding frames are drained.
     // Surface replacement stays here; native GPU teardown/rebuild runs on RHI.
     virtual void Resize(uint32_t width, uint32_t height) = 0;
 
-    // Threaded presentation reports recreation to RenderCore instead of replacing
-    // backbuffers while the next graph is being recorded.
+    // Threaded presentation reports recreation to the host instead of replacing
+    // backbuffers while the next graph is being recorded. Callable from any thread.
     virtual bool NeedsRecreation() const
     {
         return false;
     }
 
-    // False only while a deferred surface still has no extent, so polling it stays cheap.
+    // False only while a deferred surface still has no extent, so polling it stays cheap. Callable from any thread.
     virtual bool CanRecreate() const
     {
         return true;
@@ -481,7 +461,7 @@ public:
         return 0;
     }
 
-    RHITextureSubResourceRange GetSubResourceRange() const;
+    RHITextureSubresourceRange GetSubResourceRange() const;
 
     uint32_t GetWidth() const
     {
@@ -555,7 +535,7 @@ public:
         return m_pTexture;
     }
 
-    const RHITextureSubResourceRange& GetSubResourceRange() const
+    const RHITextureSubresourceRange& GetSubResourceRange() const
     {
         return m_subResourceRange;
     }
@@ -574,7 +554,7 @@ protected:
 
     RHITexture* m_pTexture{nullptr};
 
-    RHITextureSubResourceRange m_subResourceRange;
+    RHITextureSubresourceRange m_subResourceRange;
 
     RHITextureViewCreateInfo m_viewInfo{};
 
@@ -620,9 +600,9 @@ inline void RHITexture::DestroyOwnedViews()
     m_pDefaultView = nullptr;
 }
 
-inline RHITextureSubResourceRange RHITexture::GetSubResourceRange() const
+inline RHITextureSubresourceRange RHITexture::GetSubResourceRange() const
 {
-    RHITextureSubResourceRange range{};
+    RHITextureSubresourceRange range{};
     range.aspect     = GetTextureFormatAspects(m_baseInfo.format);
     range.levelCount = m_baseInfo.mipmaps;
     range.layerCount = m_baseInfo.arrayLayers;
@@ -955,14 +935,6 @@ private:
     }
 };
 
-struct RHIGeometryBuffer
-{
-    std::vector<RHIBuffer*> vertexBuffers;
-    RHIBuffer*              pIndexBuffer{nullptr};
-    DataFormat              indexBufferFormat{DataFormat::eR32UInt};
-    uint64_t                indexBufferOffset{0};
-};
-
 struct RHIGfxPipelineCreateInfo
 {
     RHIShader*           pShader{nullptr};
@@ -1025,36 +997,5 @@ protected:
 
     // for graphics pipeline
     RHIGfxPipelineStates m_gfxStates;
-};
-
-class RHIAccelerationStructure;
-struct RHIAccelerationStructureCreateInfo;
-
-class RHIResourceFactory
-{
-public:
-    virtual ~RHIResourceFactory() = default;
-
-    virtual RHIAccelerationStructure* CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info)
-    {
-        return nullptr;
-    }
-
-    virtual RHIBuffer* CreateBuffer(const RHIBufferCreateInfo& createInfo)              = 0;
-
-    virtual RHITexture* CreateTexture(const RHITextureCreateInfo& createInfo)           = 0;
-
-    virtual RHISampler* CreateSampler(const RHISamplerCreateInfo& createInfo)           = 0;
-
-    virtual RHIShader* CreateShader(const RHIShaderCreateInfo& createInfo)              = 0;
-
-    virtual RHIPipeline* CreatePipeline(const RHIComputePipelineCreateInfo& createInfo) = 0;
-
-    virtual RHIPipeline* CreatePipeline(const RHIGfxPipelineCreateInfo& createInfo)     = 0;
-
-    virtual RHIPipeline* CreatePipeline(const RHIRayTracingPipelineCreateInfo& createInfo)
-    {
-        return nullptr;
-    }
 };
 } // namespace zen

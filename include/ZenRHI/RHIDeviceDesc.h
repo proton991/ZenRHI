@@ -63,6 +63,8 @@ enum class RHIValidationMode : uint8_t
     eRequired
 };
 
+// Creation parameters. Each backend keeps its own copy, so later changes to a description
+// do not reach a device that already exists.
 class RHIDeviceDesc
 {
 public:
@@ -90,9 +92,8 @@ public:
         return m_deviceMemoryLimit;
     }
 
-    // Diagnostic adapter choice, set before device creation. A valid device whose name
-    // contains this text wins over the scored choice; empty falls back to the
-    // ZEN_VULKAN_DEVICE environment variable, then to scoring.
+    // Diagnostic adapter choice for cross-vendor runs. A valid device whose name contains
+    // this text wins over the scored choice; empty uses the scored choice.
     void SetPreferredDevice(std::string_view name)
     {
         m_preferredDevice = name;
@@ -244,7 +245,7 @@ public:
         return m_robustBufferAccessEnabled;
     }
 
-    // Read when a swapchain is created or recreated.
+    // Every swapchain the device creates or recreates presents with this mode.
     void SetPresentMode(RHIPresentMode mode)
     {
         m_presentMode = mode;
@@ -279,32 +280,16 @@ public:
         return m_bindlessHeapCapacities;
     }
 
-    // RHI resources or command contexts that outlive backend teardown are ownership bugs.
-    // Strict checks abort through the verification path; otherwise teardown logs and continues,
-    // so a leak does not turn a shipping build's exit into a crash. Debug builds default to strict.
-    void SetStrictTeardownChecks(bool enabled)
-    {
-        m_strictTeardownChecks = enabled;
-    }
-
-    bool StrictTeardownChecks() const
-    {
-        return m_strictTeardownChecks;
-    }
-
     using SurfaceExtensions = std::span<const char* const> (*)();
     SurfaceExtensions                                      surfaceExtensions{};
-    RHIMessageCallback                                     messageCallback{};
 
 private:
     std::shared_ptr<const std::vector<uint8_t>> m_pipelineCacheSeed;
     RHIPresentMode                              m_presentMode{RHIPresentMode::eDefault};
     RHIBindlessHeapCapacities                   m_bindlessHeapCapacities;
 #if defined(NDEBUG)
-    bool              m_strictTeardownChecks{false};
     RHIValidationMode m_validationMode{RHIValidationMode::eOff};
 #else
-    bool              m_strictTeardownChecks{true};
     RHIValidationMode m_validationMode{RHIValidationMode::eRequested};
 #endif
     bool                      m_workerTimingEnabled{};
@@ -321,29 +306,5 @@ private:
     std::chrono::milliseconds m_stallFatalThreshold{};
     bool                      m_stallStackCapture{true};
     bool                      m_deviceLossDiagnostics{false};
-};
-
-class RHIOptions : public RHIDeviceDesc
-{
-public:
-    // Deleted to prevent copying and assignment
-    RHIOptions(const RHIOptions&)            = delete;
-
-    RHIOptions& operator=(const RHIOptions&) = delete;
-
-    // Static method to get the single instance of the class
-    static RHIOptions& GetInstance()
-    {
-        static RHIOptions instance;
-        return instance;
-    }
-
-    void Configure(const RHIDeviceDesc& description)
-    {
-        static_cast<RHIDeviceDesc&>(*this) = description;
-    }
-
-private:
-    RHIOptions() = default;
 };
 } // namespace zen

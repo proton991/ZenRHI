@@ -1,22 +1,25 @@
 #pragma once
 #include "ZenRHI/RHIShaderParameters.h"
 #include "ZenRHI/RHIError.h"
-#include "VulkanDescriptorPool.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
 
 namespace zen
 {
-class FVulkanCommandListContext;
+class VulkanRHI;
+class VulkanCommandListContext;
 class VulkanPipeline;
-class VulkanDescriptorPoolSetContainer;
+class VulkanShader;
 
 class VulkanDescriptorSetState
 {
 public:
+    explicit VulkanDescriptorSetState(VulkanRHI* pRHI) : m_pRHI(pRHI) {}
+
     void SetPipeline(VulkanPipeline* pPipeline);
 
     bool SetShaderParameters(RHIShaderParameterView parameters, uint64_t recordedEpoch = 0, uint64_t transaction = 0);
 
-    RHIStatus FlushPendingDescriptorWrites(FVulkanCommandListContext*   pContext,
+    RHIStatus FlushPendingDescriptorWrites(VulkanCommandListContext*    pContext,
                                            HeapVector<VkDescriptorSet>& outDescriptorSets,
                                            uint32_t&                    outFirstSet,
                                            HeapVector<uint32_t>&        outDynamicOffsets);
@@ -24,6 +27,8 @@ public:
     void Reset();
 
 private:
+    VulkanRHI* m_pRHI{nullptr};
+
     struct BindingState
     {
         RHIShaderResourceBinding srb;
@@ -35,15 +40,19 @@ private:
 
     struct SetState
     {
-        VkDescriptorSet                   vkSet{VK_NULL_HANDLE};
-        VulkanDescriptorPoolSetContainer* pContainer{nullptr};
-        HeapVector<BindingState>          bindings;
-        bool                              dirty{false};
+        VkDescriptorSet vkSet{VK_NULL_HANDLE};
+        // The allocator arena's lifetime, recorded on every bind.
+        uint64_t                 lifetimeId{0};
+        HeapVector<BindingState> bindings;
+        bool                     dirty{false};
     };
 
     RHIStatus ResolveSet(uint32_t setIdx);
 
-    bool BuildContentKey(uint32_t setIdx, VulkanDescriptorSetCache::ContentKey& outKey);
+    // Finds or writes the set of an ordinary (non-heap) set index; status receives the outcome.
+    VulkanDescriptorAllocator::Set ResolveOrdinarySet(uint32_t setIdx, VulkanShader& shader, RHIStatus& status);
+
+    bool BuildContentKey(uint32_t setIdx, VulkanDescriptorAllocator::Key& outKey);
 
     void ClearAllSetStates();
 
@@ -58,9 +67,9 @@ private:
     bool ValidateSetState(uint32_t setIdx);
 
 
-    void SyncCacheRevision(const VulkanDescriptorSetCache& cache);
+    void SyncCacheRevision(const VulkanDescriptorAllocator& allocator);
 
-    RHIStatus BuildDescriptorSetList(FVulkanCommandListContext*   pContext,
+    RHIStatus BuildDescriptorSetList(VulkanCommandListContext*    pContext,
                                      HeapVector<VkDescriptorSet>& outDescriptorSets,
                                      uint32_t&                    outFirstSet,
                                      HeapVector<uint32_t>&        outDynamicOffsets);
@@ -95,7 +104,7 @@ private:
     uint64_t m_pipelineIdentity{0};
 
 
-    FVulkanCommandListContext*  m_lastContext{nullptr};
+    VulkanCommandListContext*   m_lastContext{nullptr};
     uint64_t                    m_lastWorkloadGeneration{0};
     uint64_t                    m_lastCacheRevision{0};
     HeapVector<VkDescriptorSet> m_resolvedSets;

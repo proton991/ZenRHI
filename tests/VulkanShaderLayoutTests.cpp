@@ -1,6 +1,7 @@
+#include "Vulkan/VulkanBindlessHeap.h"
 #include "Vulkan/VulkanPipeline.h"
-#include "Vulkan/VulkanDescriptorPool.h"
-#include "ZenRHI/RHIOptions.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include <gtest/gtest.h>
 #include <limits>
 
@@ -451,11 +452,11 @@ TEST_F(VulkanBindlessCapacityFitTest, MaximumRequestsDoNotOverflowScalingOrCombi
 
 TEST_F(VulkanBindlessCapacityFitTest, MissingCubeArrayFeatureLeavesTheBudgetToUsableHeaps)
 {
-    const RHIBindlessHeapCapacities options = RHIOptions::GetInstance().BindlessHeapCapacities();
-    EXPECT_EQ(GetBindlessHeapRequest(true).slots, options.slots);
+    const RHIBindlessHeapCapacities options = RHIDeviceDesc().BindlessHeapCapacities();
+    EXPECT_EQ(GetBindlessHeapRequest(options, true).slots, options.slots);
     RHIBindlessHeapCapacities expected = options;
     expected.Set(RHIBindlessHeapType::eTextureCubeArray, 1);
-    EXPECT_EQ(GetBindlessHeapRequest(false).slots, expected.slots);
+    EXPECT_EQ(GetBindlessHeapRequest(options, false).slots, expected.slots);
 }
 
 TEST_F(VulkanShaderLayoutLimitTest, FittedHeapsLeaveTheReserveForOrdinaryDescriptors)

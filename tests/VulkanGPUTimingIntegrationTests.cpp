@@ -63,7 +63,7 @@ struct TimingResetObserver
         }
         ++calls;
         EXPECT_EQ(first, 0u);
-        EXPECT_EQ(count, 2 * FVulkanCommandBuffer::kMaxGPUTimingScopes);
+        EXPECT_EQ(count, 2 * VulkanGPUTimingRecorder::kMaxScopes);
         original(device, pool, first, count);
     }
 };
@@ -115,7 +115,7 @@ protected:
         session.Reset();
     }
 
-    bool SupportsTiming(FVulkanCommandListContext& context)
+    bool SupportsTiming(VulkanCommandListContext& context)
     {
         const VkQueueFamilyProperties& family =
             session->rhi.GetDevice()->GetQueueFamilyProperties(context.GetQueue()->GetFamilyIndex());
@@ -125,11 +125,11 @@ protected:
                 || session->rhi.GetDevice()->GetExtensionFlags().hasHostQueryReset);
     }
 
-    void SubmitAndComplete(FVulkanCommandListContext& context)
+    void SubmitAndComplete(VulkanCommandListContext& context)
     {
         ASSERT_EQ(context.SubmitRecordedWorkloads(), RHISubmissionResult::eSuccess);
 
-        ASSERT_TRUE(context.GetQueue()->WaitForCompletion(context.GetLastSubmittedSerial(), UINT64_MAX));
+        ASSERT_TRUE(context.GetQueue()->WaitForCompletion(context.GetQueue()->GetLastSubmittedSerial(), UINT64_MAX));
     }
 };
 
@@ -144,7 +144,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, SupportedQueuesResolveFiniteDurationsWith
     {
         SCOPED_TRACE(RHIQueueName(queue));
 
-        FVulkanCommandListContext context(queue, session->rhi.GetDevice());
+        VulkanCommandListContext context(queue, session->rhi.GetDevice());
 
         RHIGPUTimingPtr result = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
 
@@ -180,7 +180,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, SupportedQueuesResolveFiniteDurationsWith
 
 TEST_F(VulkanGPUTimingIntegrationTest, CompletedBufferReuseDoesNotOverwritePublishedResults)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (!SupportsTiming(context))
     {
@@ -191,7 +191,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, CompletedBufferReuseDoesNotOverwritePubli
 
     context.RHIBeginGPUTiming(first);
 
-    FVulkanCommandBuffer* buffer = context.GetCommandBuffer();
+    VulkanCommandBuffer* buffer = context.GetCommandBuffer();
 
     context.RHIEndGPUTiming(first);
 
@@ -220,8 +220,8 @@ TEST_F(VulkanGPUTimingIntegrationTest, CompletedBufferReuseDoesNotOverwritePubli
 
 TEST_F(VulkanGPUTimingIntegrationTest, TransferHostResetPreservesConcurrentRecordingsAndRetiredResults)
 {
-    FVulkanCommandListContext      firstContext(RHICommandContextType::eTransfer, session->rhi.GetDevice());
-    FVulkanCommandListContext      secondContext(RHICommandContextType::eTransfer, session->rhi.GetDevice());
+    VulkanCommandListContext       firstContext(RHICommandContextType::eTransfer, session->rhi.GetDevice());
+    VulkanCommandListContext       secondContext(RHICommandContextType::eTransfer, session->rhi.GetDevice());
     const VkQueueFamilyProperties& family =
         session->rhi.GetDevice()->GetQueueFamilyProperties(firstContext.GetQueue()->GetFamilyIndex());
     if (!SupportsTiming(firstContext) || (family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0)
@@ -273,7 +273,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, TransferHostResetPreservesConcurrentRecor
 TEST_F(VulkanGPUTimingIntegrationTest, TransferTimingWithoutHostResetRemainsUnsupported)
 {
     VulkanDevice*                  device = session->rhi.GetDevice();
-    FVulkanCommandListContext      context(RHICommandContextType::eTransfer, device);
+    VulkanCommandListContext       context(RHICommandContextType::eTransfer, device);
     const VkQueueFamilyProperties& family = device->GetQueueFamilyProperties(context.GetQueue()->GetFamilyIndex());
     if ((family.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) != 0)
     {
@@ -306,14 +306,14 @@ TEST_F(VulkanGPUTimingIntegrationTest, AbandonedScopesAndCapacityOverflowHaveExp
     RHIGPUTimingPtr overflow = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
 
     {
-        FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+        VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
         if (!SupportsTiming(context))
         {
             GTEST_SKIP() << "Graphics timestamps unavailable";
         }
 
-        for (uint32_t index = 0; index < FVulkanCommandBuffer::kMaxGPUTimingScopes; ++index)
+        for (uint32_t index = 0; index < VulkanGPUTimingRecorder::kMaxScopes; ++index)
         {
             results.push_back(MakeShared<RHIGPUTimingResult, MultiThreadCounter>());
 
@@ -343,7 +343,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, SplitScopeCannotFabricateATiming)
 {
     VulkanSemaphore signal(session->rhi.GetDevice());
 
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (!SupportsTiming(context))
     {
@@ -364,7 +364,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, SplitScopeCannotFabricateATiming)
 
 TEST_F(VulkanGPUTimingIntegrationTest, QueryReadFailureDoesNotFailRendering)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (!SupportsTiming(context))
     {
@@ -392,7 +392,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, QueryReadFailureDoesNotFailRendering)
 
 TEST_F(VulkanGPUTimingIntegrationTest, QueryReadDeviceLossBlocksSubmissionsWithOriginalCause)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (!SupportsTiming(context))
     {
@@ -440,7 +440,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, QueryReadDeviceLossBlocksSubmissionsWithO
 
 TEST_F(VulkanGPUTimingIntegrationTest, PoolAllocationFailureReleasesCapacityForRetry)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (!SupportsTiming(context))
     {
@@ -450,7 +450,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, PoolAllocationFailureReleasesCapacityForR
     {
         test::ScopedVulkanCall hook(vkCreateQueryPool, RejectTimingPool);
 
-        for (uint32_t attempt = 0; attempt <= FVulkanCommandBuffer::kMaxGPUTimingPools; ++attempt)
+        for (uint32_t attempt = 0; attempt <= VulkanGPUTimingRecorder::kMaxPools; ++attempt)
         {
             RHIGPUTimingPtr result = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
 
@@ -479,7 +479,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, DevicePoolBudgetRecyclesRetiredHandles)
 
     HeapVector<VkQueryPool> acquired;
 
-    for (uint32_t index = 0; index < FVulkanCommandBuffer::kMaxGPUTimingPools; ++index)
+    for (uint32_t index = 0; index < VulkanGPUTimingRecorder::kMaxPools; ++index)
     {
         VkQueryPool pool = VK_NULL_HANDLE;
 
@@ -499,7 +499,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, DevicePoolBudgetRecyclesRetiredHandles)
         device.ReleaseGPUTimingPool(pool);
     }
 
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, &device);
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, &device);
     if (SupportsTiming(context))
     {
         RHIGPUTimingPtr timing = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
@@ -507,7 +507,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, DevicePoolBudgetRecyclesRetiredHandles)
         context.RHIDiscardRecording();
         EXPECT_EQ(timing->GetStatus(), RHIGPUTimingStatus::eDiscarded);
         acquired.clear();
-        for (uint32_t index = 0; index < FVulkanCommandBuffer::kMaxGPUTimingPools; ++index)
+        for (uint32_t index = 0; index < VulkanGPUTimingRecorder::kMaxPools; ++index)
         {
             VkQueryPool pool = VK_NULL_HANDLE;
             if (device.AcquireGPUTimingPool(pool) == VK_SUCCESS)
@@ -515,7 +515,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, DevicePoolBudgetRecyclesRetiredHandles)
                 acquired.push_back(pool);
             }
         }
-        EXPECT_EQ(acquired.size(), FVulkanCommandBuffer::kMaxGPUTimingPools);
+        EXPECT_EQ(acquired.size(), VulkanGPUTimingRecorder::kMaxPools);
         for (VkQueryPool pool : acquired)
         {
             device.ReleaseGPUTimingPool(pool);
@@ -524,7 +524,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, DevicePoolBudgetRecyclesRetiredHandles)
 
     test::ScopedVulkanCall rejectNewAllocation(vkCreateQueryPool, RejectTimingPool);
 
-    for (uint32_t index = 0; index < 2 * FVulkanCommandBuffer::kMaxGPUTimingPools; ++index)
+    for (uint32_t index = 0; index < 2 * VulkanGPUTimingRecorder::kMaxPools; ++index)
     {
         VkQueryPool pool = VK_NULL_HANDLE;
 
@@ -546,7 +546,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeCollectsNativeQueuesWithoutR
 
         session->rhi.BeginGPUFrameTiming(frame);
 
-        HeapVector<UniquePtr<FVulkanCommandListContext>> contexts;
+        HeapVector<UniquePtr<VulkanCommandListContext>> contexts;
 
         uint32_t included = 0;
 
@@ -557,9 +557,9 @@ TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeCollectsNativeQueuesWithoutR
         for (RHICommandContextType queue :
              {RHICommandContextType::eGraphics, RHICommandContextType::eAsyncCompute, RHICommandContextType::eTransfer})
         {
-            contexts.push_back(MakeUnique<FVulkanCommandListContext>(queue, session->rhi.GetDevice()));
+            contexts.push_back(MakeUnique<VulkanCommandListContext>(queue, session->rhi.GetDevice()));
 
-            FVulkanCommandListContext& context = *contexts.back();
+            VulkanCommandListContext& context = *contexts.back();
 
             const VkQueueFamilyProperties& family =
                 session->rhi.GetDevice()->GetQueueFamilyProperties(context.GetQueue()->GetFamilyIndex());
@@ -601,7 +601,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeCollectsNativeQueuesWithoutR
 
 TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeFollowsNativeBufferSplitsAndReuse)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (SupportsTiming(context) && session->rhi.GetDevice()->GetExtensionFlags().hasCalibratedTimestamps)
     {
@@ -611,7 +611,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeFollowsNativeBufferSplitsAnd
 
         session->rhi.BeginGPUFrameTiming(first);
 
-        FVulkanCommandBuffer* buffer = context.GetCommandBuffer();
+        VulkanCommandBuffer* buffer = context.GetCommandBuffer();
 
         context.AddSignalSemaphore(&signal);
 
@@ -621,7 +621,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeFollowsNativeBufferSplitsAnd
 
         session->rhi.EndGPUFrameTiming(first, true);
 
-        EXPECT_TRUE(context.GetQueue()->WaitForCompletion(context.GetLastSubmittedSerial(), UINT64_MAX));
+        EXPECT_TRUE(context.GetQueue()->WaitForCompletion(context.GetQueue()->GetLastSubmittedSerial(), UINT64_MAX));
 
         EXPECT_EQ(first->GetStatus(), RHIGPUTimingStatus::eAvailable);
 
@@ -653,7 +653,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, FrameEnvelopeFollowsNativeBufferSplitsAnd
 
 TEST_F(VulkanGPUTimingIntegrationTest, UnclosedNativeBuffersInvalidateFrameBoundaries)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     context.GetCommandBuffer();
 
@@ -685,7 +685,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, UnclosedNativeBuffersInvalidateFrameBound
 
 TEST_F(VulkanGPUTimingIntegrationTest, UnsubmittedNativeBuffersInvalidateFrameBoundaries)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     context.GetCommandBuffer()->End();
 
@@ -729,7 +729,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, MissingCommonDomainKeepsPerPassTimingAvai
 
     flags.hasCalibratedTimestamps = saved;
 
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     RHIGPUTimingPtr pass = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
 
@@ -750,7 +750,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, MissingCommonDomainKeepsPerPassTimingAvai
 
 TEST_F(VulkanGPUTimingIntegrationTest, DiscardedAndFailedFramesCannotPublishPartialDurations)
 {
-    FVulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
     if (SupportsTiming(context) && session->rhi.GetDevice()->GetExtensionFlags().hasCalibratedTimestamps)
     {
@@ -759,7 +759,7 @@ TEST_F(VulkanGPUTimingIntegrationTest, DiscardedAndFailedFramesCannotPublishPart
         session->rhi.BeginGPUFrameTiming(discarded);
 
         {
-            FVulkanCommandListContext recording(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+            VulkanCommandListContext recording(RHICommandContextType::eGraphics, session->rhi.GetDevice());
 
             recording.GetCommandBuffer();
         }
@@ -797,7 +797,7 @@ VKAPI_ATTR VkResult VKAPI_CALL RejectTimingBegin(VkCommandBuffer, const VkComman
 
 TEST_F(VulkanGPUTimingIntegrationTest, FailedRecordingBeginDiscardsPendingTiming)
 {
-    FVulkanCommandListContext                        context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+    VulkanCommandListContext                         context(RHICommandContextType::eGraphics, session->rhi.GetDevice());
     RHIGPUTimingPtr                                  result = MakeShared<RHIGPUTimingResult, MultiThreadCounter>();
     test::ScopedVulkanCall<PFN_vkBeginCommandBuffer> failure(vkBeginCommandBuffer, RejectTimingBegin);
     context.RHIBeginGPUTiming(result);

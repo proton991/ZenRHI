@@ -21,7 +21,7 @@ enum class RHISubmissionPointStatus : uint8_t
 };
 
 // Owned native-acceptance results. Queue assignments never change after construction.
-// RenderCore can retain a point while the ordered RHI worker fills its exact serial.
+// The host can retain a point while the ordered RHI worker fills its exact serial.
 class RHISubmissionState final : public RefCounted
 {
 public:
@@ -101,11 +101,7 @@ struct RHIBatchResult
     // Native submissions made by this batch, including partial execution and presentation.
     RHICompletionSet                      requiredSerials;
     std::vector<RHISubmissionGroupResult> groups;
-    bool                                  presented{false};
     bool                                  needsRecreation{false};
-    double                                executionCPUUs{0};
-    double                                queueWaitUs{0};
-    std::string                           error;
 };
 
 class RHISubmissionTicket
@@ -113,7 +109,7 @@ class RHISubmissionTicket
 public:
     RHISubmissionTicket() = default;
 
-    RHISubmissionTicket(std::shared_future<RHIBatchResult> result, RHIThreadEventPtr completion);
+    RHISubmissionTicket(std::shared_future<RHIBatchResult> result, RHIThreadEventPtr completion, RHIDeviceRuntimePtr runtime);
 
     bool IsValid() const;
 
@@ -131,6 +127,7 @@ public:
 private:
     std::shared_future<RHIBatchResult> m_result;
     RHIThreadEventPtr                  m_completion;
+    RHIDeviceRuntimePtr                m_runtime; // Its worker activity feeds the stall report.
 };
 
 struct RHICommandBatch;
@@ -148,12 +145,15 @@ struct RHIThreadMetrics
     RHIWorkerTimes       workerTimeNS{};
 };
 
-// DynamicRHI facade: RenderCore keeps its API, while mutable backend operations
-// are marshalled to one executor. Raw backend tests can still run without it.
+// DynamicRHI facade: hosts keep one API while mutable backend operations are marshalled
+// to one ordered worker. Raw backend tests can still run without it.
 class RHICommandListExecutor final : public DynamicRHI
 {
 public:
-    RHICommandListExecutor(DynamicRHI* backend, RHIExecutionMode mode);
+    // Sets the backend's frames in flight, then starts its worker.
+    RHICommandListExecutor(DynamicRHI*      backend,
+                           RHIExecutionMode mode,
+                           uint32_t         framesInFlight = RHIFrameState::kDefaultFramesInFlight);
 
     ~RHICommandListExecutor() override;
 
@@ -180,16 +180,15 @@ public:
                                 RHISubmissionStatePtr               state,
                                 RHIViewport*                        viewport = nullptr);
 
-    RHISubmissionResult SubmitBatch(std::span<RHICommandList*> lists);
+    RHISubmissionResult SubmitCommandLists(std::span<RHICommandList*> lists) override;
 
     // Request one coalesced, nonblocking GPU progress/retirement sweep on RHI.
     // Cached getters do not refresh progress; poll again if work is still in flight.
     void PollGPUProgress();
 
-    // Transfer a reference after submitting the last batch that uses the resource.
-    // Collection releases it after every previously submitted queue has completed.
+    // Transfer a reference after submitting the last batch that uses the resource; the call does not wait for the
+    // RHI thread. Collection releases it after every previously submitted queue has completed.
     void ReleaseWhenComplete(RHIResourcePtr<RHIResource> resource);
-    void CollectGarbage();
 
     // Published values only, in both execution modes. No backend calls or worker waits.
     RHICompletionSet GetCachedSubmittedSerials() const;
@@ -204,14 +203,10 @@ public:
 
     bool HasDeviceLoss() const override
     {
-        return GetRHIThread().HasDeviceLoss();
+        return m_runtime->thread.HasDeviceLoss();
     }
 
     RHIThreadMetrics GetThreadMetrics() const;
-
-    void NotifyResourceDestroyed(uint64_t resourceId) override;
-
-    void DrainDestroyedResourceIds(std::vector<uint64_t>& resourceIds);
 
     void Destroy() override;
 
@@ -223,11 +218,10 @@ public:
 
     void EndFrame() override;
 
-    RHISubmissionResult FlushAllGPUCommands() override;
-
     void WaitDeviceIdle() override;
 
-    bool WaitForCompletion(RHICommandContextType type, uint64_t serial, uint64_t timeoutNS = UINT64_MAX) override;
+    // Returns at once when published progress already covers the serial.
+    RHIWaitResult WaitForCompletion(RHICommandContextType type, uint64_t serial, uint64_t timeoutNS = UINT64_MAX) override;
 
     uint64_t GetLastSubmittedSerial(RHICommandContextType type) const override;
 
@@ -247,19 +241,24 @@ public:
 
     const RHIGPUInfo& QueryGPUInfo() const override;
 
+    const RHIDeviceDesc& GetDeviceDesc() const override;
+
+    RHIDeviceRuntime& GetRuntime() override
+    {
+        return *m_runtime;
+    }
+
+    uint64_t GetNativeObject(RHINativeObject object) const override;
+
     RHIGPUMemoryStats GetGPUMemoryStats() const override;
 
     RHIQueueCopyCapabilities GetQueueCopyCapabilities(RHICommandContextType type) const override;
-
-    void Init() override;
 
     void DestroyViewport(RHIViewport* viewport) override;
 
     RHIViewport* CreateViewport(zen::RHIWindowHandle window, uint32_t width, uint32_t height, bool vsync) override;
 
     RHIShader* CreateShader(const RHIShaderCreateInfo& info) override;
-
-    void DestroyShader(RHIShader* shader) override;
 
     RHIPipeline* CreatePipeline(const RHIComputePipelineCreateInfo& info) override;
 
@@ -269,11 +268,7 @@ public:
 
     RHIError SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes) override;
 
-    void DestroyPipeline(RHIPipeline* pipeline) override;
-
     RHISampler* CreateSampler(const RHISamplerCreateInfo& info) override;
-
-    void DestroySampler(RHISampler* sampler) override;
 
     RHIBindlessHandle RegisterBindlessResource(RHIResource* resource, uint32_t slot) override;
 
@@ -289,28 +284,16 @@ public:
 
     RHITextureView* CreateTextureView(RHITexture* texture, const RHITextureViewCreateInfo& info) override;
 
-    void DestroyTexture(RHITexture* texture) override;
-
     RHIAccelerationStructureBuildSizes GetAccelerationStructureBuildSizes(
         const RHIAccelerationStructureBuildDesc& desc) override;
 
     RHIAccelerationStructure* CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info) override;
 
-    void DestroyAccelerationStructure(RHIAccelerationStructure* structure) override;
-
     RHIBuffer* CreateBuffer(const RHIBufferCreateInfo& info) override;
 
     uint64_t GetBufferAllocationSize(const RHIBufferCreateInfo& info) override;
 
-    void DestroyBuffer(RHIBuffer* buffer) override;
-
     IRHICommandContext* GetCommandContext(RHICommandContextType type) override;
-
-    IRHICommandContext* GetTransferCommandContext() override;
-
-    RHIStatus FinalizeCommandLists(std::span<RHICommandList*> lists, std::vector<RHIPlatformCommandList*>& output) override;
-
-    void SubmitPlatformCommandLists(std::span<RHIPlatformCommandList*> lists) override;
 
     RHITextureCopyCapabilities GetTextureCopyCapabilities(DataFormat format) const override;
 
@@ -333,6 +316,15 @@ private:
     };
 
     void ExecuteFrame(const RefCountPtr<RHICommandBatch>& batch);
+
+    // Acquires the frame's presentation command list and records the copy into it; null when no list is free.
+    RHICommandList* PreparePresentCopy(RHICommandBatch& batch, RHIStatus& prepared);
+
+    // Submits the presentation copy when no graphics group carried it, then presents.
+    void PresentFrame(RHICommandBatch& batch, bool acceptedWork);
+
+    // Shapes the batch result: terminal errors, progress, the serials the batch requires, scheduled state.
+    void FinishFrame(RHICommandBatch& batch, const RHICompletionSet& submittedBefore);
 
     void CancelBatch(const RefCountPtr<RHICommandBatch>& batch);
 
@@ -376,6 +368,7 @@ private:
     void RecycleCommandLists(RHICommandBatch& batch);
 
     DynamicRHI*                                                          m_backend;
+    RHIDeviceRuntimePtr                                                  m_runtime;
     RHIExecutionMode                                                     m_mode;
     std::thread::id                                                      m_renderThread;
     std::atomic<bool>                                                    m_blocked{false};
@@ -401,8 +394,6 @@ private:
         SmallVector<HeapVector<RHICommandListPtr>, RHICompletionSet::kQueueCount>(RHICompletionSet::kQueueCount);
     // Presentation lists and their contexts stay on RHI until executor destruction.
     HeapVector<RHICommandListPtr> m_presentCommandLists;
-    std::mutex                    m_destroyedResourceMutex;
-    std::vector<uint64_t>         m_destroyedResourceIds;
     std::atomic<uint64_t>         m_submittedBatches{0};
     std::atomic<uint64_t>         m_completedBatches{0};
     std::atomic<uint64_t>         m_executionCPUUs{0};

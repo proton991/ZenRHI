@@ -1,4 +1,5 @@
 #include "ZenRHI/DynamicRHI.h"
+#include "VulkanIntegrationFixture.h"
 #include "ZenRHI/TestSupport/Validation.h"
 #include <gtest/gtest.h>
 
@@ -25,12 +26,12 @@ class ValidationListener final : public testing::EmptyTestEventListener
 int main(int argc, char** argv)
 {
     testing::InitGoogleTest(&argc, argv);
-    zen::RHIOptions::GetInstance().SetValidationMode(zen::RHIValidationMode::eRequired);
+    zen::test::ValidationCounter::Install();
     testing::UnitTest::GetInstance()->listeners().Append(new ValidationListener());
     int status = 0;
     if (argc == 2 && std::string_view(argv[1]) == "--check-device-profile")
     {
-        zen::RHIResult<std::vector<zen::RHIAdapterInfo>> adapters = zen::EnumerateRHIAdapters(zen::RHIOptions::GetInstance());
+        zen::RHIResult<std::vector<zen::RHIAdapterInfo>> adapters = zen::EnumerateRHIAdapters(zen::test::MakeTestDeviceDesc());
         if (!adapters || adapters.GetValue().empty())
         {
             status = 1;

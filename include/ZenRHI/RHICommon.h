@@ -20,10 +20,6 @@
 
 namespace zen
 {
-// Inline storage for per-set containers, not a limit. Descriptor set indices are bounded
-// only by the device, reported as RHIGPUInfo::maxBoundDescriptorSets.
-inline constexpr uint32_t kInlineDescriptorSetCount = 8;
-
 class RHIResource;
 class RHIBuffer;
 class RHITexture;
@@ -657,7 +653,7 @@ enum class RHIBlendFactor : uint32_t
     eOneMinusConstantColor = 11,
     eConstantAlpha         = 12,
     eOneMinusConstantAlpha = 13,
-    eSrcAlphaSatuate       = 14,
+    eSrcAlphaSaturate      = 14,
     eSrc1Color             = 15,
     eOneMinusSrc1Color     = 16,
     eSrc1Alpha             = 17,
@@ -667,12 +663,12 @@ enum class RHIBlendFactor : uint32_t
 
 enum class RHIBlendOp : uint32_t
 {
-    eAdd              = 0,
-    eSubstract        = 1,
-    eReverseSubstract = 2,
-    eMinimum          = 3,
-    eMaximum          = 4,
-    eMax              = 5
+    eAdd             = 0,
+    eSubtract        = 1,
+    eReverseSubtract = 2,
+    eMinimum         = 3,
+    eMaximum         = 4,
+    eMax             = 5
 };
 
 enum class RHIColorComponent : uint32_t
@@ -762,7 +758,7 @@ struct RHIGfxPipelineColorBlendState
 
 enum class RHIDynamicState : uint32_t
 {
-    eViewPort       = 0,
+    eViewport       = 0,
     eScissor        = 1,
     eLineWidth      = 2,
     eDepthBias      = 3,
@@ -868,12 +864,6 @@ struct RHIBufferCopyRegion
     uint64_t size{0};
 };
 
-struct RHIBufferCopySource
-{
-    RHIBuffer*          pBuffer{nullptr};
-    RHIBufferCopyRegion region;
-};
-
 enum class RHIBufferAllocateType : uint32_t
 {
     eNone            = 0,
@@ -973,7 +963,7 @@ enum class RHITextureType : uint32_t
     eMax  = 4,
 };
 
-struct RHITextureSubResourceRange
+struct RHITextureSubresourceRange
 {
     RHIFlags<RHITextureAspectFlagBits> aspect;
     uint32_t                           baseMipLevel{0};
@@ -981,9 +971,9 @@ struct RHITextureSubResourceRange
     uint32_t                           baseArrayLayer{0};
     uint32_t                           layerCount{1};
 
-    RHITextureSubResourceRange GetMipRange(uint32_t baseMiplevel) const
+    RHITextureSubresourceRange GetMipRange(uint32_t baseMiplevel) const
     {
-        RHITextureSubResourceRange range{};
+        RHITextureSubresourceRange range{};
         range.aspect.SetFlag(aspect);
         range.layerCount     = layerCount;
         range.levelCount     = 1;
@@ -993,12 +983,12 @@ struct RHITextureSubResourceRange
         return range;
     }
 
-    static RHITextureSubResourceRange Color(uint32_t baseMiplevel   = 0,
+    static RHITextureSubresourceRange Color(uint32_t baseMiplevel   = 0,
                                             uint32_t baseArrayLayer = 0,
                                             uint32_t levelCount     = 1,
                                             uint32_t layerCount     = 1)
     {
-        RHITextureSubResourceRange range{};
+        RHITextureSubresourceRange range{};
         range.aspect.SetFlag(RHITextureAspectFlagBits::eColor);
         range.layerCount     = layerCount;
         range.levelCount     = levelCount;
@@ -1008,12 +998,12 @@ struct RHITextureSubResourceRange
         return range;
     }
 
-    static RHITextureSubResourceRange Depth(uint32_t baseMipLevel   = 0,
+    static RHITextureSubresourceRange Depth(uint32_t baseMipLevel   = 0,
                                             uint32_t baseArrayLayer = 0,
                                             uint32_t levelCount     = 1,
                                             uint32_t layerCount     = 1)
     {
-        RHITextureSubResourceRange range{};
+        RHITextureSubresourceRange range{};
         range.aspect.SetFlag(RHITextureAspectFlagBits::eDepth);
         range.layerCount     = layerCount;
         range.levelCount     = levelCount;
@@ -1023,12 +1013,12 @@ struct RHITextureSubResourceRange
         return range;
     }
 
-    static RHITextureSubResourceRange Stencil(uint32_t baseMipLevel   = 0,
+    static RHITextureSubresourceRange Stencil(uint32_t baseMipLevel   = 0,
                                               uint32_t baseArrayLayer = 0,
                                               uint32_t levelCount     = 1,
                                               uint32_t layerCount     = 1)
     {
-        RHITextureSubResourceRange range{};
+        RHITextureSubresourceRange range{};
         range.aspect.SetFlag(RHITextureAspectFlagBits::eStencil);
         range.layerCount     = layerCount;
         range.levelCount     = levelCount;
@@ -1038,12 +1028,12 @@ struct RHITextureSubResourceRange
         return range;
     }
 
-    static RHITextureSubResourceRange DepthStencil(uint32_t baseMipLevel   = 0,
+    static RHITextureSubresourceRange DepthStencil(uint32_t baseMipLevel   = 0,
                                                    uint32_t baseArrayLayer = 0,
                                                    uint32_t levelCount     = 1,
                                                    uint32_t layerCount     = 1)
     {
-        RHITextureSubResourceRange range{};
+        RHITextureSubresourceRange range{};
         range.aspect.SetFlag(RHITextureAspectFlagBits::eDepth);
         range.aspect.SetFlag(RHITextureAspectFlagBits::eStencil);
         range.layerCount     = layerCount;
@@ -1062,7 +1052,7 @@ struct RHITextureSubresourceLayers
     uint32_t                           baseArrayLayer{0};
     uint32_t                           layerCount{1};
 
-    static RHITextureSubresourceLayers MakeMipLayers(const RHITextureSubResourceRange& range, uint32_t mipLevel)
+    static RHITextureSubresourceLayers MakeMipLayers(const RHITextureSubresourceRange& range, uint32_t mipLevel)
     {
         RHITextureSubresourceLayers layers{};
         layers.aspect         = range.aspect;
@@ -1099,12 +1089,6 @@ struct RHIBufferTextureCopyRegion
     RHITextureSubresourceLayers textureSubresources;
     RHIOffset3D                 textureOffset;
     RHIOffset3D                 textureSize;
-};
-
-struct RHIBufferTextureCopySource
-{
-    RHIBuffer*                 pBuffer{nullptr};
-    RHIBufferTextureCopyRegion region;
 };
 
 inline RHITextureLayout RHITextureUsageToLayout(RHITextureUsage usage)
@@ -1162,31 +1146,11 @@ struct RHIRenderTargetClearValue
     RHIRenderTargetClearValue(Color c) : color(c) {}
 
     RHIRenderTargetClearValue(float depth, uint32_t stencil) : depth(depth), stencil(stencil) {}
-
-    static RHIRenderTargetClearValue ColorClear(Color c)
-    {
-        return RHIRenderTargetClearValue(c);
-    }
-
-    static RHIRenderTargetClearValue DefaultColorClear()
-    {
-        return RHIRenderTargetClearValue(Color(0.8f, 0.8f, 0.8f, 1.0f));
-    }
-
-    static RHIRenderTargetClearValue DepthStencilClear(float depth, uint32_t stencil)
-    {
-        return RHIRenderTargetClearValue(depth, stencil);
-    }
-
-    static RHIRenderTargetClearValue DefaultDepthStencilClear()
-    {
-        return RHIRenderTargetClearValue(1.0f, 0.0f);
-    }
 };
 
-inline RHIRenderTargetClearValue DEFAULT_COLOR_CLEAR_VALUE = RHIRenderTargetClearValue(Color(0.8f, 0.8f, 0.8f, 0.0f));
+inline const RHIRenderTargetClearValue DEFAULT_COLOR_CLEAR_VALUE = RHIRenderTargetClearValue(Color(0.8f, 0.8f, 0.8f, 0.0f));
 
-inline RHIRenderTargetClearValue DEFAULT_DS_CLEAR_VALUE    = RHIRenderTargetClearValue(1.0f, 0);
+inline const RHIRenderTargetClearValue DEFAULT_DS_CLEAR_VALUE    = RHIRenderTargetClearValue(1.0f, 0);
 
 inline RHIFlags<RHITextureAspectFlagBits> GetTextureFormatAspects(DataFormat format)
 {
@@ -1194,23 +1158,23 @@ inline RHIFlags<RHITextureAspectFlagBits> GetTextureFormatAspects(DataFormat for
 
     if (FormatIsDepthStencil(format))
     {
-        returnValue = RHITextureSubResourceRange::DepthStencil().aspect;
+        returnValue = RHITextureSubresourceRange::DepthStencil().aspect;
     }
     else
     {
         if (FormatIsDepthOnly(format))
         {
-            returnValue = RHITextureSubResourceRange::Depth().aspect;
+            returnValue = RHITextureSubresourceRange::Depth().aspect;
         }
         else
         {
             if (FormatIsStencilOnly(format))
             {
-                returnValue = RHITextureSubResourceRange::Stencil().aspect;
+                returnValue = RHITextureSubresourceRange::Stencil().aspect;
             }
             else
             {
-                returnValue = RHITextureSubResourceRange::Color().aspect;
+                returnValue = RHITextureSubresourceRange::Color().aspect;
             }
         }
     }
@@ -1560,7 +1524,7 @@ struct RHITextureTransition
     RHITexture*                pTexture{nullptr};
     RHITextureUsage            oldUsage{RHITextureUsage::eNone};
     RHITextureUsage            newUsage{RHITextureUsage::eNone};
-    RHITextureSubResourceRange subResourceRange;
+    RHITextureSubresourceRange subResourceRange;
 
     // Earlier writes may need visibility even when oldUsage describes a later reader/layout.
     RHIFlags<RHIAccessFlagBits> additionalSrcAccess;

@@ -117,7 +117,7 @@ class VulkanDescriptorIntegrationTest : public testing::Test
 {
 protected:
     std::unique_ptr<test::VulkanSession> session;
-    FVulkanCommandListContext*           context{};
+    VulkanCommandListContext*            context{};
     std::vector<RHIBuffer*>              buffers;
     std::vector<VulkanPipeline*>         pipelines;
     std::vector<RHIShader*>              shaders;
@@ -153,7 +153,7 @@ protected:
 
         vkUpdateDescriptorSets               = DescriptorObserver::Update;
 
-        context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        context = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
         VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
 
@@ -208,8 +208,7 @@ protected:
 
         info.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
 
-        zen::test::LoadShaderModule(info, RHIShaderStage::eCompute,
-                                    std::filesystem::path(RDG_REFLECTION_TEST_PATH) / shaderFile);
+        zen::test::LoadShaderModule(info, RHIShaderStage::eCompute, std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / shaderFile);
 
         RHIShader* shader = session->rhi.CreateShader(info);
 
@@ -279,7 +278,7 @@ protected:
 
     void FillCache(VulkanPipeline* pipeline, uint32_t count)
     {
-        VulkanDescriptorSetState other;
+        VulkanDescriptorSetState other(&session->rhi);
 
         other.SetPipeline(pipeline);
 
@@ -313,7 +312,7 @@ protected:
 
     VkDescriptorSet ResolveArray(VulkanPipeline* pipeline, RHIBuffer* a, RHIBuffer* b, uint32_t aIndex, uint32_t bIndex)
     {
-        VulkanDescriptorSetState state;
+        VulkanDescriptorSetState state(&session->rhi);
 
         state.SetPipeline(pipeline);
 
@@ -328,7 +327,7 @@ protected:
     {
         EXPECT_TRUE(session->rhi.GetDevice()->GetGfxQueue()->WaitForCompletion(serial, UINT64_MAX));
 
-        session->rhi.GetDescriptorPoolManager2()->BeginFrame(1);
+        session->rhi.GetDescriptorAllocator()->BeginFrame();
     }
 };
 
@@ -380,7 +379,7 @@ TEST_F(VulkanDescriptorIntegrationTest, CacheEvictionPreservesRecordedAndPending
 
         session->rhi.GetDevice()->GetGfxQueue()->ProcessPendingWorkloads(0);
 
-        session->rhi.GetDescriptorPoolManager2()->BeginFrame(1);
+        session->rhi.GetDescriptorAllocator()->BeginFrame();
 
         EXPECT_FALSE(DescriptorObserver::freedSets.contains(first));
     }
@@ -401,7 +400,7 @@ TEST_F(VulkanDescriptorIntegrationTest, UnchangedBindingsRetainPoolInNewWorkload
 {
     VulkanPipeline* pipeline = Pipeline("descriptor_storage.comp.spv");
 
-    VulkanDescriptorSetState state;
+    VulkanDescriptorSetState state(&session->rhi);
 
     state.SetPipeline(pipeline);
 
@@ -426,7 +425,7 @@ TEST_F(VulkanDescriptorIntegrationTest, EvictedResolvedStateRebuildsWithoutChang
 {
     VulkanPipeline* pipeline = Pipeline("descriptor_storage.comp.spv");
 
-    VulkanDescriptorSetState state;
+    VulkanDescriptorSetState state(&session->rhi);
 
     state.SetPipeline(pipeline);
 
@@ -470,7 +469,8 @@ TEST_F(VulkanDescriptorIntegrationTest, ParameterInsertionOrderDoesNotChangeCach
 
     RHIBuffer* b             = Buffer();
 
-    VulkanDescriptorSetState left, right;
+    VulkanDescriptorSetState left(&session->rhi);
+    VulkanDescriptorSetState right(&session->rhi);
 
     left.SetPipeline(pipeline);
 
@@ -497,7 +497,7 @@ TEST_F(VulkanDescriptorIntegrationTest, ResourceIdentityDistinguishesCachedSets)
 
     EXPECT_NE(buffer->GetStableId(), replacement->GetStableId());
 
-    VulkanDescriptorSetState state;
+    VulkanDescriptorSetState state(&session->rhi);
 
     state.SetPipeline(pipeline);
 
@@ -528,7 +528,7 @@ TEST_F(VulkanDescriptorIntegrationTest, RecycledPipelineAddressResetsDescriptorB
 
     RHIBuffer* uniformBuffer        = Buffer(16, true);
 
-    VulkanDescriptorSetState state;
+    VulkanDescriptorSetState state(&session->rhi);
 
     state.SetPipeline(pipeline);
 
@@ -586,7 +586,7 @@ TEST_F(VulkanDescriptorIntegrationTest, UniformRangeDistinguishesOtherwiseCompat
 
     RHIBuffer* buffer             = Buffer(32, true);
 
-    VulkanDescriptorSetState state;
+    VulkanDescriptorSetState state(&session->rhi);
 
     state.SetPipeline(smallPipeline);
 
@@ -609,7 +609,7 @@ TEST_F(VulkanDescriptorIntegrationTest, PackedOffsetsAreBindTimeStateAndExternal
 {
     VulkanPipeline* pipeline = Pipeline("descriptor_uniform.comp.spv");
 
-    VulkanDescriptorSetState state;
+    VulkanDescriptorSetState state(&session->rhi);
 
     state.SetPipeline(pipeline);
 
@@ -691,7 +691,7 @@ TEST_F(VulkanDescriptorIntegrationTest, ShaderOverUniformBufferLimitIsRejectedBe
     info.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
 
     zen::test::LoadShaderModule(info, RHIShaderStage::eCompute,
-                                std::filesystem::path(RDG_REFLECTION_TEST_PATH) / "descriptor_uniform_limit.comp.spv");
+                                std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / "descriptor_uniform_limit.comp.spv");
 
     EXPECT_EQ(session->rhi.CreateShader(info), nullptr);
 
@@ -715,7 +715,7 @@ TEST_F(VulkanDescriptorIntegrationTest, ShaderOverSamplerLimitIsRejectedBeforeNa
     RHIShaderCreateInfo                                info{};
     info.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
     zen::test::LoadShaderModule(info, RHIShaderStage::eCompute,
-                                std::filesystem::path(RDG_REFLECTION_TEST_PATH) / "descriptor_sampler_limit.comp.spv");
+                                std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / "descriptor_sampler_limit.comp.spv");
     RHIShader* rejected = session->rhi.CreateShader(info);
     EXPECT_EQ(rejected, nullptr);
     if (rejected != nullptr)

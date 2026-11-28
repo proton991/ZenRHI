@@ -12,8 +12,7 @@ struct RHIError;
 class VulkanWorkload;
 class VulkanDevice;
 class VulkanSemaphore;
-enum class VulkanCommandBufferType;
-class FVulkanCommandBufferPool;
+class VulkanCommandBufferPool;
 
 class VulkanQueue
 {
@@ -23,9 +22,14 @@ public:
     ~VulkanQueue();
     RHIError GetCreationError() const;
 
-    FVulkanCommandBufferPool* AcquireCommandBufferPool(VulkanCommandBufferType type);
+    VulkanCommandBufferPool* AcquireCommandBufferPool();
 
-    void RecycleCommandBufferPool(FVulkanCommandBufferPool* pCmdBufferPool);
+    void RecycleCommandBufferPool(VulkanCommandBufferPool* pCmdBufferPool);
+
+    VulkanDevice* GetDevice() const
+    {
+        return m_pDevice;
+    }
 
     uint32_t GetFamilyIndex() const
     {
@@ -94,9 +98,8 @@ private:
 
     static bool CanMergeWorkloads(const VulkanWorkload* pPreviousWorkload, const VulkanWorkload* pCurrentWorkload);
 
-    RHISubmissionResult SubmitWorkloadsWithFences(uint64_t& serial);
 
-    RHISubmissionResult SubmitWorkloadsWithTimelineSemaphore(uint64_t& serial);
+    RHISubmissionResult SubmitWorkloads(uint64_t& serial);
 
     void MergeWorkloads(const HeapVector<VulkanWorkload*>& workloadsToSubmit, WorkloadMergeResult& outMergeResult);
 
@@ -105,7 +108,8 @@ private:
     void AppendTimelineSubmitWorkload(VulkanWorkload* pWorkload, TimelineSubmitBatch& outSubmitBatch);
 
     void PrepareBindlessWrites(std::span<VulkanWorkload*> workloads);
-    void AcceptTransferredTransactions(VulkanWorkload* workload);
+    // Accepts the workload's ownership and its merged children's for this serial.
+    void AcceptWorkload(VulkanWorkload* workload, uint64_t submissionSerial);
 
     void QueueSubmittedWorkload(VulkanWorkload* pWorkload, uint64_t submissionSerial);
 
@@ -123,10 +127,10 @@ private:
     uint32_t      m_familyIndex;
     uint32_t      m_queueIndex;
 
-    HeapVector<FVulkanCommandBufferPool*> m_cmdBufferPools;
-    uint32_t                              m_acquiredCommandBufferPools{0};
-    HeapVector<VulkanWorkload*>           m_workloadPool;
-    HeapVector<VulkanWorkload*>           m_abandonedWorkloads; // Uncertain submission; keep until device teardown.
+    HeapVector<VulkanCommandBufferPool*> m_cmdBufferPools;
+    uint32_t                             m_acquiredCommandBufferPools{0};
+    HeapVector<VulkanWorkload*>          m_workloadPool;
+    HeapVector<VulkanWorkload*>          m_abandonedWorkloads; // Uncertain submission; keep until device teardown.
 
     Queue<VulkanWorkload*> m_workloadsPendingSubmit;  // queued workloads, need to submit
     Queue<VulkanWorkload*> m_workloadsPendingProcess; // submitted workloads, need to wait

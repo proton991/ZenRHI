@@ -1,4 +1,5 @@
 #include "VulkanIntegrationFixture.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanQueue.h"
@@ -30,6 +31,7 @@ struct CapabilityDriver
     static inline VkStructureType                              missingRayFeature{VK_STRUCTURE_TYPE_MAX_ENUM};
     static inline HeapVector<std::string>                      hiddenExtensions, enabledExtensions;
     static inline HeapVector<VkStructureType>                  enabledStructures;
+    static inline bool                                         enabledBufferDeviceAddress{};
     static inline uint32_t                                     createCalls{};
     static inline uint32_t                                     forcedGraphicsFamily{UINT32_MAX};
     static inline uint32_t                                     forcedQueueCount{0};
@@ -57,6 +59,7 @@ struct CapabilityDriver
         enabledExtensions.clear();
 
         enabledStructures.clear();
+        enabledBufferDeviceAddress = false;
     }
     static void FilterCoreFeatures(VkPhysicalDeviceFeatures& output)
     {
@@ -113,8 +116,35 @@ struct CapabilityDriver
 
                     break;
                 }
-                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+                {
+                    // Device creation reads the promoted features from the 1.2 struct.
+                    VkPhysicalDeviceVulkan12Features* vulkan12 = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(node);
+                    switch (missingFeature)
+                    {
+                        case 2: vulkan12->runtimeDescriptorArray = VK_FALSE; break;
+                        case 3: vulkan12->descriptorBindingPartiallyBound = VK_FALSE; break;
+                        case 4: vulkan12->descriptorBindingSampledImageUpdateAfterBind = VK_FALSE; break;
+                        case 5: vulkan12->descriptorBindingUpdateUnusedWhilePending = VK_FALSE; break;
+                        case 6: vulkan12->descriptorBindingVariableDescriptorCount = VK_FALSE; break;
+                        case 7: vulkan12->shaderSampledImageArrayNonUniformIndexing = VK_FALSE; break;
+                        case 8: vulkan12->timelineSemaphore = VK_FALSE; break;
+                    }
                     if (optionalDisabled)
+                    {
+                        vulkan12->samplerMirrorClampToEdge = VK_FALSE;
+                    }
+                    if (optionalDisabled
+                        || missingRayFeature == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)
+                    {
+                        vulkan12->bufferDeviceAddress              = VK_FALSE;
+                        vulkan12->bufferDeviceAddressCaptureReplay = VK_FALSE;
+                        vulkan12->bufferDeviceAddressMultiDevice   = VK_FALSE;
+                    }
+                    break;
+                }
+                case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+                    if (missingFeature == 8)
                     {
                         reinterpret_cast<VkPhysicalDeviceTimelineSemaphoreFeatures*>(node)->timelineSemaphore = VK_FALSE;
                     }
@@ -312,6 +342,12 @@ struct CapabilityDriver
         for (const VkBaseInStructure* node = static_cast<const VkBaseInStructure*>(info->pNext); node; node = node->pNext)
         {
             enabledStructures.push_back(node->sType);
+
+            if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            {
+                enabledBufferDeviceAddress =
+                    reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(node)->bufferDeviceAddress;
+            }
         }
 
         return create(gpu, info, allocator, output);
@@ -376,7 +412,7 @@ protected:
 
     std::string Reason()
     {
-        return VulkanDevice::GetUnsupportedReason(session->rhi.GetPhysicalDevice());
+        return VulkanDevice::GetUnsupportedReason(session->rhi.GetPhysicalDevice(), session->rhi.GetDeviceDesc());
     }
 };
 
@@ -388,7 +424,7 @@ TEST_F(VulkanCapabilityIntegrationTest, QueueCapabilitiesMatchActualHandlesAndTi
 
     EXPECT_TRUE(capabilities.computeSupported);
 
-    EXPECT_EQ(capabilities.asyncSubmissionDependencies, device->SupportsTimelineSemaphore());
+    EXPECT_TRUE(capabilities.asyncSubmissionDependencies);
 
     for (uint32_t i = 0; i < static_cast<uint32_t>(RHICommandContextType::eMax); ++i)
     {
@@ -402,16 +438,6 @@ TEST_F(VulkanCapabilityIntegrationTest, QueueCapabilitiesMatchActualHandlesAndTi
                       device->GetQueue(first)->GetVkHandle() == device->GetQueue(second)->GetVkHandle());
         }
     }
-
-    const uint32_t timelineSupported                 = device->GetExtensionFlags().hasTimelineSemaphore;
-
-    device->GetExtensionFlags().hasTimelineSemaphore = 0;
-
-    EXPECT_FALSE(session->rhi.GetQueueCapabilities().asyncSubmissionDependencies);
-
-    EXPECT_FALSE(session->rhi.GetQueueCapabilities().SupportsAsyncCompute());
-
-    device->GetExtensionFlags().hasTimelineSemaphore = timelineSupported;
 }
 
 TEST_F(VulkanCapabilityIntegrationTest, SingleNativeQueueReportsSharedFallback)
@@ -420,9 +446,9 @@ TEST_F(VulkanCapabilityIntegrationTest, SingleNativeQueueReportsSharedFallback)
 
     CapabilityDriver::forcedQueueCount     = 1;
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     const RHIQueueCapabilities capabilities = device.GetQueueCapabilities();
 
@@ -465,9 +491,9 @@ TEST_F(VulkanCapabilityIntegrationTest, DistinctIndicesInOneFamilyCreateIndepend
 
     CapabilityDriver::forcedQueueCount     = 2;
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_EQ(device.GetGfxQueue()->GetFamilyIndex(), family);
 
@@ -487,7 +513,7 @@ TEST_F(VulkanCapabilityIntegrationTest, DistinctIndicesInOneFamilyCreateIndepend
 
     EXPECT_TRUE(capabilities.AreQueuesShared(RHICommandContextType::eAsyncCompute, RHICommandContextType::eTransfer));
 
-    EXPECT_EQ(capabilities.SupportsAsyncCompute(), device.SupportsTimelineSemaphore());
+    EXPECT_TRUE(capabilities.SupportsAsyncCompute());
 
     EXPECT_EQ(CapabilityDriver::requestedQueues.size(), 1u);
 
@@ -504,9 +530,9 @@ TEST_F(VulkanCapabilityIntegrationTest, DistinctIndicesInOneFamilyCreateIndepend
 struct ScopedTopologyDevice
 {
     VulkanDevice device;
-    explicit ScopedTopologyDevice(VkPhysicalDevice physical) : device(physical)
+    ScopedTopologyDevice(VulkanRHI* rhi, VkPhysicalDevice physical) : device(rhi, physical)
     {
-        device.Init();
+        zen::test::InitOrAbort(device);
     }
 
     ~ScopedTopologyDevice()
@@ -681,7 +707,7 @@ TEST_F(VulkanCapabilityIntegrationTest, SameFamilyHandoffUsesWaitForDistinctQueu
 
     CapabilityDriver::forcedQueueCount     = 2;
 
-    ScopedTopologyDevice owner(session->rhi.GetPhysicalDevice());
+    ScopedTopologyDevice owner(&session->rhi, session->rhi.GetPhysicalDevice());
 
     VulkanDevice& device = owner.device;
 
@@ -835,9 +861,9 @@ TEST_F(VulkanCapabilityIntegrationTest, OptionalPipelineCacheFailureKeepsDeviceU
 
     Hook(vkGetDeviceProcAddr, PipelineCacheFailureDriver::Proc, PipelineCacheFailureDriver::original);
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_EQ(PipelineCacheFailureDriver::calls, 1u);
 
@@ -888,8 +914,9 @@ TEST_F(VulkanCapabilityIntegrationTest, MissingRequiredFeatureRejectsBeforeCreat
                                             "descriptorBindingSampledImageUpdateAfterBind",
                                             "descriptorBindingUpdateUnusedWhilePending",
                                             nullptr,
-                                            "shaderSampledImageArrayNonUniformIndexing"};
-    for (uint32_t feature = 1; feature <= 7; ++feature)
+                                            "shaderSampledImageArrayNonUniformIndexing",
+                                            "timelineSemaphore"};
+    for (uint32_t feature = 1; feature <= 8; ++feature)
     {
         SCOPED_TRACE(feature);
 
@@ -902,9 +929,9 @@ TEST_F(VulkanCapabilityIntegrationTest, MissingRequiredFeatureRejectsBeforeCreat
 
         EXPECT_NE(Reason().find(featureNames[feature]), std::string::npos);
 
-        VulkanDevice device(session->rhi.GetPhysicalDevice());
+        VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-        EXPECT_DEATH(device.Init(), "verification failed");
+        EXPECT_DEATH(zen::test::InitOrAbort(device), "verification failed");
 
         device.Destroy();
     }
@@ -920,9 +947,9 @@ TEST_F(VulkanCapabilityIntegrationTest, PromotedCoreFeaturesDoNotRequireFormerEx
 
     ASSERT_TRUE(Reason().empty());
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_TRUE(device.GetExtensionFlags().hasDescriptorIndexing);
 
@@ -956,11 +983,12 @@ TEST_F(VulkanCapabilityIntegrationTest, RayTracingFollowsDeviceCapabilitiesAndDe
         {VK_STRUCTURE_TYPE_MAX_ENUM, VK_KHR_RAY_QUERY_EXTENSION_NAME},
         {VK_STRUCTURE_TYPE_MAX_ENUM, "", true},
     };
-    const bool previousDisabled = RHIOptions::GetInstance().RayTracingDisabled();
-    RHIOptions::GetInstance().SetRayTracingDisabled(false);
+    RHIDeviceDesc& sessionDesc      = VulkanRHITestAccess::DeviceDesc(session->rhi);
+    const bool     previousDisabled = sessionDesc.RayTracingDisabled();
+    sessionDesc.SetRayTracingDisabled(false);
     DeviceExtensionFlags supported{};
     {
-        ScopedTopologyDevice baseline(session->rhi.GetPhysicalDevice());
+        ScopedTopologyDevice baseline(&session->rhi, session->rhi.GetPhysicalDevice());
         supported = baseline.device.GetExtensionFlags();
     }
 
@@ -975,8 +1003,8 @@ TEST_F(VulkanCapabilityIntegrationTest, RayTracingFollowsDeviceCapabilitiesAndDe
         {
             CapabilityDriver::hiddenExtensions.emplace_back(scenario.missingExtension);
         }
-        RHIOptions::GetInstance().SetRayTracingDisabled(scenario.disableRayTracing);
-        ScopedTopologyDevice        device(session->rhi.GetPhysicalDevice());
+        sessionDesc.SetRayTracingDisabled(scenario.disableRayTracing);
+        ScopedTopologyDevice        device(&session->rhi, session->rhi.GetPhysicalDevice());
         const DeviceExtensionFlags& enabled = device.device.GetExtensionFlags();
         const std::string_view      missing(scenario.missingExtension);
         const bool address = supported.hasBufferDeviceAddress
@@ -997,13 +1025,14 @@ TEST_F(VulkanCapabilityIntegrationTest, RayTracingFollowsDeviceCapabilitiesAndDe
         EXPECT_EQ(enabled.hasRaytracingPipeline != 0, pipeline);
         EXPECT_EQ(enabled.hasRayQuery != 0, query);
 
-        const VkStructureType structures[] = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
-                                              VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+        // Buffer device addresses are a Vulkan 1.2 feature; the others bring their own structs.
+        EXPECT_EQ(CapabilityDriver::enabledBufferDeviceAddress, address);
+        const VkStructureType structures[] = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
                                               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
                                               VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
         const char* extensions[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
                                     VK_KHR_RAY_QUERY_EXTENSION_NAME};
-        const bool  expected[]   = {address, acceleration, pipeline, query};
+        const bool  expected[]   = {acceleration, pipeline, query};
         for (uint32_t i = 0; i < std::size(structures); ++i)
         {
             EXPECT_EQ(std::count(CapabilityDriver::enabledStructures.begin(), CapabilityDriver::enabledStructures.end(),
@@ -1014,10 +1043,10 @@ TEST_F(VulkanCapabilityIntegrationTest, RayTracingFollowsDeviceCapabilitiesAndDe
         {
             EXPECT_EQ(std::count(CapabilityDriver::enabledExtensions.begin(), CapabilityDriver::enabledExtensions.end(),
                                  extensions[i]),
-                      expected[i + 1] ? 1 : 0);
+                      expected[i] ? 1 : 0);
         }
     }
-    RHIOptions::GetInstance().SetRayTracingDisabled(previousDisabled);
+    sessionDesc.SetRayTracingDisabled(previousDisabled);
 }
 
 TEST_F(VulkanCapabilityIntegrationTest, InvocationReorderAndIndirectTracingRespectOptionalCapabilities)
@@ -1025,12 +1054,12 @@ TEST_F(VulkanCapabilityIntegrationTest, InvocationReorderAndIndirectTracingRespe
     DeviceExtensionFlags baseline{};
     bool                 nvAvailable = false;
     {
-        ScopedTopologyDevice device(session->rhi.GetPhysicalDevice());
+        ScopedTopologyDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
         baseline = device.device.GetExtensionFlags();
     }
     {
         CapabilityDriver::hiddenExtensions.emplace_back(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
-        ScopedTopologyDevice device(session->rhi.GetPhysicalDevice());
+        ScopedTopologyDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
         nvAvailable = device.device.GetExtensionFlags().hasInvocationReorderNV;
     }
     for (uint32_t scenario = 0; scenario < 7; ++scenario)
@@ -1055,7 +1084,7 @@ TEST_F(VulkanCapabilityIntegrationTest, InvocationReorderAndIndirectTracingRespe
             CapabilityDriver::missingRayFeature = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
         }
         CapabilityDriver::traceIndirectUnavailable = scenario == 6;
-        ScopedTopologyDevice        device(session->rhi.GetPhysicalDevice());
+        ScopedTopologyDevice        device(&session->rhi, session->rhi.GetPhysicalDevice());
         const DeviceExtensionFlags& enabled = device.device.GetExtensionFlags();
         const bool                  ext     = baseline.hasInvocationReorderEXT && (scenario == 0 || scenario == 6);
         const bool                  nv      = nvAvailable && !ext && scenario != 3 && scenario != 4 && scenario != 5;
@@ -1084,11 +1113,9 @@ TEST_F(VulkanCapabilityIntegrationTest, OptionalFeaturesDisableTheirDependentsAn
 
     ASSERT_TRUE(Reason().empty());
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
-
-    EXPECT_FALSE(device.SupportsTimelineSemaphore());
+    zen::test::InitOrAbort(device);
 
     EXPECT_FALSE(device.GetPhysicalDeviceFeatures().imageCubeArray);
     EXPECT_FALSE(device.GetPhysicalDeviceFeatures().fullDrawIndexUint32);
@@ -1102,9 +1129,9 @@ TEST_F(VulkanCapabilityIntegrationTest, OptionalFeaturesDisableTheirDependentsAn
 
     EXPECT_FALSE(device.GetExtensionFlags().hasRayQuery);
 
-    for (VkStructureType type : {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
-                                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
-                                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
+    EXPECT_FALSE(CapabilityDriver::enabledBufferDeviceAddress);
+
+    for (VkStructureType type : {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
                                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
                                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR})
     {
@@ -1112,10 +1139,10 @@ TEST_F(VulkanCapabilityIntegrationTest, OptionalFeaturesDisableTheirDependentsAn
     }
 
     {
-        VulkanMemoryAllocator allocator;
+        VulkanMemoryAllocator allocator(&session->rhi);
 
         allocator.Init(session->rhi.GetInstance(), session->rhi.GetPhysicalDevice(), device.GetVkHandle(),
-                       device.GetExtensionFlags().hasBufferDeviceAddress);
+                       {device.GetExtensionFlags().hasBufferDeviceAddress != 0});
 
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 
@@ -1127,7 +1154,7 @@ TEST_F(VulkanCapabilityIntegrationTest, OptionalFeaturesDisableTheirDependentsAn
 
         VulkanMemoryAllocation allocation{};
 
-        allocator.AllocBuffer(256, &info, RHIBufferAllocateType::eCPUWrite, &buffer, &allocation);
+        ASSERT_FALSE(allocator.AllocBuffer(&info, RHIBufferAllocateType::eCPUWrite, &buffer, &allocation).IsFailure());
 
         ASSERT_NE(buffer, VK_NULL_HANDLE);
 
@@ -1152,9 +1179,9 @@ TEST_F(VulkanCapabilityIntegrationTest, MissingMaintenanceFeatureUsesUnextendedS
 {
     CapabilityDriver::maintenanceDisabled = true;
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_FALSE(device.GetExtensionFlags().hasSwapchainMaintenance1);
 
@@ -1180,9 +1207,9 @@ TEST_F(VulkanCapabilityIntegrationTest, MissingSurfaceMaintenanceDependencyDisab
 
     flags.hasSurfaceMaintenanceKHR = flags.hasSurfaceMaintenanceEXT = 0;
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_FALSE(device.GetExtensionFlags().hasSwapchainMaintenance1);
 
@@ -1204,8 +1231,7 @@ TEST_F(VulkanCapabilityIntegrationTest, MaintenanceSelectsEXTWhenKHRNameIsAbsent
         GTEST_SKIP() << "Requires the EXT surface maintenance instance dependency";
     }
 
-    const HeapVector<VkExtensionProperties> supported =
-        VulkanDeviceExtension::GetSupportedExtensions(session->rhi.GetPhysicalDevice());
+    const HeapVector<VkExtensionProperties> supported = GetSupportedDeviceExtensions(session->rhi.GetPhysicalDevice());
 
     if (std::none_of(supported.begin(), supported.end(), [](const VkExtensionProperties& extension) {
             return strcmp(extension.extensionName, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) == 0;
@@ -1230,9 +1256,9 @@ TEST_F(VulkanCapabilityIntegrationTest, MaintenanceSelectsEXTWhenKHRNameIsAbsent
 
     CapabilityDriver::hiddenExtensions = {"VK_KHR_swapchain_maintenance1"};
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_TRUE(device.GetExtensionFlags().hasSwapchainMaintenance1);
 
@@ -1307,7 +1333,7 @@ struct MaintenanceSelectionDriver
 template <typename Extensions> bool HasEnabledMaintenanceExtension(const Extensions& extensions, const char* name)
 {
     return std::any_of(extensions.begin(), extensions.end(), [name](const typename Extensions::value_type& extension) {
-        return extension->GetName() == NameID(name) && extension->IsEnabledAndSupported();
+        return extension->GetName() == NameID(name) && extension->IsSupported();
     });
 }
 
@@ -1336,7 +1362,8 @@ TEST_F(VulkanCapabilityIntegrationTest, SurfaceMaintenanceAdvertisementRequiresS
 
             InstanceExtensionFlags flags{};
 
-            const VulkanInstanceExtensionArray extensions = VulkanInstanceExtension::GetEnabledInstanceExtensions(flags);
+            const VulkanInstanceExtensionArray extensions =
+                VulkanInstanceExtension::GetEnabledInstanceExtensions(flags, nullptr);
 #if defined(VK_KHR_surface_maintenance1)
             const bool expectKHR = advertiseKHR;
 #else
@@ -1375,28 +1402,27 @@ TEST_F(VulkanCapabilityIntegrationTest, SwapchainMaintenanceAdvertisementRequire
 
             test::ScopedVulkanCall hook(vkEnumerateDeviceExtensionProperties, MaintenanceSelectionDriver::DeviceExtensions);
 
-            VulkanDevice device(session->rhi.GetPhysicalDevice());
+            VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-            InstanceExtensionFlags& instanceFlags       = session->rhi.GetInstanceExtensionFlags();
+            InstanceExtensionFlags& instanceFlags          = session->rhi.GetInstanceExtensionFlags();
 
-            const InstanceExtensionFlags saved          = instanceFlags;
+            const InstanceExtensionFlags saved             = instanceFlags;
 
-            instanceFlags.hasSurfaceMaintenanceKHR      = 1;
+            instanceFlags.hasSurfaceMaintenanceKHR         = 1;
 
-            instanceFlags.hasSurfaceMaintenanceEXT      = 1;
+            instanceFlags.hasSurfaceMaintenanceEXT         = 1;
 
-            const VulkanDeviceExtensionArray extensions = VulkanDeviceExtension::GetEnabledExtensions(&device);
+            const VulkanDeviceExtensionSelection selection = SelectDeviceExtensions(device);
 
-            instanceFlags                               = saved;
+            instanceFlags                                  = saved;
 #if defined(VK_KHR_swapchain_maintenance1)
             const bool expectKHR = advertiseKHR;
 #else
             const bool expectKHR = false;
 #endif
-            EXPECT_EQ(HasEnabledMaintenanceExtension(extensions, "VK_KHR_swapchain_maintenance1"), expectKHR);
+            EXPECT_EQ(selection.IsEnabled("VK_KHR_swapchain_maintenance1"), expectKHR);
 
-            EXPECT_EQ(HasEnabledMaintenanceExtension(extensions, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME),
-                      advertiseEXT && !expectKHR);
+            EXPECT_EQ(selection.IsEnabled(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME), advertiseEXT && !expectKHR);
 
             EXPECT_EQ(CapabilityDriver::createCalls, 0u);
         }
@@ -1407,9 +1433,9 @@ TEST_F(VulkanCapabilityIntegrationTest, AbsentMaintenanceNamesKeepDeviceUsable)
 {
     CapabilityDriver::hiddenExtensions = {"VK_KHR_swapchain_maintenance1", VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME};
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_FALSE(device.GetExtensionFlags().hasSwapchainMaintenance1);
 
@@ -1442,9 +1468,9 @@ TEST_F(VulkanCapabilityIntegrationTest, CalibratedTimestampSelectionPrefersSuppo
 
             test::ScopedVulkanCall hook(vkEnumerateDeviceExtensionProperties, MaintenanceSelectionDriver::DeviceExtensions);
 
-            VulkanDevice device(session->rhi.GetPhysicalDevice());
+            VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-            const VulkanDeviceExtensionArray extensions = VulkanDeviceExtension::GetEnabledExtensions(&device);
+            const VulkanDeviceExtensionSelection selection = SelectDeviceExtensions(device);
 
 #if defined(VK_KHR_calibrated_timestamps)
             const bool expectKHR = advertiseKHR;
@@ -1458,11 +1484,11 @@ TEST_F(VulkanCapabilityIntegrationTest, CalibratedTimestampSelectionPrefersSuppo
             const bool expectEXT = false;
 #endif
 
-            EXPECT_EQ(HasEnabledMaintenanceExtension(extensions, "VK_KHR_calibrated_timestamps"), expectKHR);
+            EXPECT_EQ(selection.IsEnabled("VK_KHR_calibrated_timestamps"), expectKHR);
 
-            EXPECT_EQ(HasEnabledMaintenanceExtension(extensions, "VK_EXT_calibrated_timestamps"), expectEXT);
+            EXPECT_EQ(selection.IsEnabled("VK_EXT_calibrated_timestamps"), expectEXT);
 
-            EXPECT_EQ(bool(device.GetExtensionFlags().hasCalibratedTimestamps), expectKHR || expectEXT);
+            EXPECT_EQ(bool(selection.flags.hasCalibratedTimestamps), expectKHR || expectEXT);
 
             EXPECT_EQ(CapabilityDriver::createCalls, 0u);
         }
@@ -1473,9 +1499,9 @@ TEST_F(VulkanCapabilityIntegrationTest, MissingCalibratedTimestampsKeepsDeviceUs
 {
     CapabilityDriver::hiddenExtensions = {"VK_KHR_calibrated_timestamps", "VK_EXT_calibrated_timestamps"};
 
-    VulkanDevice device(session->rhi.GetPhysicalDevice());
+    VulkanDevice device(&session->rhi, session->rhi.GetPhysicalDevice());
 
-    device.Init();
+    zen::test::InitOrAbort(device);
 
     EXPECT_FALSE(device.GetExtensionFlags().hasCalibratedTimestamps);
 
@@ -1550,7 +1576,7 @@ TEST_F(VulkanCapabilityIntegrationTest, SurfaceMaintenanceRequiresSurfaceCapabil
 
     InstanceExtensionFlags flags{};
 
-    const VulkanInstanceExtensionArray extensions = VulkanInstanceExtension::GetEnabledInstanceExtensions(flags);
+    const VulkanInstanceExtensionArray extensions = VulkanInstanceExtension::GetEnabledInstanceExtensions(flags, nullptr);
 
     EXPECT_FALSE(flags.hasSurfaceMaintenanceKHR);
 
@@ -1561,7 +1587,7 @@ TEST_F(VulkanCapabilityIntegrationTest, SurfaceMaintenanceRequiresSurfaceCapabil
         if (extension->GetName() == NameID("VK_KHR_surface_maintenance1")
             || extension->GetName() == NameID(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME))
         {
-            EXPECT_FALSE(extension->IsEnabledAndSupported());
+            EXPECT_FALSE(extension->IsSupported());
         }
     }
 }

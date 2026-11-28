@@ -6,163 +6,6 @@
 
 namespace zen
 {
-VulkanFence::VulkanFence(VulkanFenceManager* pOwner, bool createSignaled) :
-    m_pOwner(pOwner), m_state(createSignaled ? State::eSignaled : State::eInitial)
-{
-    VkFenceCreateInfo fenceCI;
-
-    InitVkStruct(fenceCI, VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
-
-    fenceCI.flags         = createSignaled ? VK_FENCE_CREATE_SIGNALED_BIT : 0;
-
-    const VkResult result = vkCreateFence(m_pOwner->GetDevice()->GetVkHandle(), &fenceCI, nullptr, &m_fence);
-
-    if (result != VK_SUCCESS)
-    {
-        m_fence = VK_NULL_HANDLE;
-
-        ReportVulkanDeviceLoss(result, "vkCreateFence");
-
-        ZEN_RHI_LOG_ERROR("vkCreateFence failed: {}", GetResultString(result));
-    }
-}
-
-void VulkanFenceManager::Destroy()
-{
-    ZEN_RHI_VERIFY(m_usedFences.empty());
-
-    while (!m_freeFences.Empty())
-    {
-        VulkanFence* pFence = m_freeFences.Peek();
-
-        m_freeFences.Pop();
-
-        DestroyFence(pFence);
-
-        ZEN_DELETE(pFence);
-    }
-}
-
-VulkanFence* VulkanFenceManager::CreateFence(bool createSignaled)
-{
-    VulkanFence* result{};
-
-    if (!createSignaled && !m_freeFences.Empty())
-    {
-        VulkanFence* pFence = m_freeFences.Peek();
-
-        m_freeFences.Pop();
-
-        m_usedFences.push_back(pFence);
-
-        result = pFence;
-    }
-    else
-    {
-        VulkanFence* pNewFence = ZEN_NEW() VulkanFence(this, createSignaled);
-
-        if (pNewFence->GetVkHandle() != VK_NULL_HANDLE)
-        {
-            m_usedFences.push_back(pNewFence);
-
-            result = pNewFence;
-        }
-        else
-        {
-            ZEN_DELETE(pNewFence);
-        }
-    }
-
-    return result;
-}
-
-void VulkanFenceManager::ReleaseFence(VulkanFence*& fence)
-{
-    const VkResult reset =
-        GVulkanRHI->HasDeviceLoss() ? VK_ERROR_DEVICE_LOST : vkResetFences(m_pDevice->GetVkHandle(), 1, &fence->m_fence);
-
-    if (!m_usedFences.empty())
-    {
-        HeapVector<VulkanFence*>::iterator it = m_usedFences.begin();
-
-        while (it != m_usedFences.end())
-        {
-            if (*it == fence)
-            {
-                *it = m_usedFences.back();
-                m_usedFences.pop_back();
-
-                break;
-            }
-
-            ++it;
-        }
-    }
-
-    if (reset == VK_SUCCESS)
-    {
-        fence->m_state = VulkanFence::State::eInitial;
-        m_freeFences.Push(fence);
-    }
-    else
-    {
-        if (!GVulkanRHI->HasDeviceLoss())
-        {
-            ReportVulkanDeviceLoss(reset, "vkResetFences");
-            ZEN_RHI_LOG_ERROR("vkResetFences failed: {}", GetResultString(reset));
-        }
-        DestroyFence(fence);
-        ZEN_DELETE(fence);
-    }
-
-    fence = nullptr;
-}
-
-VkResult VulkanFenceManager::GetFenceStatus(VulkanFence* pFence)
-{
-    VkResult result = VK_SUCCESS;
-
-    if (!pFence->IsSignaled())
-    {
-        result = vkGetFenceStatus(m_pDevice->GetVkHandle(), pFence->m_fence);
-
-        if (result == VK_SUCCESS)
-        {
-            pFence->m_state = VulkanFence::State::eSignaled;
-        }
-    }
-
-    return result;
-}
-
-VkResult VulkanFenceManager::WaitForFence(VulkanFence* pFence, uint64_t timeNS)
-{
-    VkResult result = GetFenceStatus(pFence);
-
-    // A failed status query must not be hidden by a subsequent successful wait.
-    if (result == VK_NOT_READY)
-    {
-        result =
-            TimedRHICall(RHIWorkerTime::eWait, vkWaitForFences, m_pDevice->GetVkHandle(), 1, &pFence->m_fence, true, timeNS);
-
-        if (result == VK_SUCCESS)
-        {
-            pFence->m_state = VulkanFence::State::eSignaled;
-        }
-    }
-
-    return result;
-}
-
-void VulkanFenceManager::DestroyFence(VulkanFence* pFence)
-{
-    vkDestroyFence(m_pDevice->GetVkHandle(), pFence->GetVkHandle(), nullptr);
-
-    pFence->m_fence = VK_NULL_HANDLE;
-
-    pFence->m_state = VulkanFence::State::eInitial;
-}
-
 VulkanSemaphore::VulkanSemaphore(VulkanDevice* pDevice, VkSemaphoreType semaphoreType, uint64_t initialValue) :
     m_pDevice(pDevice), m_type(semaphoreType)
 {
@@ -185,7 +28,9 @@ VulkanSemaphore::VulkanSemaphore(VulkanDevice* pDevice, VkSemaphoreType semaphor
 
     const VkResult result = vkCreateSemaphore(m_pDevice->GetVkHandle(), &semaphoreCI, nullptr, &m_semaphore);
 
-    m_error               = MakeVulkanError(result, "vkCreateSemaphore", __FILE__, __LINE__);
+    pDevice->GetRHI()->CheckDeviceLoss(result, "vkCreateSemaphore");
+
+    m_error = MakeVulkanError(result, "vkCreateSemaphore", __FILE__, __LINE__);
 
     if (m_error.IsFailure())
     {
@@ -243,17 +88,8 @@ VulkanSemaphore::~VulkanSemaphore()
 void VulkanSemaphoreManager::Destroy()
 {
 #if defined(ZEN_DEBUG)
-    ZEN_RHI_VERIFY(m_allocatedSemaphoreCount == m_usedSemaphores.size() + m_freeSemaphores.Size());
+    ZEN_RHI_VERIFY(m_allocatedSemaphoreCount == m_usedSemaphores.size());
 #endif
-
-    while (!m_freeSemaphores.Empty())
-    {
-        VulkanSemaphore* pSem = m_freeSemaphores.Peek();
-
-        m_freeSemaphores.Pop();
-
-        ZEN_DELETE(pSem);
-    }
 
     for (VulkanSemaphore* pSem : m_usedSemaphores)
     {
@@ -266,38 +102,24 @@ void VulkanSemaphoreManager::Destroy()
 #endif
 }
 
-VulkanSemaphore* VulkanSemaphoreManager::GetOrCreateSemaphore()
+VulkanSemaphore* VulkanSemaphoreManager::CreateBinarySemaphore()
 {
-    VulkanSemaphore* result{};
+    VulkanSemaphore* result = ZEN_NEW() VulkanSemaphore(m_pDevice);
 
-    if (!m_freeSemaphores.Empty())
+    m_error                 = result->GetError();
+
+    if (!m_error.IsFailure())
     {
-        VulkanSemaphore* pSem = m_freeSemaphores.Peek();
-
-        m_freeSemaphores.Pop();
-
-        m_usedSemaphores.push_back(pSem);
-
-        result = pSem;
+        m_usedSemaphores.push_back(result);
+#if defined(ZEN_DEBUG)
+        m_allocatedSemaphoreCount++;
+#endif
     }
     else
     {
-        VulkanSemaphore* pNewSem = ZEN_NEW() VulkanSemaphore(m_pDevice);
+        ZEN_DELETE(result);
 
-        m_error                  = pNewSem->GetError();
-
-        if (!m_error.IsFailure())
-        {
-            m_usedSemaphores.push_back(pNewSem);
-#if defined(ZEN_DEBUG)
-            m_allocatedSemaphoreCount++;
-#endif
-            result = pNewSem;
-        }
-        else
-        {
-            ZEN_DELETE(pNewSem);
-        }
+        result = nullptr;
     }
 
     return result;
@@ -322,33 +144,6 @@ void VulkanSemaphoreManager::DestroySemaphore(VulkanSemaphore*& sem)
 #if defined(ZEN_DEBUG)
         --m_allocatedSemaphoreCount;
 #endif
-    }
-}
-
-void VulkanSemaphoreManager::ReleaseSemaphore(VulkanSemaphore*& sem)
-{
-    if (sem != nullptr)
-    {
-        VulkanSemaphore** it = std::find(m_usedSemaphores.begin(), m_usedSemaphores.end(), sem);
-
-        if (it != m_usedSemaphores.end())
-        {
-            // The next owner must not inherit acceptance of an earlier signal.
-            // Keep the generation monotonic across reuse of the same object.
-            sem->m_pSignalQueue           = nullptr;
-
-            sem->m_signalSubmissionSerial = 0;
-
-            m_usedSemaphores.erase(it);
-
-            m_freeSemaphores.Push(sem);
-
-            sem = nullptr;
-        }
-        else
-        {
-            ZEN_RHI_VERIFY_MSG(false, "Cannot release a semaphore that is not in use");
-        }
     }
 }
 

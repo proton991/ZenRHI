@@ -1,4 +1,5 @@
 #include "ZenRHI/RHIThread.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "ZenRHI/RHIGPUFrameTiming.h"
 #include "ZenRHI/RHICommandListExecutor.h"
 #include <gtest/gtest.h>
@@ -41,19 +42,20 @@ namespace
 std::atomic<bool> observedStall{};
 std::atomic<bool> observedStack{};
 std::atomic<bool> observedRecovery{};
-void              CaptureStall(RHIMessageSeverity, std::string_view message) noexcept
+void              CaptureStall(const RHIMessage& diagnostic) noexcept
 {
-    if ((message.starts_with("RHI stall: synchronous RHI call") || message.starts_with("RHI stall: RHI shutdown"))
-        && message.find("worker=executing") != std::string_view::npos)
+    if ((diagnostic.text.starts_with("RHI stall: synchronous RHI call")
+         || diagnostic.text.starts_with("RHI stall: RHI shutdown"))
+        && diagnostic.text.find("worker=executing") != std::string_view::npos)
     {
         observedStall.store(true);
     }
-    if (message.starts_with("RHI worker stack [0]"))
+    if (diagnostic.text.starts_with("RHI worker stack [0]"))
     {
         observedStack.store(true);
     }
-    if (message.starts_with("RHI stall recovered: synchronous RHI call")
-        || message.starts_with("RHI stall recovered: RHI shutdown"))
+    if (diagnostic.text.starts_with("RHI stall recovered: synchronous RHI call")
+        || diagnostic.text.starts_with("RHI stall recovered: RHI shutdown"))
     {
         observedRecovery.store(true);
     }
@@ -77,14 +79,13 @@ TEST(RHIThreadTest, ReportsBlockedInvocationAndResumes)
         GTEST_SKIP() << "The RHI watchdog suppresses reports while a debugger is attached";
     }
 #endif
-    const std::chrono::milliseconds threshold = RHIOptions::GetInstance().StallReportThreshold();
-    const RHIMessageCallback        callback  = GetRHIMessageCallback();
-    RHIOptions::GetInstance().SetStallReportThreshold(std::chrono::milliseconds(10));
+    const RHIMessageCallback callback = GetRHIMessageCallback();
     SetRHIMessageCallback(CaptureStall);
     observedStall.store(false);
     observedStack.store(false);
     observedRecovery.store(false);
     RHIThread thread;
+    thread.SetStallReports(std::chrono::milliseconds(10), std::chrono::milliseconds(0), true);
     thread.Start(RHIExecutionMode::eThreaded);
     EXPECT_TRUE(thread.Invoke(WaitForStallReport));
     EXPECT_TRUE(observedRecovery.load());
@@ -93,7 +94,6 @@ TEST(RHIThreadTest, ReportsBlockedInvocationAndResumes)
     thread.Stop([] { WaitForStallReport(); });
     EXPECT_TRUE(observedStall.load());
     SetRHIMessageCallback(callback);
-    RHIOptions::GetInstance().SetStallReportThreshold(threshold);
     EXPECT_TRUE(observedRecovery.load());
 #if defined(_WIN32) && defined(_M_X64)
     EXPECT_TRUE(observedStack.load());
@@ -123,10 +123,8 @@ TEST(RHIThreadDeathTest, ExplicitFatalThresholdEndsABlockedInvocation)
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_DEATH(
         {
-            RHIOptions::GetInstance().SetStallStackCapture(false);
-            RHIOptions::GetInstance().SetStallReportThreshold(std::chrono::milliseconds(0));
-            RHIOptions::GetInstance().SetStallFatalThreshold(std::chrono::milliseconds(30));
             RHIThread thread;
+            thread.SetStallReports(std::chrono::milliseconds(0), std::chrono::milliseconds(30), false);
             thread.Start(RHIExecutionMode::eThreaded);
             thread.Invoke([] { std::this_thread::sleep_for(std::chrono::seconds(2)); });
             thread.Stop();
@@ -212,9 +210,9 @@ struct QueueStallGate
     std::promise<void>            waiting;
     RHIThreadEvent                resume;
     static inline QueueStallGate* active{};
-    static void                   OnMessage(RHIMessageSeverity, std::string_view message) noexcept
+    static void                   OnMessage(const RHIMessage& diagnostic) noexcept
     {
-        if (message.starts_with("RHI stall: RHI queue space") && !active->reported.exchange(true))
+        if (diagnostic.text.starts_with("RHI stall: RHI queue space") && !active->reported.exchange(true))
         {
             active->waiting.set_value();
             active->resume.Wait();
@@ -230,11 +228,9 @@ TEST(RHIThreadProductionTest, LateCleanupKeepsShutdownWakeVisibleToFullQueueProd
     RHIThread      thread;
     RHIThreadEvent entered, release;
     QueueStallGate gate;
-    QueueStallGate::active                    = &gate;
-    RHIOptions&                     options   = RHIOptions::GetInstance();
-    const std::chrono::milliseconds threshold = options.StallReportThreshold();
-    const RHIMessageCallback        callback  = GetRHIMessageCallback();
-    options.SetStallReportThreshold(5ms);
+    QueueStallGate::active            = &gate;
+    const RHIMessageCallback callback = GetRHIMessageCallback();
+    thread.SetStallReports(5ms, 0ms, true);
     SetRHIMessageCallback(QueueStallGate::OnMessage);
     thread.Start(RHIExecutionMode::eThreaded, 1);
     thread.Dispatch([&entered, &release] {
@@ -258,7 +254,6 @@ TEST(RHIThreadProductionTest, LateCleanupKeepsShutdownWakeVisibleToFullQueueProd
     stopper.join();
     EXPECT_EQ(producer.get().admission, RHIJobAdmission::eClosed);
     SetRHIMessageCallback(callback);
-    options.SetStallReportThreshold(threshold);
     QueueStallGate::active = nullptr;
     if (!reached)
     {

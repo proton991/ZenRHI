@@ -3,18 +3,12 @@
 namespace zen
 {
 struct VulkanSurfaceProvider;
-enum class RHIWindowType
-{
-    eWin32,
-    eMetal,
-    eCustom
-};
 
+// A borrowed window to present to. The provider creates its Vulkan surface, so the RHI carries no window-system
+// code; the host keeps both alive until the viewport is destroyed.
 struct RHIWindowHandle
 {
-    RHIWindowType                type{RHIWindowType::eCustom};
-    void*                        window{};   // HWND, CAMetalLayer*, or borrowed custom provider context
-    void*                        instance{}; // HINSTANCE for Win32
+    void*                        window{};
     const VulkanSurfaceProvider* provider{};
 };
 } // namespace zen

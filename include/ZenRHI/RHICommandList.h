@@ -1,4 +1,5 @@
 #pragma once
+#include "ZenRHI/RHIDeviceRuntime.h"
 #include "ZenRHI/RHIDiagnostics.h"
 #include <span>
 #include "RHIError.h"
@@ -12,6 +13,7 @@
 #include "ZenFoundation/Templates/HeapVector.h"
 #include "ZenFoundation/Templates/SmallVector.h"
 #include "ZenFoundation/Templates/VectorView.h"
+#include <cstring>
 #include <type_traits>
 #include <utility>
 #include <memory>
@@ -19,13 +21,10 @@
 #include "ZenFoundation/Utils/RefCountPtr.h"
 #include "ZenFoundation/Templates/FlatHashMap.h"
 
-#define ALLOC_CMD(...) AllocateCmdTyped<__VA_ARGS__>
-
 namespace zen
 {
 class RHIPipeline;
 class RHICommandList;
-struct RHICommand;
 
 struct RHICommandListDeleter
 {
@@ -64,18 +63,14 @@ private:
     FlatHashMap<RHIResource*, size_t> m_unique;
 };
 
-class RHIPlatformCommandList
+// Recorded commands live in the list's arena and are destroyed through this virtual destructor.
+struct RHICommand
 {
-public:
-    virtual ~RHIPlatformCommandList() = default;
-};
+    RHICommand* pNextCmd{nullptr};
 
-struct RHICommandBase
-{
-    RHICommandBase* pNextCmd{nullptr};
-    void            (*pDestroy)(RHICommandBase*){nullptr};
+    virtual ~RHICommand()                         = default;
 
-    virtual ~RHICommandBase() {}
+    virtual void Execute(RHICommandList& cmdList) = 0;
 };
 
 enum class RHICommandContextType : uint32_t
@@ -187,7 +182,7 @@ struct RHISubmissionDependency
     uint64_t                  serial{0};
 };
 
-class IRHICommandContext : public RefCounted
+class IRHICommandContext : public RefCounted, public RHIDeviceChild
 {
 public:
     // Optional profiler annotations; no resource or synchronization semantics.
@@ -208,13 +203,6 @@ public:
     // Resource arguments are borrowed through GPU completion (including the base
     // texture of a view). Recorded rendering layouts must survive command execution.
     virtual RHICommandContextType GetContextType() = 0;
-
-    // Serial of this context's most recent accepted native submission, or zero when unknown.
-    // It stays exact when other contexts' work joins the same native submission.
-    virtual uint64_t RHIGetLastSubmittedSerial() const
-    {
-        return 0;
-    }
 
     virtual ~IRHICommandContext() {}
 
@@ -315,7 +303,7 @@ public:
 
     virtual void RHICopyBuffer(RHIBuffer* pSrcBuffer, RHIBuffer* pDstBuffer, const RHIBufferCopyRegion& region)            = 0;
 
-    virtual void RHIClearTexture(RHITexture* pTex, const Color& color, const RHITextureSubResourceRange& range)            = 0;
+    virtual void RHIClearTexture(RHITexture* pTex, const Color& color, const RHITextureSubresourceRange& range)            = 0;
 
     virtual void RHICopyTexture(RHITexture* pSrcTexture, RHITexture* pDstTexture, std::span<RHITextureCopyRegion> regions) = 0;
 
@@ -339,7 +327,6 @@ public:
                                    uint32_t    dstLayer,
                                    uint32_t    dstMipmap)                                                                  = 0;
 
-    virtual void RHIWaitUntilCompleted()                                                                                   = 0;
 
 protected:
     // A context that latches recording errors binds its error record for HasRecordingError.
@@ -355,30 +342,59 @@ private:
     const RHIError* m_pRecordingError{nullptr};
 };
 
-class RHICommandListBase
+// Indexed draw arguments. The index buffer is retained by the recording command list.
+struct RHIDrawIndexedArgs
+{
+    RHIBuffer* pIndexBuffer{nullptr};
+    DataFormat indexFormat{};
+    uint64_t   indexBufferOffset{0};
+    uint32_t   indexCount{0};
+    uint32_t   instanceCount{0};
+    uint32_t   firstIndex{0};
+    int32_t    vertexOffset{0};
+    uint32_t   firstInstance{0};
+};
+
+// Indexed indirect draw arguments. Both buffers are retained by the recording command list.
+struct RHIDrawIndexedIndirectArgs
+{
+    RHIBuffer* pIndirectBuffer{nullptr};
+    RHIBuffer* pIndexBuffer{nullptr};
+    DataFormat indexFormat{};
+    uint64_t   indexBufferOffset{0};
+    uint64_t   offset{0};
+    uint32_t   drawCount{0};
+    uint32_t   stride{0};
+};
+
+class RHICommandList final
 {
 public:
-    virtual ~RHICommandListBase()
+    static RHICommandList* Create(IRHICommandContext* pContext);
+
+    RHICommandList() : m_cmdAllocator(64 * 1024)
+    {
+        m_ppCmdPtr = &m_pCmdHead;
+    }
+
+    ~RHICommandList()
     {
         Reset();
         m_ppCmdPtr = nullptr;
     }
 
-    RHICommandListBase(const RHICommandListBase&)            = delete;
+    RHICommandList(const RHICommandList&)            = delete;
 
-    RHICommandListBase& operator=(const RHICommandListBase&) = delete;
+    RHICommandList& operator=(const RHICommandList&) = delete;
 
     template <typename T, typename... Args> T* AllocateCmdTyped(Args&&... args)
     {
         static_assert(std::is_base_of_v<RHICommand, T>, "T must derive from RHICommand");
         // Construct command metadata before linking it into the recorded command list.
-        void* memory   = m_cmdAllocator.Alloc(sizeof(T), alignof(T));
-        T*    pCmd     = new (memory) T(std::forward<Args>(args)...);
-        pCmd->pDestroy = [](RHICommandBase* pBase) {
-            static_cast<T*>(pBase)->~T();
-        };
-        *m_ppCmdPtr = pCmd;
-        m_ppCmdPtr  = &pCmd->pNextCmd;
+        void* memory = m_cmdAllocator.Alloc(sizeof(T), alignof(T));
+        T*    pCmd   = new (memory) T(std::forward<Args>(args)...);
+        *m_ppCmdPtr  = pCmd;
+        m_ppCmdPtr   = &pCmd->pNextCmd;
         ++m_numCommands;
 
         return pCmd;
@@ -412,7 +428,7 @@ public:
 
     IRHICommandContext* GetContext() const
     {
-        return m_pGraphicsContext != nullptr ? m_pGraphicsContext : m_pComputeContext;
+        return m_contextOwner.Get();
     }
 
     uint64_t CaptureBindlessEpoch();
@@ -467,11 +483,11 @@ public:
 
     struct CommandCheckpoint
     {
-        RHICommandBase** tail;
-        uint32_t         count;
-        size_t           resourceCount;
-        size_t           dependencyCount;
-        size_t           captureCount;
+        RHICommand** tail;
+        uint32_t     count;
+        size_t       resourceCount;
+        size_t       dependencyCount;
+        size_t       captureCount;
     };
 
     CommandCheckpoint GetCommandCheckpoint() const
@@ -487,629 +503,6 @@ public:
     // Discard only commands appended after this checkpoint. Arena bytes are reclaimed by Reset.
     void RollbackCommands(CommandCheckpoint checkpoint);
 
-protected:
-    RHICommandListBase() : m_cmdAllocator(64 * 1024)
-    {
-        m_ppCmdPtr = &m_pCmdHead;
-    }
-
-    RHICommandBase*  m_pCmdHead{nullptr};
-    RHICommandBase** m_ppCmdPtr{nullptr};
-
-    IRHICommandContext* m_pGraphicsContext{nullptr};
-    IRHICommandContext* m_pComputeContext{nullptr};
-
-    uint32_t                            m_numCommands{0};
-    PoolAllocator<LinearAllocator>      m_cmdAllocator;
-    RefCountPtr<IRHICommandContext>     m_contextOwner;
-    RHIResourceReferences               m_resources;
-    HeapVector<RHISubmissionDependency> m_submissionDependencies;
-    SmallVector<uint64_t, 4>            m_bindlessEpochs;
-    uint64_t                            m_submittedSerial{0};
-    bool                                m_submissionBoundary{false};
-};
-
-struct RHICommand : public RHICommandBase
-{
-    virtual ~RHICommand() {};
-
-    virtual void Execute(RHICommandListBase& cmdList) = 0;
-};
-
-struct RHICommandWithBindlessEpoch : public RHICommand
-{
-    explicit RHICommandWithBindlessEpoch(uint64_t epoch) : m_bindlessEpoch(epoch) {}
-
-    RHICommandWithBindlessEpoch(const RHICommandWithBindlessEpoch&)            = delete;
-
-    RHICommandWithBindlessEpoch& operator=(const RHICommandWithBindlessEpoch&) = delete;
-
-    void Execute(RHICommandListBase& cmdList) final
-    {
-        IRHICommandContext* context = cmdList.GetContext();
-        context->RHISetRecordedBindlessEpoch(m_bindlessEpoch);
-
-        ExecuteCommand(cmdList);
-
-        context->RHISetRecordedBindlessEpoch(0);
-    }
-
-    virtual void ExecuteCommand(RHICommandListBase& cmdList) = 0;
-
-private:
-    uint64_t m_bindlessEpoch;
-};
-
-struct RHICommandClearBuffer : public RHICommand
-{
-    RHIBuffer* pBuffer;
-    uint64_t   offset;
-    uint64_t   size;
-
-    RHICommandClearBuffer(RHIBuffer* pBuffer, uint64_t offset, uint64_t size) : pBuffer(pBuffer), offset(offset), size(size) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIClearBuffer(pBuffer, offset, size);
-    }
-};
-
-struct RHICommandBuildAccelerationStructure : public RHICommand
-{
-    RHIAccelerationStructureBuildInfo info;
-
-    explicit RHICommandBuildAccelerationStructure(const RHIAccelerationStructureBuildInfo& buildInfo) : info(buildInfo) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIBuildAccelerationStructure(info);
-    }
-};
-
-struct RHICommandCopyBuffer : public RHICommand
-{
-    RHIBuffer*          pSrcBuffer;
-    RHIBuffer*          pDstBuffer;
-    RHIBufferCopyRegion copyRegion;
-
-    RHICommandCopyBuffer(RHIBuffer* pSrcBuffer, RHIBuffer* pDstBuffer, const RHIBufferCopyRegion& region) :
-        pSrcBuffer(pSrcBuffer), pDstBuffer(pDstBuffer), copyRegion(region)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHICopyBuffer(pSrcBuffer, pDstBuffer, copyRegion);
-    }
-};
-
-struct RHICommandClearTexture : public RHICommand
-{
-    RHITexture*                pTexture;
-    Color                      clearColor;
-    RHITextureSubResourceRange range;
-
-    RHICommandClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubResourceRange& range) :
-        pTexture(pTexture), clearColor(color), range(range)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIClearTexture(pTexture, clearColor, range);
-    }
-};
-
-struct RHICommandCopyTexture : public RHICommand
-{
-    RHITexture*                     pSrcTexture;
-    RHITexture*                     pDstTexture;
-    std::span<RHITextureCopyRegion> copyRegions;
-
-    RHICommandCopyTexture(RHITexture* pSrcTexture, RHITexture* pDstTexture) : pSrcTexture(pSrcTexture), pDstTexture(pDstTexture)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHICopyTexture(pSrcTexture, pDstTexture, copyRegions);
-    }
-};
-
-struct RHICommandBlitTexture : public RHICommand
-{
-    RHITexture*                     pSrcTexture;
-    RHITexture*                     pDstTexture;
-    std::span<RHITextureBlitRegion> blitRegions;
-    RHISamplerFilter                filter;
-
-    RHICommandBlitTexture(RHITexture* pSrcTexture, RHITexture* pDstTexture, RHISamplerFilter filter) :
-        pSrcTexture(pSrcTexture), pDstTexture(pDstTexture), filter(filter)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIBlitTexture(pSrcTexture, pDstTexture, blitRegions, filter);
-    }
-};
-
-struct RHICommandCopyBufferToTexture : public RHICommand
-{
-    RHIBuffer*                            pSrcBuffer;
-    RHITexture*                           pDstTexture;
-    std::span<RHIBufferTextureCopyRegion> copyRegions;
-
-    RHICommandCopyBufferToTexture(RHIBuffer* pSrcBuffer, RHITexture* pDstTexture) :
-        pSrcBuffer(pSrcBuffer), pDstTexture(pDstTexture)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHICopyBufferToTexture(pSrcBuffer, pDstTexture, copyRegions);
-    }
-};
-
-struct RHICommandCopyTextureToBuffer : public RHICommand
-{
-    RHITexture*                           pSrcTexture;
-    RHIBuffer*                            pDstBuffer;
-    std::span<RHIBufferTextureCopyRegion> copyRegions;
-
-    RHICommandCopyTextureToBuffer(RHITexture* pSrcTexture, RHIBuffer* pDstBuffer) :
-        pSrcTexture(pSrcTexture), pDstBuffer(pDstBuffer)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHICopyTextureToBuffer(pSrcTexture, pDstBuffer, copyRegions);
-    }
-};
-
-struct RHICommandResolveTexture : public RHICommand
-{
-    RHITexture* pSrcTexture;
-    RHITexture* pDstTexture;
-    uint32_t    srcLayer;
-    uint32_t    srcMipmap;
-    uint32_t    dstLayer;
-    uint32_t    dstMipmap;
-
-    RHICommandResolveTexture(RHITexture* pSrcTexture,
-                             RHITexture* pDstTexture,
-                             uint32_t    srcLayer,
-                             uint32_t    srcMipmap,
-                             uint32_t    dstLayer,
-                             uint32_t    dstMipmap) :
-        pSrcTexture(pSrcTexture),
-        pDstTexture(pDstTexture),
-        srcLayer(srcLayer),
-        srcMipmap(srcMipmap),
-        dstLayer(dstLayer),
-        dstMipmap(dstMipmap)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIResolveTexture(pSrcTexture, pDstTexture, srcLayer, srcMipmap, dstLayer, dstMipmap);
-    }
-};
-
-struct RHICommandBeginRendering final : public RHICommand
-{
-    RHIRenderingLayout renderingLayout;
-
-    explicit RHICommandBeginRendering(const RHIRenderingLayout* pRenderingLayout) : renderingLayout(*pRenderingLayout) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIBeginRendering(&renderingLayout);
-    }
-};
-
-struct RHICommandEndRendering final : public RHICommand
-{
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIEndRendering();
-    }
-};
-
-struct RHICommandDebugLabel final : public RHICommand
-{
-private:
-    NameID name;
-    bool   begin;
-
-public:
-    RHICommandDebugLabel(std::string_view label, bool isBegin) : name(label), begin(isBegin) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        if (begin)
-        {
-            cmdList.GetContext()->RHIBeginDebugLabel(name);
-        }
-        else
-        {
-            cmdList.GetContext()->RHIEndDebugLabel();
-        }
-    }
-};
-
-struct RHICommandGPUTiming final : public RHICommand
-{
-    RHIGPUTimingPtr result;
-    bool            begin;
-    bool            executed{false};
-
-    RHICommandGPUTiming(const RHIGPUTimingPtr& timing, bool isBegin) : result(timing), begin(isBegin) {}
-
-    ~RHICommandGPUTiming() override
-    {
-        if (begin && !executed && result != nullptr)
-        {
-            result->Publish(RHIGPUTimingStatus::eDiscarded);
-        }
-    }
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        if (begin)
-        {
-            cmdList.GetContext()->RHIBeginGPUTiming(result);
-        }
-        else
-        {
-            cmdList.GetContext()->RHIEndGPUTiming(result);
-        }
-        executed = true;
-    }
-};
-
-struct RHICommandBindPipeline final : public RHICommand
-{
-    RHIPipelineType pipelineType;
-    RHIPipeline*    pPipeline;
-
-    explicit RHICommandBindPipeline(RHIPipelineType pipelineType, RHIPipeline* pPipeline) :
-        pipelineType(pipelineType), pPipeline(pPipeline)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIBindPipeline(pPipeline);
-    }
-};
-
-struct RHICommandSetShaderParameters final : public RHICommandWithBindlessEpoch
-{
-    RHIShaderParameterView parameters;
-
-    RHICommandSetShaderParameters(RHICommandListBase& list, RHIShaderParameterView source, uint64_t epoch = 0) :
-        RHICommandWithBindlessEpoch(epoch)
-    {
-        parameters.valueParameters    = list.CopyCmdData(source.valueParameters);
-
-        parameters.valueBytes         = list.CopyCmdData(source.valueBytes);
-
-        parameters.resourceParameters = list.CopyCmdData(source.resourceParameters);
-
-        parameters.bindlessParameters = list.CopyCmdData(source.bindlessParameters);
-    }
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetShaderParameters(parameters);
-    }
-};
-
-struct RHICommandSetScissor final : public RHICommand
-{
-    uint32_t minX;
-    uint32_t minY;
-    uint32_t maxX;
-    uint32_t maxY;
-
-    RHICommandSetScissor(uint32_t minX, uint32_t minY, uint32_t maxX, uint32_t maxY) :
-        minX(minX), minY(minY), maxX(maxX), maxY(maxY)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetScissor(minX, minY, maxX, maxY);
-    }
-};
-
-struct RHICommandSetViewport final : public RHICommand
-{
-    uint32_t minX;
-    uint32_t minY;
-    uint32_t maxX;
-    uint32_t maxY;
-
-    RHICommandSetViewport(uint32_t minX, uint32_t minY, uint32_t maxX, uint32_t maxY) :
-        minX(minX), minY(minY), maxX(maxX), maxY(maxY)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetViewport(minX, minY, maxX, maxY);
-    }
-};
-
-struct RHICommandSetDepthBias : public RHICommand
-{
-    float depthBiasConstantFactor;
-    float depthBiasClamp;
-    float depthBiasSlopeFactor;
-
-    RHICommandSetDepthBias(float depthBiasConstantFactor, float depthBiasClamp, float depthBiasSlopeFactor) :
-        depthBiasConstantFactor(depthBiasConstantFactor),
-        depthBiasClamp(depthBiasClamp),
-        depthBiasSlopeFactor(depthBiasSlopeFactor)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetDepthBias(depthBiasConstantFactor, depthBiasClamp, depthBiasSlopeFactor);
-    }
-};
-
-struct RHICommandSetLineWidth : public RHICommand
-{
-    float lineWidth;
-
-    explicit RHICommandSetLineWidth(float lineWidth) : lineWidth(lineWidth) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetLineWidth(lineWidth);
-    }
-};
-
-struct RHICommandSetBlendConstants : public RHICommand
-{
-    Color blendConstants;
-
-    explicit RHICommandSetBlendConstants(Color blendConstants) : blendConstants(std::move(blendConstants)) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetBlendConstants(blendConstants);
-    }
-};
-
-struct RHICommandBindVertexBuffer final : public RHICommand
-{
-    RHIBuffer* pVertexBuffer;
-    uint64_t   offset;
-
-    RHICommandBindVertexBuffer(RHIBuffer* pVertexBuffer, uint64_t offset) : pVertexBuffer(pVertexBuffer), offset(offset) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIBindVertexBuffer(pVertexBuffer, offset);
-    }
-};
-
-struct RHICommandBindVertexBuffers final : public RHICommand
-{
-    std::span<RHIBuffer*> vertexBuffers;
-    std::span<uint64_t>   offsets;
-
-    RHICommandBindVertexBuffers() = default;
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIBindVertexBuffers(vertexBuffers, offsets);
-    }
-};
-
-struct RHICommandDraw final : public RHICommandWithBindlessEpoch
-{
-    uint32_t vertexCount;
-    uint32_t instanceCount;
-    uint32_t firstVertex;
-    uint32_t firstInstance;
-
-    RHICommandDraw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch),
-        vertexCount(vertexCount),
-        instanceCount(instanceCount),
-        firstVertex(firstVertex),
-        firstInstance(firstInstance)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIDraw(vertexCount, instanceCount, firstVertex, firstInstance);
-    }
-};
-
-struct RHICommandDrawIndexed final : public RHICommandWithBindlessEpoch
-{
-    struct Param
-    {
-        RHIBuffer* pIndexBuffer;
-        DataFormat indexFormat;
-        uint64_t   indexBufferOffset;
-        uint32_t   indexCount;
-        uint32_t   instanceCount;
-        uint32_t   firstIndex;
-        int32_t    vertexOffset;
-        uint32_t   firstInstance;
-    };
-
-    // note: For now index buffer format is UINT32 only
-    RHIBuffer* pIndexBuffer;
-    DataFormat indexFormat;
-    uint64_t   indexBufferOffset;
-    uint32_t   indexCount;
-    uint32_t   instanceCount;
-    uint32_t   firstIndex;
-    int32_t    vertexOffset;
-    uint32_t   firstInstance;
-
-    explicit RHICommandDrawIndexed(const Param& param, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch),
-        pIndexBuffer(param.pIndexBuffer),
-        indexFormat(param.indexFormat),
-        indexBufferOffset(param.indexBufferOffset),
-        indexCount(param.indexCount),
-        instanceCount(param.instanceCount),
-        firstIndex(param.firstIndex),
-        vertexOffset(param.vertexOffset),
-        firstInstance(param.firstInstance)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIDrawIndexed(pIndexBuffer, indexFormat, indexBufferOffset, indexCount, instanceCount,
-                                             firstIndex, vertexOffset, firstInstance);
-    }
-};
-
-struct RHICommandDrawIndexedIndirect final : public RHICommandWithBindlessEpoch
-{
-    struct Param
-    {
-        RHIBuffer* pIndirectBuffer;
-        RHIBuffer* pIndexBuffer;
-        DataFormat indexFormat;
-        uint64_t   indexBufferOffset;
-        uint64_t   offset;
-        uint32_t   drawCount;
-        uint32_t   stride;
-    };
-
-    RHIBuffer* pIndirectBuffer;
-    RHIBuffer* pIndexBuffer;
-    DataFormat indexFormat;
-    uint64_t   indexBufferOffset;
-    uint64_t   offset;
-    uint32_t   drawCount;
-    uint32_t   stride;
-
-    explicit RHICommandDrawIndexedIndirect(const Param& param, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch),
-        pIndirectBuffer(param.pIndirectBuffer),
-        pIndexBuffer(param.pIndexBuffer),
-        indexFormat(param.indexFormat),
-        indexBufferOffset(param.indexBufferOffset),
-        offset(param.offset),
-        drawCount(param.drawCount),
-        stride(param.stride)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIDrawIndexedIndirect(pIndirectBuffer, pIndexBuffer, indexFormat, indexBufferOffset, offset,
-                                                     drawCount, stride);
-    }
-};
-
-struct RHICommandDispatch final : public RHICommandWithBindlessEpoch
-{
-    uint32_t groupCountX;
-    uint32_t groupCountY;
-    uint32_t groupCountZ;
-
-    RHICommandDispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch), groupCountX(groupCountX), groupCountY(groupCountY), groupCountZ(groupCountZ)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIDispatch(groupCountX, groupCountY, groupCountZ);
-    }
-};
-
-struct RHICommandDispatchIndirect final : public RHICommandWithBindlessEpoch
-{
-    RHIBuffer* pIndirectBuffer;
-    uint64_t   offset;
-
-    RHICommandDispatchIndirect(RHIBuffer* pIndirectBuffer, uint64_t offset, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch), pIndirectBuffer(pIndirectBuffer), offset(offset)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIDispatchIndirect(pIndirectBuffer, offset);
-    }
-};
-
-struct RHICommandTraceRays final : public RHICommandWithBindlessEpoch
-{
-    uint32_t width;
-    uint32_t height;
-    uint32_t depth;
-
-    RHICommandTraceRays(uint32_t width, uint32_t height, uint32_t depth, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch), width(width), height(height), depth(depth)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHITraceRays(width, height, depth);
-    }
-};
-
-struct RHICommandTraceRaysIndirect final : public RHICommandWithBindlessEpoch
-{
-    RHIBuffer* buffer;
-    uint64_t   offset;
-
-    RHICommandTraceRaysIndirect(RHIBuffer* buffer, uint64_t offset, uint64_t epoch) :
-        RHICommandWithBindlessEpoch(epoch), buffer(buffer), offset(offset)
-    {}
-
-    void ExecuteCommand(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHITraceRaysIndirect(buffer, offset);
-    }
-};
-
-struct RHICommandSetPushConstants final : public RHICommand
-{
-    RHIPipeline*             pPipeline;
-    std::span<const uint8_t> data;
-    uint32_t                 offset{0};
-
-    explicit RHICommandSetPushConstants(RHIPipeline* pPipeline) : pPipeline(pPipeline) {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHISetPushConstants(pPipeline, data, offset);
-    }
-};
-
-struct RHICommandAddTransitions final : public RHICommand
-{
-    RHIFlags<RHIPipelineStageFlagBits> srcStages;
-    RHIFlags<RHIPipelineStageFlagBits> dstStages;
-
-    std::span<RHIMemoryTransition>  memoryTransitions;
-    std::span<RHIBufferTransition>  bufferTransitions;
-    std::span<RHITextureTransition> textureTransitions;
-
-    RHICommandAddTransitions(RHIFlags<RHIPipelineStageFlagBits> srcStages, RHIFlags<RHIPipelineStageFlagBits> dstStages) :
-        srcStages(srcStages), dstStages(dstStages)
-    {}
-
-    void Execute(RHICommandListBase& cmdList) override
-    {
-        cmdList.GetContext()->RHIAddTransitions(srcStages, dstStages, memoryTransitions, bufferTransitions, textureTransitions);
-    }
-};
-
-// Recorded command-list API used by the active RenderCore/V2 path.
-class RHICommandList : public RHICommandListBase
-{
-public:
-    static RHICommandList* Create(IRHICommandContext* pContext);
-
-    RHICommandList()           = default;
-
-    ~RHICommandList() override = default;
-
     // Moves only CPU recording storage. The reusable producer and detached batch
     // share a context whose native state is accessed exclusively by the executor.
     // Optional empty storage supplies the producer's replacement arena without allocating.
@@ -1124,7 +517,7 @@ public:
 
     void CopyBuffer(RHIBuffer* pSrcBuffer, RHIBuffer* pDstBuffer, const RHIBufferCopyRegion& region);
 
-    void ClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubResourceRange& range);
+    void ClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubresourceRange& range);
 
     void CopyTexture(RHITexture*                           pSrcTextureHandle,
                      RHITexture*                           pDstTextureHandle,
@@ -1166,7 +559,7 @@ public:
 
     void SetBlendConstants(const Color& color);
 
-    void BindPipeline(RHIPipelineType pipelineType, RHIPipeline* pPipeline);
+    void BindPipeline(RHIPipeline* pPipeline);
 
     void SetShaderParameters(const RHIBatchedShaderParameters& parameters);
 
@@ -1181,9 +574,9 @@ public:
 
     void Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance);
 
-    void DrawIndexed(const RHICommandDrawIndexed::Param& param);
+    void DrawIndexed(const RHIDrawIndexedArgs& args);
 
-    void DrawIndexedIndirect(const RHICommandDrawIndexedIndirect::Param& param);
+    void DrawIndexedIndirect(const RHIDrawIndexedIndirectArgs& args);
 
     void Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ);
 
@@ -1200,5 +593,19 @@ public:
                         std::span<RHIMemoryTransition>     memoryTransitions,
                         std::span<RHIBufferTransition>     bufferTransitions,
                         std::span<RHITextureTransition>    textureTransitions);
+
+private:
+    RHICommand*  m_pCmdHead{nullptr};
+    RHICommand** m_ppCmdPtr{nullptr};
+
+    uint32_t                            m_numCommands{0};
+    PoolAllocator<LinearAllocator>      m_cmdAllocator;
+    RefCountPtr<IRHICommandContext>     m_contextOwner;
+    RHIResourceReferences               m_resources;
+    HeapVector<RHISubmissionDependency> m_submissionDependencies;
+    SmallVector<uint64_t, 4>            m_bindlessEpochs;
+    uint64_t                            m_submittedSerial{0};
+    bool                                m_submissionBoundary{false};
 };
+
 } // namespace zen

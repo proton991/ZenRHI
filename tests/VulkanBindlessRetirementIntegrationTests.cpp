@@ -1,6 +1,10 @@
+#include "Vulkan/VulkanBindlessHeap.h"
 #include "VulkanIntegrationFixture.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "Vulkan/VulkanSetLayout.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanBuffer.h"
+#include "Vulkan/VulkanUniformRing.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanPipeline.h"
@@ -18,7 +22,7 @@ class VulkanBindlessRetirementIntegrationTest : public testing::Test
 {
 protected:
     std::unique_ptr<test::VulkanSession> session;
-    FVulkanCommandListContext*           context{};
+    VulkanCommandListContext*            context{};
     RHICommandList*                      commandList{};
     VkDebugUtilsMessengerEXT             messenger{};
     HeapVector<RHIBuffer*>               buffers;
@@ -59,7 +63,7 @@ protected:
 
         ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(session->rhi.GetInstance(), &info, nullptr, &messenger), VK_SUCCESS);
 
-        context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        context = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
     }
 
     void Shutdown()
@@ -248,7 +252,7 @@ protected:
                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     }
 
-    void Enqueue(FVulkanCommandListContext* source)
+    void Enqueue(VulkanCommandListContext* source)
     {
         HeapVector<VulkanWorkload*> workloads;
 
@@ -373,7 +377,7 @@ protected:
             ASSERT_TRUE(handle.IsValid());
             EXPECT_EQ(handle.heapType, arrayHeap);
             EXPECT_EQ(handle.slotIndex, 0u);
-            session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+            session->rhi.GetBindlessHeap()->Flush();
             EXPECT_TRUE(session->rhi.UnregisterBindlessResource(handle));
             EXPECT_EQ(texture->GetRefCount(), 1u);
             EXPECT_EQ(resource->GetRefCount(), 1u);
@@ -461,11 +465,11 @@ protected:
         ASSERT_NE(slice, nullptr);
         RHISampler* sampler = Sampler();
         ASSERT_NE(sampler, nullptr);
-        VulkanBindlessDescriptorPoolManager* manager     = session->rhi.GetBindlessDescriptorPoolManager();
-        const uint64_t                       transaction = manager->BeginTransaction();
-        RHIBindlessHandle                    arrayHandle;
-        RHIBindlessHandle                    sliceHandle;
-        RHIBindlessHandle                    samplerHandle;
+        VulkanBindlessHeap* manager     = session->rhi.GetBindlessHeap();
+        const uint64_t      transaction = manager->BeginTransaction();
+        RHIBindlessHandle   arrayHandle;
+        RHIBindlessHandle   sliceHandle;
+        RHIBindlessHandle   samplerHandle;
         ASSERT_TRUE(manager->RegisterBindlessResource(array, 0, &arrayHandle, 0, transaction));
         ASSERT_TRUE(manager->RegisterBindlessResource(slice, 0, &sliceHandle, 0, transaction));
         ASSERT_TRUE(manager->RegisterBindlessResource(sampler, 0, &samplerHandle, 0, transaction));
@@ -559,7 +563,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, MatchingArrayParametersPublishSe
     // The immediate submission path publishes the context's descriptor transaction.
     context->GetCommandBuffer();
     ASSERT_EQ(context->SubmitRecordedWorkloads(), RHISubmissionResult::eSuccess);
-    ASSERT_TRUE(context->GetQueue()->WaitForCompletion(context->GetLastSubmittedSerial(), UINT64_MAX));
+    session->rhi.WaitDeviceIdle();
     for (size_t index = 0; index < std::size(resources); ++index)
     {
         const RHIBindlessHandle handle = session->rhi.RegisterBindlessResource(resources[index], 0);
@@ -574,16 +578,16 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, MatchingArrayParametersPublishSe
 
 TEST_F(VulkanBindlessRetirementIntegrationTest, DetachedWorkloadsOwnBindlessReservationsUntilAcceptedOrDiscarded)
 {
-    RHISampler*                          sampler = Sampler();
-    VulkanBindlessDescriptorPoolManager* manager = session->rhi.GetBindlessDescriptorPoolManager();
-    VulkanQueue*                         queue   = session->rhi.GetDevice()->GetGfxQueue();
+    RHISampler*         sampler = Sampler();
+    VulkanBindlessHeap* manager = session->rhi.GetBindlessHeap();
+    VulkanQueue*        queue   = session->rhi.GetDevice()->GetGfxQueue();
     for (bool submit : {false, true})
     {
         RHIBindlessHandle           handle;
         HeapVector<VulkanWorkload*> workloads;
         VulkanSemaphore             split(session->rhi.GetDevice());
         {
-            FVulkanCommandListContext recording(RHICommandContextType::eGraphics, session->rhi.GetDevice());
+            VulkanCommandListContext recording(RHICommandContextType::eGraphics, session->rhi.GetDevice());
             ASSERT_TRUE(manager->RegisterBindlessResource(sampler, 0, &handle, 0, recording.GetRecordingTransaction()));
             recording.GetCommandBuffer();
             recording.AddSignalSemaphore(&split);
@@ -642,8 +646,8 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, ArrayViewAtTexture2DBindingRejec
     parameters.AddResourceParam(*descriptor, texture, nullptr, 0);
     parameters.AddResourceParam(*descriptor, array, nullptr, 1);
 
-    VulkanBindlessDescriptorPoolManager* manager = session->rhi.GetBindlessDescriptorPoolManager();
-    descriptorWriteCount                         = 0;
+    VulkanBindlessHeap* manager = session->rhi.GetBindlessHeap();
+    descriptorWriteCount        = 0;
     {
         test::ScopedVulkanCall<PFN_vkUpdateDescriptorSets> observe(vkUpdateDescriptorSets, CountDescriptorWrites);
         context->RHISetShaderParameters(parameters);
@@ -683,9 +687,9 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, MultisampledViewsCannotEnterSing
         viewInfo.arrayView    = true;
         RHITextureView* array = texture->CreateView(viewInfo);
         ASSERT_NE(array, nullptr);
-        VulkanBindlessDescriptorPoolManager* manager     = session->rhi.GetBindlessDescriptorPoolManager();
-        RHIResource*                         resources[] = {texture, texture->GetDefaultView(), array};
-        descriptorWriteCount                             = 0;
+        VulkanBindlessHeap* manager     = session->rhi.GetBindlessHeap();
+        RHIResource*        resources[] = {texture, texture->GetDefaultView(), array};
+        descriptorWriteCount            = 0;
         {
             test::ScopedVulkanCall<PFN_vkUpdateDescriptorSets> observe(vkUpdateDescriptorSets, CountDescriptorWrites);
             for (RHIResource* resource : resources)
@@ -834,7 +838,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, UnflushedRetirementReleasesViewA
     textures.back() = nullptr;
 
     // A pending write must not touch the freed view, or overwrite a later registration.
-    session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+    session->rhi.GetBindlessHeap()->Flush();
 
     VulkanTexture* replacement = Texture();
 
@@ -842,7 +846,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, UnflushedRetirementReleasesViewA
 
     EXPECT_EQ(next.slotIndex, handle.slotIndex);
 
-    session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+    session->rhi.GetBindlessHeap()->Flush();
 
     EXPECT_TRUE(session->rhi.UnregisterBindlessResource(next));
 
@@ -868,9 +872,9 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, ListCapturesOnceAndRollbackPrese
 
     EXPECT_EQ(session->rhi.GetExecutionCounters().bindlessCaptures - before, 1u);
 
-    const RHICommandListBase::CommandCheckpoint checkpoint = commandList->GetCommandCheckpoint();
+    const RHICommandList::CommandCheckpoint checkpoint = commandList->GetCommandCheckpoint();
 
-    const uint64_t earlierEpoch                            = context->RHIGetCurrentBindlessEpoch();
+    const uint64_t earlierEpoch                        = context->RHIGetCurrentBindlessEpoch();
 
     ASSERT_TRUE(session->rhi.UnregisterBindlessResource(handle));
 
@@ -919,7 +923,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, AllRecordedDrawAndDispatchFormsP
 
         ASSERT_TRUE(handle.IsValid());
 
-        RHICommandListBase::CommandCheckpoint checkpoint = commandList->GetCommandCheckpoint();
+        RHICommandList::CommandCheckpoint checkpoint = commandList->GetCommandCheckpoint();
 
         switch (form)
         {
@@ -996,13 +1000,13 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, NewRecordingsDoNotKeepOlderRetir
 
 TEST_F(VulkanBindlessRetirementIntegrationTest, OnlyLiveEpochsFromThisManagerPermitReplay)
 {
-    RHISampler* sampler                          = Sampler();
+    RHISampler* sampler         = Sampler();
 
-    VulkanBindlessDescriptorPoolManager* manager = session->rhi.GetBindlessDescriptorPoolManager();
+    VulkanBindlessHeap* manager = session->rhi.GetBindlessHeap();
 
-    RHIBindlessHandle handle                     = session->rhi.RegisterBindlessResource(sampler, 0);
+    RHIBindlessHandle handle    = session->rhi.RegisterBindlessResource(sampler, 0);
 
-    const uint64_t epoch                         = context->RHICaptureBindlessEpoch();
+    const uint64_t epoch        = context->RHICaptureBindlessEpoch();
 
     EXPECT_TRUE(session->rhi.UnregisterBindlessResource(handle));
 
@@ -1012,9 +1016,9 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, OnlyLiveEpochsFromThisManagerPer
 
     EXPECT_FALSE(manager->RegisterBindlessResource(sampler, 0, nullptr, newerEpoch));
 
-    VulkanBindlessDescriptorPoolManager other;
+    VulkanBindlessHeap other(session->rhi.GetDevice());
 
-    other.Init();
+    zen::test::InitOrAbort(other);
 
     const uint64_t foreignEpoch = other.CaptureEpoch();
 
@@ -1024,7 +1028,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, OnlyLiveEpochsFromThisManagerPer
 
     other.Destroy();
 
-    other.Init();
+    zen::test::InitOrAbort(other);
 
     const uint64_t recreatedEpoch = other.CaptureEpoch();
 
@@ -1075,7 +1079,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, RecordedParametersAndReplayRetai
 
     commandList = RHICommandList::Create(context);
 
-    commandList->BindPipeline(RHIPipelineType::eCompute, pipeline);
+    commandList->BindPipeline(pipeline);
 
     RHIBatchedShaderParameters parameters;
 
@@ -1167,7 +1171,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, RepeatedTextureAndSamplerStreami
 
         if (i % 2 == 0)
         {
-            session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+            session->rhi.GetBindlessHeap()->Flush();
         }
 
         EXPECT_TRUE(session->rhi.UnregisterBindlessResource(image));
@@ -1189,7 +1193,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, RepeatedTextureAndSamplerStreami
         samplers.pop_back();
     }
 
-    session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+    session->rhi.GetBindlessHeap()->Flush();
 }
 
 TEST_F(VulkanBindlessRetirementIntegrationTest, ContextDestructionDiscardsUnsubmittedHeapUse)
@@ -1247,7 +1251,7 @@ TEST_F(VulkanBindlessRetirementIntegrationTest, CubeRegistrationsReleaseTheirIma
 
         EXPECT_EQ(handle.slotIndex, 0u);
 
-        session->rhi.GetBindlessDescriptorPoolManager()->Flush();
+        session->rhi.GetBindlessHeap()->Flush();
 
         EXPECT_TRUE(session->rhi.UnregisterBindlessResource(handle));
 
@@ -1284,7 +1288,7 @@ public:
         vkDestroySemaphore(device->GetVkHandle(), semaphore, nullptr);
     }
 
-    void Record(FVulkanCommandListContext* context)
+    void Record(VulkanCommandListContext* context)
     {
         // A semaphore wait also gates all later commands in queue submission order.
         // This test-only native prelude works with either engine completion backend.
@@ -1333,22 +1337,10 @@ private:
     bool          opened{false};
 };
 
-class VulkanBindlessQueueRetirementTest :
-    public VulkanBindlessRetirementIntegrationTest,
-    public testing::WithParamInterface<bool>
-{
-    void SetUp() override
-    {
-        VulkanBindlessRetirementIntegrationTest::SetUp();
+class VulkanBindlessQueueRetirementTest : public VulkanBindlessRetirementIntegrationTest
+{};
 
-        ASSERT_TRUE(session->rhi.GetDevice()->SupportsTimelineSemaphore());
-
-        // Exercise the existing fence backend on the same real device as well.
-        session->rhi.GetDevice()->GetExtensionFlags().hasTimelineSemaphore = GetParam();
-    }
-};
-
-TEST_P(VulkanBindlessQueueRetirementTest, PendingGPUReadKeepsViewAndSamplerAlive)
+TEST_F(VulkanBindlessQueueRetirementTest, PendingGPUReadKeepsViewAndSamplerAlive)
 {
     RHIPipeline* pipeline  = Compute("binding_bindless.comp.spv");
 
@@ -1428,7 +1420,7 @@ TEST_P(VulkanBindlessQueueRetirementTest, PendingGPUReadKeepsViewAndSamplerAlive
     EXPECT_TRUE(session->rhi.RegisterBindlessResource(nextSampler, 0).IsValid());
 }
 
-TEST_P(VulkanBindlessQueueRetirementTest, EveryQueueMustCompleteItsRecordedEpoch)
+TEST_F(VulkanBindlessQueueRetirementTest, EveryQueueMustCompleteItsRecordedEpoch)
 {
     RHISampler* sampler      = Sampler();
 
@@ -1436,8 +1428,8 @@ TEST_P(VulkanBindlessQueueRetirementTest, EveryQueueMustCompleteItsRecordedEpoch
 
     ASSERT_TRUE(handle.IsValid());
 
-    FVulkanCommandListContext* compute =
-        static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eAsyncCompute));
+    VulkanCommandListContext* compute =
+        static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eAsyncCompute));
 
     const uint64_t epoch = context->RHICaptureBindlessEpoch();
 
@@ -1491,7 +1483,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL RejectSubmit(VkQueue, uint32_t, const VkSu
     return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
-TEST_P(VulkanBindlessQueueRetirementTest, ReplayResetWaitsForLatestSubmission)
+TEST_F(VulkanBindlessQueueRetirementTest, ReplayResetWaitsForLatestSubmission)
 {
     RHIPipeline* pipeline  = Compute("binding_bindless.comp.spv");
 
@@ -1560,7 +1552,7 @@ TEST_P(VulkanBindlessQueueRetirementTest, ReplayResetWaitsForLatestSubmission)
     EXPECT_FALSE(session->rhi.RegisterBindlessResource(sampler, 0).IsValid());
 
     // A saved integer alone cannot reactivate a recording after its count is released.
-    EXPECT_FALSE(session->rhi.GetBindlessDescriptorPoolManager()->RegisterBindlessResource(sampler, 0, nullptr, epoch));
+    EXPECT_FALSE(session->rhi.GetBindlessHeap()->RegisterBindlessResource(sampler, 0, nullptr, epoch));
 
     gate.Open();
 
@@ -1573,14 +1565,14 @@ TEST_P(VulkanBindlessQueueRetirementTest, ReplayResetWaitsForLatestSubmission)
     EXPECT_TRUE(session->rhi.RegisterBindlessResource(sampler, 0).IsValid());
 }
 
-TEST_P(VulkanBindlessQueueRetirementTest, RejectedMergedEpochCountsTransferOnRetry)
+TEST_F(VulkanBindlessQueueRetirementTest, RejectedMergedEpochCountsTransferOnRetry)
 {
     RHISampler* sampler      = Sampler();
 
     RHIBindlessHandle handle = session->rhi.RegisterBindlessResource(sampler, 0);
 
-    FVulkanCommandListContext* other =
-        static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    VulkanCommandListContext* other =
+        static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
     const uint64_t epoch = context->RHICaptureBindlessEpoch();
 
@@ -1635,25 +1627,31 @@ TEST_P(VulkanBindlessQueueRetirementTest, RejectedMergedEpochCountsTransferOnRet
     ZEN_DELETE(other);
 }
 
-TEST_P(VulkanBindlessQueueRetirementTest, OneSubmissionProtectsUniformsBindlessAndDescriptorPools)
+TEST_F(VulkanBindlessQueueRetirementTest, OneSubmissionProtectsUniformsBindlessAndDescriptorPools)
 {
-    VulkanLifetimeTracker& tracker          = session->rhi.GetLifetimeTracker();
+    VulkanLifetimeTracker& tracker = session->rhi.GetLifetimeTracker();
 
-    VulkanUniformBufferAllocator* allocator = session->rhi.GetUniformBufferAllocator();
+    VulkanUniformRing* allocator   = session->rhi.GetUniformRing();
 
-    VulkanDescriptorPoolManager2* pools     = session->rhi.GetDescriptorPoolManager2();
 
     allocator->BeginFrame(0);
 
-    const VulkanUniformBufferBlock allocation = allocator->Alloc(64);
+    const VulkanUniformBlock allocation = allocator->Alloc(64).GetValueOr({});
 
     ASSERT_TRUE(allocation.IsValid());
 
-    VulkanDescriptorPoolSetContainer* pool = pools->AcquireDescriptorPoolSetContainer();
+    RHIShaderResourceDescriptor descriptor{};
+    descriptor.type               = RHIShaderResourceType::eStorageBuffer;
+    descriptor.arraySize          = 1;
+    descriptor.stageFlags         = RHIShaderStageFlagBits::eCompute;
+    const VulkanSetLayout* layout = session->rhi.GetSetLayoutCache()->GetOrCreate({&descriptor, 1});
+    ASSERT_NE(layout, nullptr);
+    const VulkanDescriptorAllocator::Set set = session->rhi.GetDescriptorAllocator()->Insert({layout->id, {1}}, *layout, {});
+    ASSERT_NE(set.handle, VK_NULL_HANDLE);
 
-    RHISampler* sampler                    = Sampler();
+    RHISampler* sampler      = Sampler();
 
-    RHIBindlessHandle handle               = session->rhi.RegisterBindlessResource(sampler, 0);
+    RHIBindlessHandle handle = session->rhi.RegisterBindlessResource(sampler, 0);
 
     ASSERT_TRUE(handle.IsValid());
 
@@ -1663,19 +1661,17 @@ TEST_P(VulkanBindlessQueueRetirementTest, OneSubmissionProtectsUniformsBindlessA
 
     EXPECT_NE(blockLifetime, epoch);
 
-    EXPECT_NE(pool->GetLifetimeId(), epoch);
+    EXPECT_NE(set.lifetimeId, epoch);
 
-    EXPECT_NE(pool->GetLifetimeId(), blockLifetime);
+    EXPECT_NE(set.lifetimeId, blockLifetime);
 
     context->RecordUniformBufferBlock(allocation.blockId);
 
-    context->RecordDescriptorPool(pool);
+    context->RecordLifetime(set.lifetimeId);
 
     context->RecordLifetime(epoch);
 
     context->RHIReleaseBindlessEpoch(epoch);
-
-    pools->ReleaseContainer(pool);
 
     ASSERT_TRUE(session->rhi.UnregisterBindlessResource(handle));
 
@@ -1699,32 +1695,32 @@ TEST_P(VulkanBindlessQueueRetirementTest, OneSubmissionProtectsUniformsBindlessA
 
     EXPECT_FALSE(tracker.HasRecordings(epoch));
 
-    EXPECT_FALSE(tracker.HasRecordings(pool->GetLifetimeId()));
+    EXPECT_FALSE(tracker.HasRecordings(set.lifetimeId));
 
     EXPECT_FALSE(tracker.IsComplete(blockLifetime));
 
-    EXPECT_FALSE(pool->CanReuse());
+    EXPECT_FALSE(tracker.IsComplete(set.lifetimeId));
 
     EXPECT_FALSE(session->rhi.RegisterBindlessResource(sampler, 0).IsValid());
 
     allocator->BeginFrame(0);
 
-    EXPECT_NE(allocator->Alloc(64).blockId, allocation.blockId);
+    EXPECT_NE(allocator->Alloc(64).GetValueOr({}).blockId, allocation.blockId);
 
     gate.Open();
 
     ASSERT_TRUE(queue->WaitForCompletion(serial, UINT64_MAX));
 
-    EXPECT_TRUE(pool->CanReuse());
+    EXPECT_TRUE(tracker.IsComplete(set.lifetimeId));
 
     EXPECT_TRUE(session->rhi.RegisterBindlessResource(sampler, 0).IsValid());
 
     allocator->BeginFrame(0);
 
-    EXPECT_EQ(allocator->Alloc(64).blockId, allocation.blockId);
+    EXPECT_EQ(allocator->Alloc(64).GetValueOr({}).blockId, allocation.blockId);
 }
 
-TEST_P(VulkanBindlessQueueRetirementTest, RejectedMergedWorkRetainsUntilExplicitDiscard)
+TEST_F(VulkanBindlessQueueRetirementTest, RejectedMergedWorkRetainsUntilExplicitDiscard)
 {
     RHISampler* first              = Sampler();
 
@@ -1734,8 +1730,8 @@ TEST_P(VulkanBindlessQueueRetirementTest, RejectedMergedWorkRetainsUntilExplicit
 
     RHIBindlessHandle secondHandle = session->rhi.RegisterBindlessResource(second, 1);
 
-    FVulkanCommandListContext* other =
-        static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    VulkanCommandListContext* other =
+        static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
     const uint64_t epoch = context->RHICaptureBindlessEpoch();
 
@@ -1782,7 +1778,7 @@ TEST_P(VulkanBindlessQueueRetirementTest, RejectedMergedWorkRetainsUntilExplicit
     ZEN_DELETE(other);
 }
 
-TEST_P(VulkanBindlessQueueRetirementTest, UncertainSubmissionDoesNotPermitEarlyReclamation)
+TEST_F(VulkanBindlessQueueRetirementTest, UncertainSubmissionDoesNotPermitEarlyReclamation)
 {
     RHISampler* sampler      = Sampler();
 
@@ -1819,5 +1815,4 @@ TEST_P(VulkanBindlessQueueRetirementTest, UncertainSubmissionDoesNotPermitEarlyR
     // Uncertain work retains its pending epoch count until queue/device teardown.
 }
 
-INSTANTIATE_TEST_SUITE_P(TimelineAndFence, VulkanBindlessQueueRetirementTest, testing::Bool());
 } // namespace

@@ -31,6 +31,10 @@ struct RHIThreadActivity
     std::atomic<uint64_t> queued{};
     std::atomic<int64_t>  taskStartedMS{};
     std::atomic<uint32_t> threadID{};
+    // Stall reports for waits on this thread, in milliseconds; zero disables a threshold.
+    std::atomic<int64_t> stallReportMS{10000};
+    std::atomic<int64_t> stallFatalMS{};
+    std::atomic<bool>    stallStackCapture{true};
 };
 
 // Manual-reset event. Windows waits service sent messages required by Vulkan WSI.
@@ -65,7 +69,7 @@ private:
 
 using RHIThreadEventPtr = RefCountPtr<RHIThreadEvent>;
 
-// One ordered executor for backend operations. Tasks must never wait for RenderCore
+// One ordered executor for backend operations. Tasks must never wait for recording-thread
 // work; Windows WSI may synchronously send messages to the window's owning thread.
 class RHIThread
 {
@@ -82,14 +86,14 @@ public:
     void Start(RHIExecutionMode mode, size_t capacity = 64);
 
     // A finalizer retires the backend: admission closes when it starts, in both modes, and
-    // stays closed until Start or OpenAdmission. Releases from the finalizer still run.
+    // stays closed until Start. Releases from the finalizer still run.
     // Stop ordinary producers first; ordinary jobs arriving while the worker drains are rejected.
     // Without a finalizer no backend is retired: late cleanup stays admitted and runs inline once
     // the worker has exited, and after Stop returns all work runs inline as it did before Start.
     void Stop(std::function<void()> finalizer = {});
 
-    // Called when a backend starts without an executor, after an earlier backend was retired.
-    void OpenAdmission();
+    // Device creation applies the RHIDeviceDesc stall settings. Zero disables a threshold.
+    void SetStallReports(std::chrono::milliseconds report, std::chrono::milliseconds fatal, bool captureStack);
 
     bool Dispatch(std::function<void()> task, std::function<void()> cancelled = {});
 
@@ -145,8 +149,7 @@ public:
     template <typename Function, typename... Args>
     RHIResult<std::invoke_result_t<Function, Args...>> InvokeChecked(Function&& function, Args&&... args)
     {
-        RHIWorkerTimer blocked(RHIWorkerTime::eCallerBlocked,
-                               RHIOptions::GetInstance().WorkerTimingEnabled() && !IsCurrentThread());
+        RHIWorkerTimer blocked(RHIWorkerTime::eCallerBlocked, !IsCurrentThread());
         using Value                                                 = std::invoke_result_t<Function, Args...>;
         using Result                                                = RHIResult<Value>;
         SharedPtr<std::promise<Result>, MultiThreadCounter> promise = MakeShared<std::promise<Result>, MultiThreadCounter>();
@@ -261,5 +264,4 @@ private:
     static thread_local RHIThread* s_current;
 };
 
-RHIThread& GetRHIThread();
 } // namespace zen

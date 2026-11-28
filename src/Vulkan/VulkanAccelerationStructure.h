@@ -4,14 +4,16 @@
 
 namespace zen
 {
+class VulkanRHI;
 class VulkanAccelerationStructure : public RHIAccelerationStructure
 {
 public:
-    static VulkanAccelerationStructure* CreateObject(const RHIAccelerationStructureCreateInfo& info);
+    static RHIResult<VulkanAccelerationStructure*> CreateObject(VulkanRHI*                                pRHI,
+                                                                const RHIAccelerationStructureCreateInfo& info);
 
-    static RHIAccelerationStructureBuildSizes GetBuildSizes(const RHIAccelerationStructureBuildDesc& desc);
+    static RHIAccelerationStructureBuildSizes GetBuildSizes(VulkanRHI& rhi, const RHIAccelerationStructureBuildDesc& desc);
 
-    static bool ValidateDescription(const RHIAccelerationStructureBuildDesc& desc, bool requireBuffers);
+    static bool ValidateDescription(VulkanRHI& rhi, const RHIAccelerationStructureBuildDesc& desc, bool requireBuffers);
 
     bool ValidateBuild(const RHIAccelerationStructureBuildInfo& info) const;
 
@@ -36,12 +38,16 @@ public:
     }
 
 protected:
-    void Init() override;
+    RHIError Init();
+
+    template <typename T, typename... Args> friend T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args);
 
     void Destroy() override;
 
 private:
-    explicit VulkanAccelerationStructure(const RHIAccelerationStructureCreateInfo& info);
+    VulkanAccelerationStructure(VulkanRHI* pRHI, const RHIAccelerationStructureCreateInfo& info);
+
+    VulkanRHI* m_pRHI{nullptr};
 
     bool IsUpdateCompatible(const RHIAccelerationStructureBuildDesc& desc) const;
 

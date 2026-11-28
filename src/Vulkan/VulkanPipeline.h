@@ -8,42 +8,12 @@
 #include "ZenFoundation/Utils/Helpers.h"
 #include "ZenRHI/RHIResource.h"
 #include "VulkanHeaders.h"
+#include "Vulkan/VulkanSetLayout.h"
 
 namespace zen
 {
-struct VulkanDescriptorPoolKey
-{
-    VulkanDescriptorPoolKey()                                           = default;
+class VulkanRHI;
 
-    uint32_t descriptorCount[ToUnderlying(RHIShaderResourceType::eMax)] = {};
-
-    bool operator==(const VulkanDescriptorPoolKey& other) const
-    {
-        return memcmp(descriptorCount, other.descriptorCount, sizeof(descriptorCount)) == 0;
-    }
-};
-} // namespace zen
-
-namespace std
-{
-template <> struct hash<zen::VulkanDescriptorPoolKey>
-{
-    size_t operator()(const zen::VulkanDescriptorPoolKey& key) const noexcept
-    {
-        size_t seed = 0;
-
-        for (uint32_t count : key.descriptorCount)
-        {
-            zen::util::HashCombine(seed, count);
-        }
-
-        return seed;
-    }
-};
-} // namespace std
-
-namespace zen
-{
 // Includes the actual global set even when the shader does not declare its runtime arrays.
 bool ShaderLayoutFitsLimits(const RHIShaderGroupInfo&                                 info,
                             const VkPhysicalDeviceLimits&                             limits,
@@ -51,26 +21,19 @@ bool ShaderLayoutFitsLimits(const RHIShaderGroupInfo&                           
                             const VkPhysicalDeviceAccelerationStructurePropertiesKHR& accelerationLimits,
                             const RHIBindlessHeapCapacities&                          globalCapacities);
 
-// maxDescriptorSets is the device's maxBoundDescriptorSets.
-bool ValidateShaderLayout(const RHIShaderGroupInfo& info, uint32_t maxDescriptorSets);
+// Fragment-stage resources plus color attachments, against maxPerStageResources and its update-after-bind limit.
+bool FragmentResourcesFitLimits(NameID                                              name,
+                                const RHIShaderResourceDescriptorTable&             table,
+                                uint64_t                                            globalImages,
+                                uint32_t                                            colorAttachmentCount,
+                                const VkPhysicalDeviceLimits&                       limits,
+                                const VkPhysicalDeviceDescriptorIndexingProperties& indexingLimits);
 
 class VulkanDevice;
 class VulkanShader : public RHIShader
 {
 public:
-    static VulkanShader* CreateObject(const RHIShaderCreateInfo& createInfo);
-
-    struct DynamicOffsetSlot
-    {
-        uint32_t binding{0};
-        uint32_t count{0};
-    };
-
-    std::span<const DynamicOffsetSlot> GetDynamicOffsetSlots(uint32_t set) const
-    {
-        return set < m_dynamicOffsetSlots.size() ? std::span<const DynamicOffsetSlot>(m_dynamicOffsetSlots[set])
-                                                 : std::span<const DynamicOffsetSlot>();
-    }
+    static RHIResult<VulkanShader*> CreateObject(VulkanRHI* pRHI, const RHIShaderCreateInfo& createInfo);
 
     uint32_t GetNumShaderStages() const
     {
@@ -87,14 +50,16 @@ public:
         return m_pipelineLayout;
     }
 
-    const VkDescriptorSetLayout* GetDescriptorSetLayoutData() const
-    {
-        return m_descriptorSetLayouts.data();
-    }
-
     uint32_t GetNumDescriptorSetLayouts() const
     {
-        return m_descriptorSetLayouts.size();
+        return m_setLayouts.size();
+    }
+
+    const VulkanSetLayout& GetSetLayout(uint32_t set) const
+    {
+        ZEN_RHI_VERIFY(set < m_setLayouts.size());
+
+        return *m_setLayouts[set];
     }
 
     VkShaderStageFlags GetPushConstantsStageFlags() const
@@ -107,39 +72,37 @@ public:
         return &m_vertexInputInfo.stateCI;
     }
 
-    const VulkanDescriptorPoolKey& GetDescriptorPoolKey(uint32_t setIdx) const
-    {
-        ZEN_RHI_VERIFY(setIdx < m_descriptorSetInfos.size());
-
-        return m_descriptorSetInfos[setIdx].poolKey;
-    }
-
-    uint32_t GetDescriptorSetLayoutId(uint32_t setIdx) const
-    {
-        return m_descriptorSetInfos[setIdx].layoutId;
-    }
-
-    VkDescriptorSetLayout GetDescriptorSetLayoutHandle(uint32_t setIdx) const
-    {
-        return m_descriptorSetLayouts[setIdx];
-    }
-
     bool HasGlobalBindlessSet() const
     {
         return m_hasGlobalBindlessSet;
     }
 
 protected:
-    void Init() override;
+    RHIError Init();
+
+    template <typename T, typename... Args> friend T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args);
 
     void Destroy() override;
 
 private:
-    VulkanShader(const RHIShaderCreateInfo& createInfo) : RHIShader(createInfo) {}
+    VulkanShader(VulkanRHI* pRHI, const RHIShaderCreateInfo& createInfo) : RHIShader(createInfo), m_pRHI(pRHI) {}
+
+    VulkanRHI* m_pRHI{nullptr};
 
 
 
-    void InitNativeObjects(const RHIShaderGroupInfo& sgInfo);
+    RHIError InitNativeObjects(const RHIShaderGroupInfo& sgInfo);
+
+    // False when an override's type differs from the reflected constant's.
+    bool ApplySpecializationOverrides(RHIShaderGroupInfo& sgInfo) const;
+
+    void BuildSpecializationInfo(std::span<const RHIShaderSpecializationConstant> constants);
+
+    bool CreateShaderModules();
+
+    void BuildVertexInput(const RHIShaderGroupInfo& sgInfo);
+
+    bool CreatePipelineLayout(const RHIShaderGroupInfo& sgInfo);
 
     struct VertexInputInfo
     {
@@ -153,34 +116,21 @@ private:
     VkShaderStageFlags                           m_pushConstantsStageFlags;
     SmallVector<VkPipelineShaderStageCreateInfo> m_stageCreateInfos;
 
-    struct DescriptorSetInfo
-    {
-        VulkanDescriptorPoolKey poolKey{};
-        uint32_t                layoutId{0};
-        bool                    ownsLayout{false};
-    };
-
-    SmallVector<DescriptorSetInfo, kInlineDescriptorSetCount> m_descriptorSetInfos;
-
-    SmallVector<VkDescriptorSetLayout, kInlineDescriptorSetCount> m_descriptorSetLayouts;
+    // Shared layouts, one per set; set 0 is the global heap's. Empty unless every set has one.
+    SmallVector<const VulkanSetLayout*, kInlineDescriptorSetCount> m_setLayouts;
 
     VkPipelineLayout m_pipelineLayout{VK_NULL_HANDLE};
     bool             m_hasGlobalBindlessSet{false};
-    // False when the reflected layout exceeds device descriptor limits; no native objects exist.
-    bool m_fitsDeviceLimits{false};
-
-    // One entry per descriptor set in the layout, sized from the reflected table.
-    SmallVector<SmallVector<DynamicOffsetSlot>, kInlineDescriptorSetCount> m_dynamicOffsetSlots;
 };
 
 class VulkanPipeline : public RHIPipeline
 {
 public:
-    static VulkanPipeline* CreateObject(const RHIGfxPipelineCreateInfo& createInfo);
+    static RHIResult<VulkanPipeline*> CreateObject(VulkanRHI* pRHI, const RHIGfxPipelineCreateInfo& createInfo);
 
-    static VulkanPipeline* CreateObject(const RHIComputePipelineCreateInfo& createInfo);
+    static RHIResult<VulkanPipeline*> CreateObject(VulkanRHI* pRHI, const RHIComputePipelineCreateInfo& createInfo);
 
-    static VulkanPipeline* CreateObject(const RHIRayTracingPipelineCreateInfo& createInfo);
+    static RHIResult<VulkanPipeline*> CreateObject(VulkanRHI* pRHI, const RHIRayTracingPipelineCreateInfo& createInfo);
 
     const std::array<VkStridedDeviceAddressRegionKHR, RHIShaderBindingTableLayout::Count>& GetShaderBindingTable() const
     {
@@ -209,33 +159,36 @@ public:
 
     VkShaderStageFlags GetPushConstantsStageFlags() const
     {
-        return m_pushConstantsStageFlags;
+        return static_cast<VulkanShader*>(m_pShader)->GetPushConstantsStageFlags();
     }
 
 protected:
-    void Init() override;
+    RHIError Init();
+
+    template <typename T, typename... Args> friend T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args);
 
     void Destroy() override;
 
 private:
-    VulkanPipeline(const RHIGfxPipelineCreateInfo& createInfo) : RHIPipeline(createInfo) {}
+    VulkanPipeline(VulkanRHI* pRHI, const RHIGfxPipelineCreateInfo& createInfo) : RHIPipeline(createInfo), m_pRHI(pRHI) {}
 
-    VulkanPipeline(const RHIComputePipelineCreateInfo& createInfo) : RHIPipeline(createInfo) {}
+    VulkanPipeline(VulkanRHI* pRHI, const RHIComputePipelineCreateInfo& createInfo) : RHIPipeline(createInfo), m_pRHI(pRHI) {}
 
-    VulkanPipeline(const RHIRayTracingPipelineCreateInfo& createInfo) : RHIPipeline(createInfo) {}
+    VulkanPipeline(VulkanRHI* pRHI, const RHIRayTracingPipelineCreateInfo& createInfo) : RHIPipeline(createInfo), m_pRHI(pRHI)
+    {}
 
-    void InitGraphics(const RHIRenderingLayout& layout);
+    VulkanRHI* m_pRHI{nullptr};
 
-    void InitCompute();
+    RHIError InitGraphics(const RHIRenderingLayout& layout);
 
-    void InitRayTracing(const RHIRayTracingPipelineCreateInfo& createInfo, const RHIShaderBindingTableLayout& layout);
+    RHIError InitCompute();
+
+    RHIError InitRayTracing(const RHIRayTracingPipelineCreateInfo& createInfo, const RHIShaderBindingTableLayout& layout);
 
     bool InitShaderBindingTable(std::span<const RHIRayTracingShaderGroup> groups, const RHIShaderBindingTableLayout& layout);
 
     VkPipeline          m_vkPipeline{VK_NULL_HANDLE};
     VkPipelineBindPoint m_bindPoint{VK_PIPELINE_BIND_POINT_GRAPHICS};
-    VkShaderStageFlags  m_pushConstantsStageFlags{0};
-    bool                m_initialized{false};
     // Immutable after creation, and retained with the pipeline through GPU retirement.
     RHIResourcePtr<RHIBuffer>                                                       m_shaderBindingTableBuffer;
     std::array<VkStridedDeviceAddressRegionKHR, RHIShaderBindingTableLayout::Count> m_shaderBindingTable{};

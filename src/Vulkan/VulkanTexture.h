@@ -5,14 +5,15 @@
 
 namespace zen
 {
-bool              IsTextureShapeValid(const RHITextureCreateInfo& info);
+class VulkanTextureView;
+class VulkanRHI;
 VkImageCreateInfo BuildImageCreateInfo(const RHITextureCreateInfo& info);
 float             ClampSamplerAnisotropy(float requested, float limit);
 
 class VulkanSampler : public RHISampler
 {
 public:
-    static VulkanSampler* CreateObject(const RHISamplerCreateInfo& createInfo);
+    static RHIResult<VulkanSampler*> CreateObject(VulkanRHI* pRHI, const RHISamplerCreateInfo& createInfo);
 
     VkSampler GetVkSampler() const
     {
@@ -20,12 +21,16 @@ public:
     }
 
 protected:
-    void Init() override;
+    RHIError Init();
+
+    template <typename T, typename... Args> friend T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args);
 
     void Destroy() override;
 
 private:
-    VulkanSampler(const RHISamplerCreateInfo& createInfo) : RHISampler(createInfo) {}
+    VulkanSampler(VulkanRHI* pRHI, const RHISamplerCreateInfo& createInfo) : RHISampler(createInfo), m_pRHI(pRHI) {}
+
+    VulkanRHI* m_pRHI{nullptr};
 
     VkSampler m_vkSampler{VK_NULL_HANDLE};
 };
@@ -33,7 +38,12 @@ private:
 class VulkanTexture : public RHITexture
 {
 public:
-    static VulkanTexture* CreateObject(const RHITextureCreateInfo& createInfo);
+    static RHIResult<VulkanTexture*> CreateObject(VulkanRHI* pRHI, const RHITextureCreateInfo& createInfo);
+
+    VulkanRHI* GetRHI() const
+    {
+        return m_pRHI;
+    }
 
     bool IsAsyncComputeAccessible() const override
     {
@@ -41,21 +51,6 @@ public:
     }
 
     RHITextureView* CreateView(const RHITextureViewCreateInfo& createInfo) override;
-
-    VkImageSubresourceRange GetVkSubresourceRange(uint32_t baseMipLevel,
-                                                  uint32_t levelCount,
-                                                  uint32_t baseArrayLayer,
-                                                  uint32_t layerCount) const
-    {
-        VkImageSubresourceRange range{};
-        range.aspectMask     = m_vkAspectFlags;
-        range.baseMipLevel   = baseMipLevel;
-        range.levelCount     = levelCount;
-        range.baseArrayLayer = baseArrayLayer;
-        range.layerCount     = layerCount;
-
-        return range;
-    }
 
     VkImageSubresourceRange GetVkSubresourceRange() const
     {
@@ -116,14 +111,18 @@ public:
     }
 
 protected:
-    void Init() override;
+    RHIError Init();
+
+    template <typename T, typename... Args> friend T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args);
 
     void Destroy() override;
 
 private:
-    explicit VulkanTexture(const RHITextureCreateInfo& createInfo) : RHITexture(createInfo) {}
+    VulkanTexture(VulkanRHI* pRHI, const RHITextureCreateInfo& createInfo) : RHITexture(createInfo), m_pRHI(pRHI) {}
 
-    RHITextureView* CreateViewOnRHIThread(const RHITextureViewCreateInfo& createInfo);
+    VulkanRHI* m_pRHI{nullptr};
+
+    RHIResult<VulkanTextureView*> CreateViewOnRHIThread(const RHITextureViewCreateInfo& createInfo);
 
     VkImage                m_vkImage{VK_NULL_HANDLE};
     VkImageCreateInfo      m_vkImageCI{};
@@ -136,7 +135,7 @@ private:
 class VulkanTextureView : public RHITextureView
 {
 public:
-    static VulkanTextureView* CreateObject(VulkanTexture* pTexture, const RHITextureViewCreateInfo& createInfo);
+    static RHIResult<VulkanTextureView*> CreateObject(VulkanTexture* pTexture, const RHITextureViewCreateInfo& createInfo);
 
     VkImageView GetVkImageView() const
     {
@@ -149,14 +148,18 @@ public:
     }
 
 protected:
-    void Init() override;
+    RHIError Init();
+
+    template <typename T, typename... Args> friend T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args);
 
     void Destroy() override;
 
 private:
     VulkanTextureView(VulkanTexture* pTexture, const RHITextureViewCreateInfo& createInfo) :
-        RHITextureView(pTexture, createInfo)
+        RHITextureView(pTexture, createInfo), m_pRHI(pTexture->GetRHI())
     {}
+
+    VulkanRHI* m_pRHI{nullptr};
 
     VkImageView     m_vkImageView{VK_NULL_HANDLE};
     VkImageViewType m_vkImageViewType{VK_IMAGE_VIEW_TYPE_MAX_ENUM};

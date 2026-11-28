@@ -1,33 +1,25 @@
 #pragma once
+#include "Vulkan/VulkanTranslatedBatch.h"
 #include <span>
 #include "ZenRHI/RHICommandList.h"
 #include "ZenFoundation/Templates/HeapVector.h"
 #include "VulkanExtension.h"
 #include "VulkanLifetimeTracker.h"
 #include "ZenFoundation/Memory/PagedAllocator.h"
-#include "ZenFoundation/Templates/HashMap.h"
 #include "ZenFoundation/Templates/ObjectPool.h"
-#include "ZenFoundation/Templates/VectorView.h"
 #include "ZenRHI/DynamicRHI.h"
 #include "ZenRHI/RHIGPUFrameTiming.h"
-#include "Vulkan/VulkanPlatformCommandList.h"
-#if defined(ZEN_MACOS)
-#    include "Platform/VulkanMacOSPlatform.h"
-#elif defined(ZEN_WIN32)
-#    include "Platform/VulkanWindowsPlatform.h"
-#endif
 
-#define ZEN_VK_API_VERSION VK_API_VERSION_1_2
 #define ZEN_VK_APP_VERSION VK_MAKE_API_VERSION(0, 1, 0, 0)
-#define ZEN_ENGINE_VERSION VK_MAKE_API_VERSION(0, 1, 0, 0)
 
 namespace zen
 {
 class VulkanDevice;
 class VulkanViewport;
-class VulkanDescriptorPoolManager2;
-class VulkanBindlessDescriptorPoolManager;
-class VulkanUniformBufferAllocator;
+class VulkanDescriptorAllocator;
+class VulkanSetLayoutCache;
+class VulkanBindlessHeap;
+class VulkanUniformRing;
 class VulkanShader;
 class VulkanTexture;
 class VulkanTextureView;
@@ -35,7 +27,6 @@ class VulkanBuffer;
 class VulkanAccelerationStructure;
 class VulkanSampler;
 class VulkanPipeline;
-class VulkanCommandBuffer;
 class VulkanMemoryAllocator;
 
 template <typename... RESOURCE_TYPES> struct VersatileResourceTemplate;
@@ -52,16 +43,11 @@ using VersatileResource = VersatileResourceTemplate<VulkanShader,
 class VulkanRHI : public DynamicRHI
 {
 public:
-    VulkanRHI();
-    void     CountValidationMessage(RHIMessageSeverity severity, std::string_view id);
-    uint64_t GetValidationCount(RHIMessageSeverity severity, std::string_view id) const;
+    explicit VulkanRHI(const RHIDeviceDesc& desc);
 
-    // Clears GVulkanRHI when it still points to this backend.
     ~VulkanRHI() override;
 
     IRHICommandContext* GetCommandContext(RHICommandContextType contextType) override;
-
-    IRHICommandContext* GetTransferCommandContext() override;
 
     RHIExecutionCounterStorage& GetExecutionCounterStorage()
     {
@@ -76,7 +62,6 @@ public:
     bool PrepareSubmissionDependencies(IRHICommandContext*                      context,
                                        std::span<const RHISubmissionDependency> dependencies) override;
 
-    void Init() override;
     bool IsInitialized() const
     {
         return m_initialized;
@@ -129,8 +114,6 @@ public:
 
     RHIShader* CreateShader(const RHIShaderCreateInfo& createInfo) final;
 
-    void DestroyShader(RHIShader* pShader) final;
-
     RHIPipeline* CreatePipeline(const RHIComputePipelineCreateInfo& createInfo) final;
 
     RHIPipeline* CreatePipeline(const RHIRayTracingPipelineCreateInfo& createInfo) final;
@@ -139,17 +122,11 @@ public:
 
     RHIError SnapshotPipelineCache(size_t byteLimit, std::vector<uint8_t>& bytes) override;
 
-    void DestroyPipeline(RHIPipeline* pPipeline) final;
-
     RHISampler* CreateSampler(const RHISamplerCreateInfo& createInfo) final;
-
-    void DestroySampler(RHISampler* pSampler) final;
 
     RHITexture* CreateTexture(const RHITextureCreateInfo& createInfo) final;
 
     RHITextureView* CreateTextureView(RHITexture* pBaseTexture, const RHITextureViewCreateInfo& createInfo) final;
-
-    void DestroyTexture(RHITexture* pTexture) final;
 
     RHIAccelerationStructureBuildSizes GetAccelerationStructureBuildSizes(
         const RHIAccelerationStructureBuildDesc& desc) override;
@@ -160,14 +137,13 @@ public:
 
     uint64_t GetBufferAllocationSize(const RHIBufferCreateInfo& createInfo) final;
 
-    void DestroyBuffer(RHIBuffer* pBuffer) final;
+    RHISubmissionResult SubmitCommandLists(std::span<RHICommandList*> lists) final;
 
-    RHIStatus FinalizeCommandLists(std::span<RHICommandList*>            cmdLists,
-                                   std::vector<RHIPlatformCommandList*>& outCommandLists) final;
+    // The two halves of SubmitCommandLists. Translation appends to batch and, on failure, discards only what this
+    // call added. Submission enqueues the batch, flushes every queue and consumes the batch.
+    RHIStatus TranslateCommandLists(std::span<RHICommandList*> lists, VulkanTranslatedBatch& batch);
 
-    void SubmitPlatformCommandLists(std::span<RHIPlatformCommandList*> commandLists) final;
-
-    RHISubmissionResult FlushAllGPUCommands() final;
+    RHISubmissionResult SubmitTranslated(VulkanTranslatedBatch& batch);
 
     void BlockSubmissions(RHIError error)
     {
@@ -221,17 +197,6 @@ public:
         m_submissionError = error;
     }
 
-    // Native object-creation failures stay separate from submission failures.
-    RHIError GetLastCreationError() const
-    {
-        return m_creationError;
-    }
-
-    void SetCreationError(RHIError error)
-    {
-        m_creationError = error;
-    }
-
     bool AreSubmissionsBlocked() const final
     {
         return m_submissionBlocked;
@@ -243,11 +208,32 @@ public:
 
     uint64_t QueryLastCompletedSerial(RHICommandContextType contextType) final;
 
-    bool WaitForCompletion(RHICommandContextType contextType, uint64_t submissionSerial, uint64_t timeoutNS = UINT64_MAX) final;
+    RHIWaitResult WaitForCompletion(RHICommandContextType contextType,
+                                    uint64_t              submissionSerial,
+                                    uint64_t              timeoutNS = UINT64_MAX) final;
 
     void WaitDeviceIdle() final;
 
     const RHIGPUInfo& QueryGPUInfo() const final;
+
+    const RHIDeviceDesc& GetDeviceDesc() const final
+    {
+        return m_desc;
+    }
+
+    RHIDeviceRuntime& GetRuntime() final
+    {
+        return *m_runtime;
+    }
+
+    uint64_t GetNativeObject(RHINativeObject object) const final;
+
+    // Blocks submissions and reports device diagnostics when result is VK_ERROR_DEVICE_LOST.
+    void CheckDeviceLoss(VkResult result, const char* operation);
+
+    // Checks a failed native object creation for device loss and returns it as an error. Creation failures
+    // stay separate from submission failures.
+    [[nodiscard]] RHIError ReportCreationFailure(VkResult result, const char* operation, const char* source, uint32_t line);
 
     RHIGPUMemoryStats GetGPUMemoryStats() const final;
 
@@ -260,14 +246,24 @@ public:
         return m_resourceAllocator;
     }
 
-    VulkanDescriptorPoolManager2* GetDescriptorPoolManager2() const
+    VulkanMemoryAllocator* GetMemoryAllocator() const
     {
-        return m_pDescriptorPoolManager2;
+        return m_pMemoryAllocator;
     }
 
-    VulkanBindlessDescriptorPoolManager* GetBindlessDescriptorPoolManager() const
+    VulkanDescriptorAllocator* GetDescriptorAllocator() const
     {
-        return m_pBindlessDescriptorPoolManager;
+        return m_pDescriptorAllocator;
+    }
+
+    VulkanBindlessHeap* GetBindlessHeap() const
+    {
+        return m_pBindlessHeap;
+    }
+
+    VulkanSetLayoutCache* GetSetLayoutCache() const
+    {
+        return m_pSetLayoutCache;
     }
 
     RHIBindlessHandle RegisterBindlessResource(RHIResource* pResource, uint32_t slotIndex = kInvalidBindlessSlotIndex) override;
@@ -280,9 +276,9 @@ public:
 
     bool ResetBindlessResources() override;
 
-    VulkanUniformBufferAllocator* GetUniformBufferAllocator() const
+    VulkanUniformRing* GetUniformRing() const
     {
-        return m_pUniformBufferAllocator;
+        return m_pUniformRing;
     }
 
     VulkanLifetimeTracker& GetLifetimeTracker()
@@ -300,11 +296,16 @@ protected:
     void     PopulateGPUInfo();
 
 private:
+    friend struct VulkanRHITestAccess;
+
+    RHIDeviceDesc              m_desc;
+    RHIDeviceRuntimePtr        m_runtime{MakeRefCountPtr<RHIDeviceRuntime>()};
+    RHIExecutionCounterStorage m_executionCounters;
+
     RHIError SetupInstanceLayers(VulkanInstanceExtensionArray& instanceExtensions);
 
     RHIError SetupInstanceExtensions(VulkanInstanceExtensionArray& instanceExtensions);
 
-    RHIExecutionCounterStorage m_executionCounters;
 
     void PopulateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& dbgMessengerCI);
 
@@ -312,20 +313,6 @@ private:
     VkResult          m_loaderResult{};
     bool              m_initialized{};
     VkLayerProperties m_validationLayer{};
-    struct ValidationMessageCount
-    {
-        RHIMessageSeverity severity;
-        std::string        id;
-        uint64_t           count;
-    };
-    mutable std::mutex                 m_validationMutex;
-    HeapVector<ValidationMessageCount> m_validationCounts;
-
-    VulkanPlatformCommandList* AcquirePlatformCommandList();
-
-    void ReleasePlatformCommandList(VulkanPlatformCommandList* pCommandList);
-
-    void DestroyPlatformCommandListPool();
 
     VkInstance               m_instance{VK_NULL_HANDLE};
     VkDebugUtilsMessengerEXT m_messenger{VK_NULL_HANDLE};
@@ -339,46 +326,24 @@ private:
 
     RHIGPUInfo m_gpuInfo{};
 
-    VulkanDescriptorPoolManager2*        m_pDescriptorPoolManager2{nullptr};
-    VulkanBindlessDescriptorPoolManager* m_pBindlessDescriptorPoolManager{nullptr};
-    VulkanUniformBufferAllocator*        m_pUniformBufferAllocator{nullptr};
+    VulkanDescriptorAllocator* m_pDescriptorAllocator{nullptr};
+    VulkanBindlessHeap*        m_pBindlessHeap{nullptr};
+    VulkanSetLayoutCache*      m_pSetLayoutCache{nullptr};
+    VulkanUniformRing*         m_pUniformRing{nullptr};
+    VulkanMemoryAllocator*     m_pMemoryAllocator{nullptr};
 
     PagedAllocator<VersatileResource> m_resourceAllocator;
 
-    ObjectPool<VulkanPlatformCommandList> m_platformCommandListPool;
+    VulkanTranslatedBatch m_translatedBatch; // Reused by SubmitCommandLists.
 
-    HeapVector<VulkanPlatformCommandList*> m_pendingPlatformCmdLists;
-    mutable std::mutex                     m_terminalMutex;
-    std::atomic<bool>                      m_submissionBlocked{false};
-    RHIError                               m_terminalError{};
-    RHIError                               m_submissionError{};
-    RHIError                               m_creationError{};
-    std::atomic<bool>                      m_deviceLost{false};
-    RHIGPUFrameTimingPtr                   m_gpuFrameTiming;
-    uint32_t                               m_pendingNativeRecordings{0};
-    VulkanLifetimeTracker                  m_lifetimeTracker;
+    mutable std::mutex    m_terminalMutex;
+    std::atomic<bool>     m_submissionBlocked{false};
+    RHIError              m_terminalError{};
+    RHIError              m_submissionError{};
+    std::atomic<bool>     m_deviceLost{false};
+    RHIGPUFrameTimingPtr  m_gpuFrameTiming;
+    uint32_t              m_pendingNativeRecordings{0};
+    VulkanLifetimeTracker m_lifetimeTracker;
 };
 
-class VulkanResourceFactory : public RHIResourceFactory
-{
-public:
-    RHIAccelerationStructure* CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info) override;
-
-    RHIBuffer* CreateBuffer(const RHIBufferCreateInfo& createInfo) final;
-
-    RHITexture* CreateTexture(const RHITextureCreateInfo& createInfo) final;
-
-    RHISampler* CreateSampler(const RHISamplerCreateInfo& createInfo) final;
-
-    RHIShader* CreateShader(const RHIShaderCreateInfo& createInfo) final;
-
-    RHIPipeline* CreatePipeline(const RHIComputePipelineCreateInfo& createInfo) final;
-
-    RHIPipeline* CreatePipeline(const RHIRayTracingPipelineCreateInfo& createInfo) final;
-
-    RHIPipeline* CreatePipeline(const RHIGfxPipelineCreateInfo& createInfo) final;
-};
-
-extern VulkanMemoryAllocator* GVkMemAllocator;
-extern VulkanRHI*             GVulkanRHI;
 } // namespace zen

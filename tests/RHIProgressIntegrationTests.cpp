@@ -1,6 +1,7 @@
 #include "ZenRHI/RHICommandListExecutor.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanRHI.h"
+#include "VulkanIntegrationFixture.h"
 #include <gtest/gtest.h>
 
 namespace
@@ -24,18 +25,9 @@ protected:
 
     void SetUp() override
     {
-        backend = static_cast<VulkanRHI*>(DynamicRHI::Create(RHIAPIType::eVulkan));
+        backend  = static_cast<VulkanRHI*>(CreateRHI(test::MakeTestDeviceDesc()));
 
-        if (!backend->GetDevice()->SupportsTimelineSemaphore())
-        {
-            GTEST_SKIP() << "Timeline semaphores are required for the progress injection";
-        }
-
-        executor    = ZEN_NEW() RHICommandListExecutor(backend, GetParam());
-
-        GDynamicRHI = executor;
-
-        GetRHIThread().Invoke(&RHIFrameState::Init, &GRHIFrameState, 3);
+        executor = ZEN_NEW() RHICommandListExecutor(backend, GetParam());
 
         RHIBufferCreateInfo info{};
 
@@ -55,14 +47,14 @@ protected:
 
         originalWait    = vkWaitSemaphores;
 
-        GetRHIThread().Invoke(&RHIProgressIntegrationTest::InstallCounter);
+        executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::InstallCounter);
     }
 
     void TearDown() override
     {
         if (executor != nullptr)
         {
-            GetRHIThread().Invoke(&RHIProgressIntegrationTest::RestoreFunctions, this);
+            executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::RestoreFunctions, this);
 
             executor->WaitDeviceIdle();
 
@@ -80,10 +72,6 @@ protected:
 
             ZEN_DELETE(backend);
         }
-
-        GDynamicRHI = nullptr;
-
-        GVulkanRHI  = nullptr;
     }
 
     static void InstallCounter()
@@ -114,7 +102,7 @@ protected:
     {
         const RHIBatchResult result = executor->SubmitFrame(*commands, nullptr).Wait();
 
-        GetRHIThread().Flush();
+        executor->GetRuntime().thread.Flush();
 
         EXPECT_EQ(result.submission, RHISubmissionResult::eSuccess);
 
@@ -127,7 +115,7 @@ protected:
 
     void CheckBlocked(uint64_t submittedSerial)
     {
-        EXPECT_TRUE(GetRHIThread().Invoke(&VulkanRHI::AreSubmissionsBlocked, backend));
+        EXPECT_TRUE(executor->GetRuntime().thread.Invoke(&VulkanRHI::AreSubmissionsBlocked, backend));
 
         EXPECT_TRUE(executor->AreSubmissionsBlocked());
 
@@ -154,7 +142,7 @@ TEST_P(RHIProgressIntegrationTest, CounterFailureDuringPollingBlocksSubmissions)
 {
     const RHIBatchResult result = SubmitPendingFrame();
 
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailCounter);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailCounter);
 
     if (GetParam() == RHIExecutionMode::eInline)
     {
@@ -165,7 +153,7 @@ TEST_P(RHIProgressIntegrationTest, CounterFailureDuringPollingBlocksSubmissions)
         executor->PollGPUProgress();
     }
 
-    GetRHIThread().Flush();
+    executor->GetRuntime().thread.Flush();
 
     CheckBlocked(result.requiredSerials.Get(RHICommandContextType::eGraphics));
 }
@@ -174,7 +162,7 @@ TEST_P(RHIProgressIntegrationTest, CounterFailureDuringFlushBlocksSubmissions)
 {
     const RHIBatchResult result = SubmitPendingFrame();
 
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailCounter);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailCounter);
 
     executor->FlushRHIThread();
 
@@ -185,7 +173,7 @@ TEST_P(RHIProgressIntegrationTest, WaitFailureBlocksSubmissions)
 {
     const RHIBatchResult result = SubmitPendingFrame();
 
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailWait);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailWait);
 
     EXPECT_FALSE(executor->WaitForCompletion(RHICommandContextType::eGraphics,
                                              result.requiredSerials.Get(RHICommandContextType::eGraphics), UINT64_MAX));
@@ -197,7 +185,7 @@ TEST_P(RHIProgressIntegrationTest, CounterFailureDuringRetirementBlocksSubmissio
 {
     const RHIBatchResult result = SubmitPendingFrame();
 
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailCounter);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailCounter);
 
     executor->CollectRetiredBindlessResources();
 
@@ -208,7 +196,7 @@ TEST_P(RHIProgressIntegrationTest, CounterFailureDuringSubmissionFailsFrameTicke
 {
     const RHIBatchResult first = SubmitPendingFrame();
 
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailCounter);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailCounter);
 
     commands->ClearBuffer(buffer, 0, 64);
 
@@ -221,7 +209,7 @@ TEST_P(RHIProgressIntegrationTest, CounterFailureDuringSubmissionFailsFrameTicke
 
 TEST_P(RHIProgressIntegrationTest, CounterFailureAfterSubmissionFailsFrameTicket)
 {
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailCounter);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailCounter);
 
     const RHICommandContextType queue     = RHICommandContextType::eGraphics;
 
@@ -272,7 +260,7 @@ TEST_P(RHIProgressIntegrationTest, ComputeProgressFailureRetainsSerialAndStopsDe
 
     groups[1].predecessors.push_back({queues[0], 0, state, 0});
 
-    GetRHIThread().Invoke(&RHIProgressIntegrationTest::FailCounter);
+    executor->GetRuntime().thread.Invoke(&RHIProgressIntegrationTest::FailCounter);
 
     const RHIBatchResult failed = executor->SubmitFrame(groups, nullptr, state).Wait();
 

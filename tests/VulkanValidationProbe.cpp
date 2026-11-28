@@ -9,8 +9,10 @@ namespace zen
 {
 TEST(VulkanValidationTest, OverlappingBufferClears)
 {
-    test::VulkanSession session;
-    RHIBufferCreateInfo desc{};
+    // Engine test mains install no counter; this probe counts under its own.
+    test::ScopedValidationCounter counting;
+    test::VulkanSession           session;
+    RHIBufferCreateInfo           desc{};
     desc.allocateType = RHIBufferAllocateType::eGPU;
     desc.size         = 64;
     desc.usageFlags.SetFlag(RHIBufferUsageFlagBits::eTransferDstBuffer);
@@ -33,9 +35,9 @@ TEST(VulkanValidationTest, OverlappingBufferClears)
         ASSERT_EQ(vkAllocateCommandBuffers(device, &allocate, &cmd), VK_SUCCESS);
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         ASSERT_EQ(vkBeginCommandBuffer(cmd, &begin), VK_SUCCESS);
-        const uint64_t before   = test::GetValidationCount(RHIMessageSeverity::eError);
-        const uint64_t warnings = test::GetValidationCount(RHIMessageSeverity::eWarning);
-        const uint64_t info     = test::GetValidationCount(RHIMessageSeverity::eInfo);
+        const uint64_t before   = test::ValidationCounter::Get().Count(RHIMessageSeverity::eError);
+        const uint64_t warnings = test::ValidationCounter::Get().Count(RHIMessageSeverity::eWarning);
+        const uint64_t info     = test::ValidationCounter::Get().Count(RHIMessageSeverity::eInfo);
         vkCmdFillBuffer(cmd, native, 0, 64, 1);
         if (corrected)
         {
@@ -47,10 +49,10 @@ TEST(VulkanValidationTest, OverlappingBufferClears)
         }
         vkCmdFillBuffer(cmd, native, 0, 64, 2);
         EXPECT_EQ(vkEndCommandBuffer(cmd), VK_SUCCESS);
-        EXPECT_EQ(test::GetValidationCount(RHIMessageSeverity::eError) - before, corrected ? 0u : 1u);
-        EXPECT_EQ(test::GetValidationCount(RHIMessageSeverity::eError, "SYNC-HAZARD-WRITE-AFTER-WRITE"), 1u);
-        EXPECT_EQ(test::GetValidationCount(RHIMessageSeverity::eWarning), warnings);
-        EXPECT_EQ(test::GetValidationCount(RHIMessageSeverity::eInfo), info);
+        EXPECT_EQ(test::ValidationCounter::Get().Count(RHIMessageSeverity::eError) - before, corrected ? 0u : 1u);
+        EXPECT_EQ(test::ValidationCounter::Get().Count(RHIMessageSeverity::eError, "SYNC-HAZARD-WRITE-AFTER-WRITE"), 1u);
+        EXPECT_EQ(test::ValidationCounter::Get().Count(RHIMessageSeverity::eWarning), warnings);
+        EXPECT_EQ(test::ValidationCounter::Get().Count(RHIMessageSeverity::eInfo), info);
         vkFreeCommandBuffers(device, pool, 1, &cmd);
     }
     vkDestroyCommandPool(device, pool, nullptr);

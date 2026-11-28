@@ -13,7 +13,7 @@
 
 #include "VulkanIntegrationFixture.h"
 
-// Intercept the Vulkan calls made by the actual queue, semaphore and fence implementations.
+// Intercept the Vulkan calls made by the actual queue and semaphore implementations.
 // No graphics device is needed, and a later submission stays pending until explicitly waited.
 
 namespace
@@ -36,13 +36,12 @@ template <typename T> struct ScopedVulkanFunction
 
 struct QueueDriver
 {
-    static inline uint64_t                              submitted{}, completed{}, nextFence{};
-    static inline VkResult                              waitResult{VK_SUCCESS};
-    static inline uint64_t                              submitCalls{}, failSubmitAt{};
-    static inline VkResult                              submitResult{VK_SUCCESS};
-    static inline VkResult                              statusResult{VK_SUCCESS};
-    static inline std::unordered_map<VkFence, uint64_t> fences;
-    static inline std::vector<uint64_t>                 waitedSerials, timeouts;
+    static inline uint64_t              submitted{}, completed{};
+    static inline VkResult              waitResult{VK_SUCCESS};
+    static inline uint64_t              submitCalls{}, failSubmitAt{};
+    static inline VkResult              submitResult{VK_SUCCESS};
+    static inline VkResult              statusResult{VK_SUCCESS};
+    static inline std::vector<uint64_t> waitedSerials, timeouts;
 
     static VKAPI_ATTR void VKAPI_CALL Properties(VkPhysicalDevice, VkPhysicalDeviceProperties* p)
     {
@@ -87,69 +86,7 @@ struct QueueDriver
         return waitResult;
     }
 
-    static VKAPI_ATTR VkResult VKAPI_CALL CreateFence(VkDevice,
-                                                      const VkFenceCreateInfo*,
-                                                      const VkAllocationCallbacks*,
-                                                      VkFence* fence)
-    {
-        *fence         = (VkFence)uintptr_t(++nextFence);
-
-        fences[*fence] = 0;
-
-        return VK_SUCCESS;
-    }
-
-    static VKAPI_ATTR void VKAPI_CALL DestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*)
-    {
-        fences.erase(fence);
-    }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL FenceStatus(VkDevice, VkFence fence)
-    {
-        VkResult result{};
-
-        if (statusResult != VK_SUCCESS)
-        {
-            result = statusResult;
-        }
-        else
-        {
-            result = fences[fence] != 0 && fences[fence] <= completed ? VK_SUCCESS : VK_NOT_READY;
-        }
-
-        return result;
-    }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL ResetFences(VkDevice, uint32_t count, const VkFence* handles)
-    {
-        for (uint32_t i = 0; i < count; ++i)
-        {
-            fences[handles[i]] = 0;
-        }
-
-        return VK_SUCCESS;
-    }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL
-    WaitFences(VkDevice, uint32_t count, const VkFence* handles, VkBool32, uint64_t timeout)
-    {
-        EXPECT_EQ(count, 1u);
-
-        const uint64_t serial = fences[handles[0]];
-
-        waitedSerials.push_back(serial);
-
-        timeouts.push_back(timeout);
-
-        if (waitResult == VK_SUCCESS)
-        {
-            completed = std::max(completed, serial);
-        }
-
-        return waitResult;
-    }
-
-    static VKAPI_ATTR VkResult VKAPI_CALL Submit(VkQueue, uint32_t count, const VkSubmitInfo* infos, VkFence fence)
+    static VKAPI_ATTR VkResult VKAPI_CALL Submit(VkQueue, uint32_t count, const VkSubmitInfo* infos, VkFence)
     {
         EXPECT_EQ(count, 1u);
 
@@ -163,21 +100,13 @@ struct QueueDriver
         {
             ++submitted;
 
-            if (fence != VK_NULL_HANDLE)
-            {
-                fences[fence] = submitted;
-            }
-            else
-            {
-                const VkTimelineSemaphoreSubmitInfo* timeline =
-                    static_cast<const VkTimelineSemaphoreSubmitInfo*>(infos[0].pNext);
+            const VkTimelineSemaphoreSubmitInfo* timeline = static_cast<const VkTimelineSemaphoreSubmitInfo*>(infos[0].pNext);
 
-                EXPECT_NE(timeline, nullptr);
+            EXPECT_NE(timeline, nullptr);
 
-                if (timeline != nullptr)
-                {
-                    EXPECT_EQ(timeline->pSignalSemaphoreValues[0], submitted);
-                }
+            if (timeline != nullptr)
+            {
+                EXPECT_EQ(timeline->pSignalSemaphoreValues[0], submitted);
             }
         }
 
@@ -185,14 +114,14 @@ struct QueueDriver
     }
 };
 
-class VulkanQueueWaitTest : public testing::TestWithParam<bool>
+class VulkanQueueWaitTest : public testing::Test
 {
 protected:
     static void CheckTimeout(zen::VulkanQueue& queue)
     {
         EXPECT_FALSE(queue.WaitForCompletion(2, 0));
 
-        EXPECT_FALSE(zen::GVulkanRHI->AreSubmissionsBlocked());
+        EXPECT_FALSE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
         QueueDriver::waitResult = VK_TIMEOUT;
 
@@ -200,7 +129,7 @@ protected:
 
         EXPECT_EQ(queue.GetLastCompletedSerial(), 0u);
 
-        EXPECT_FALSE(zen::GVulkanRHI->AreSubmissionsBlocked());
+        EXPECT_FALSE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
         ASSERT_EQ(QueueDriver::waitedSerials.size(), 1u);
 
@@ -229,7 +158,7 @@ protected:
 
         EXPECT_EQ(queue.GetLastCompletedSerial(), 1u);
 
-        EXPECT_TRUE(zen::GVulkanRHI->AreSubmissionsBlocked());
+        EXPECT_TRUE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
         EXPECT_EQ(QueueDriver::waitedSerials.size(), 2u);
 
@@ -259,7 +188,7 @@ protected:
 
         EXPECT_EQ(queue.GetLastSubmittedSerial(), 3u);
 
-        EXPECT_TRUE(zen::GVulkanRHI->AreSubmissionsBlocked());
+        EXPECT_TRUE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
         QueueDriver::statusResult = VK_SUCCESS;
 
@@ -288,7 +217,7 @@ protected:
 
         EXPECT_EQ(queue.SubmitPendingWorkloads(serial), zen::RHISubmissionResult::eFatal);
 
-        EXPECT_TRUE(zen::GVulkanRHI->AreSubmissionsBlocked());
+        EXPECT_TRUE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
         EXPECT_EQ(serial, 0u);
 
@@ -305,17 +234,15 @@ protected:
 
         VulkanDevice& device   = *session.rhi.GetDevice();
 
-        QueueDriver::submitted = QueueDriver::completed = QueueDriver::nextFence = 0;
+        QueueDriver::submitted = QueueDriver::completed = 0;
 
-        QueueDriver::waitResult                                                  = VK_SUCCESS;
+        QueueDriver::waitResult                         = VK_SUCCESS;
 
         QueueDriver::submitCalls = QueueDriver::failSubmitAt = 0;
 
         QueueDriver::submitResult                            = VK_SUCCESS;
 
         QueueDriver::statusResult                            = VK_SUCCESS;
-
-        QueueDriver::fences.clear();
 
         QueueDriver::waitedSerials.clear();
 
@@ -333,21 +260,7 @@ protected:
 
         ScopedVulkanFunction waitSemaphore(vkWaitSemaphores, &QueueDriver::WaitSemaphore);
 
-        ScopedVulkanFunction createFence(vkCreateFence, &QueueDriver::CreateFence);
-
-        ScopedVulkanFunction destroyFence(vkDestroyFence, &QueueDriver::DestroyFence);
-
-        ScopedVulkanFunction fenceStatus(vkGetFenceStatus, &QueueDriver::FenceStatus);
-
-        ScopedVulkanFunction resetFences(vkResetFences, &QueueDriver::ResetFences);
-
-        ScopedVulkanFunction waitFences(vkWaitForFences, &QueueDriver::WaitFences);
-
         ScopedVulkanFunction submit(vkQueueSubmit, &QueueDriver::Submit);
-
-        device.GetExtensionFlags().hasTimelineSemaphore = GetParam();
-
-        VulkanFenceManager& manager                     = *device.GetFenceManager();
 
         {
             VulkanQueue queue(&device, 0);
@@ -365,10 +278,6 @@ protected:
 
             callback(queue);
         }
-
-        manager.Destroy();
-
-        EXPECT_TRUE(QueueDriver::fences.empty());
     }
 };
 } // namespace
@@ -376,7 +285,7 @@ protected:
 static_assert(std::is_same_v<decltype(std::declval<zen::VulkanQueue>().GetLastSubmittedSerial()), uint64_t>);
 static_assert(std::is_same_v<decltype(std::declval<zen::VulkanQueue>().GetLastCompletedSerial()), uint64_t>);
 
-TEST_P(VulkanQueueWaitTest, StopsAtRequestedSerialAndDoesNotWaitDuringPolling)
+TEST_F(VulkanQueueWaitTest, StopsAtRequestedSerialAndDoesNotWaitDuringPolling)
 {
     WithQueue([](zen::VulkanQueue& queue) {
         EXPECT_TRUE(queue.WaitForCompletion(0, 0));
@@ -413,7 +322,7 @@ TEST_P(VulkanQueueWaitTest, StopsAtRequestedSerialAndDoesNotWaitDuringPolling)
     });
 }
 
-TEST_P(VulkanQueueWaitTest, BoundedWaitRetiresOnlyTheRequestedPrefix)
+TEST_F(VulkanQueueWaitTest, BoundedWaitRetiresOnlyTheRequestedPrefix)
 {
     WithQueue([](zen::VulkanQueue& queue) {
         QueueDriver::completed = 3;
@@ -424,68 +333,20 @@ TEST_P(VulkanQueueWaitTest, BoundedWaitRetiresOnlyTheRequestedPrefix)
     });
 }
 
-TEST(VulkanFencePoolTest, ReusedFenceMatchesItsRequestedNativeState)
-{
-    zen::test::VulkanSession session;
-    zen::VulkanDevice&       device  = *session.rhi.GetDevice();
-    zen::VulkanFenceManager& manager = *device.GetFenceManager();
-    zen::VulkanFence*        fence   = manager.CreateFence();
-    ASSERT_NE(fence, nullptr);
-    manager.ReleaseFence(fence);
-    fence = manager.CreateFence(true);
-    ASSERT_NE(fence, nullptr);
-    EXPECT_EQ(vkGetFenceStatus(device.GetVkHandle(), fence->GetVkHandle()), VK_SUCCESS);
-    manager.ReleaseFence(fence);
-}
-
-TEST(VulkanFencePoolTest, UnpolledGpuSignalIsResetBeforeReuse)
-{
-    zen::test::VulkanSession session;
-    zen::VulkanDevice&       device  = *session.rhi.GetDevice();
-    zen::VulkanFenceManager& manager = *device.GetFenceManager();
-    zen::VulkanFence*        fence   = manager.CreateFence();
-    ASSERT_NE(fence, nullptr);
-    ASSERT_EQ(vkQueueSubmit(device.GetGfxQueue()->GetVkHandle(), 0, nullptr, fence->GetVkHandle()), VK_SUCCESS);
-    ASSERT_EQ(vkDeviceWaitIdle(device.GetVkHandle()), VK_SUCCESS);
-    manager.ReleaseFence(fence);
-    fence = manager.CreateFence();
-    ASSERT_NE(fence, nullptr);
-    EXPECT_EQ(vkGetFenceStatus(device.GetVkHandle(), fence->GetVkHandle()), VK_NOT_READY);
-    manager.ReleaseFence(fence);
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL LoseFenceReset(VkDevice, uint32_t, const VkFence*)
-{
-    return VK_ERROR_DEVICE_LOST;
-}
-
-TEST(VulkanFencePoolTest, LostDeviceDuringResetDiscardsFence)
-{
-    zen::test::VulkanSession session;
-    zen::VulkanFenceManager& manager = *session.rhi.GetDevice()->GetFenceManager();
-    zen::VulkanFence*        fence   = manager.CreateFence(true);
-    ASSERT_NE(fence, nullptr);
-    ScopedVulkanFunction failure(vkResetFences, LoseFenceReset);
-    manager.ReleaseFence(fence);
-    EXPECT_TRUE(session.rhi.HasDeviceLoss());
-    EXPECT_EQ(session.rhi.GetTerminalError().code, zen::RHIErrorCode::eDeviceLost);
-}
-
-TEST_P(VulkanQueueWaitTest, TimeoutDoesNotBlockSubmissionsOrPublishCompletion)
+TEST_F(VulkanQueueWaitTest, TimeoutDoesNotBlockSubmissionsOrPublishCompletion)
 {
     WithQueue(&VulkanQueueWaitTest::CheckTimeout);
 }
 
-TEST_P(VulkanQueueWaitTest, WaitFailureBlocksSubmissionsPermanently)
+TEST_F(VulkanQueueWaitTest, WaitFailureBlocksSubmissionsPermanently)
 {
     WithQueue(&VulkanQueueWaitTest::CheckWaitFailure);
 }
 
-INSTANTIATE_TEST_SUITE_P(TimelineAndFence, VulkanQueueWaitTest, testing::Bool());
 
-TEST_P(VulkanQueueWaitTest, RejectedSubmissionDoesNotPublishSerialOrCompletionAndCanBeRebuilt)
+TEST_F(VulkanQueueWaitTest, RejectedSubmissionDoesNotPublishSerialOrCompletionAndCanBeRebuilt)
 {
-    WithQueue([timeline = GetParam()](zen::VulkanQueue& queue) {
+    WithQueue([](zen::VulkanQueue& queue) {
         using namespace zen;
 
         QueueDriver::failSubmitAt = QueueDriver::submitCalls + 1;
@@ -528,7 +389,7 @@ TEST_P(VulkanQueueWaitTest, RejectedSubmissionDoesNotPublishSerialOrCompletionAn
 
         EXPECT_EQ(queue.SubmitPendingWorkloads(serial), RHISubmissionResult::eSuccess);
 
-        EXPECT_EQ(serial, timeline ? 4u : 6u);
+        EXPECT_EQ(serial, 4u);
 
         EXPECT_TRUE(queue.WaitForCompletion(serial, UINT64_MAX));
 
@@ -536,12 +397,12 @@ TEST_P(VulkanQueueWaitTest, RejectedSubmissionDoesNotPublishSerialOrCompletionAn
     });
 }
 
-TEST_P(VulkanQueueWaitTest, FailedBatchRetainsOnlyItsAcceptedPrefix)
+TEST_F(VulkanQueueWaitTest, FailedBatchRetainsOnlyItsAcceptedPrefix)
 {
-    WithQueue([timeline = GetParam()](zen::VulkanQueue& queue) {
+    WithQueue([](zen::VulkanQueue& queue) {
         using namespace zen;
 
-        QueueDriver::failSubmitAt = QueueDriver::submitCalls + (timeline ? 1 : 2);
+        QueueDriver::failSubmitAt = QueueDriver::submitCalls + 1;
 
         QueueDriver::submitResult = VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -552,12 +413,11 @@ TEST_P(VulkanQueueWaitTest, FailedBatchRetainsOnlyItsAcceptedPrefix)
 
         uint64_t serial = 0;
 
-        EXPECT_EQ(queue.SubmitPendingWorkloads(serial),
-                  timeline ? RHISubmissionResult::eRejected : RHISubmissionResult::eFatal);
+        EXPECT_EQ(queue.SubmitPendingWorkloads(serial), RHISubmissionResult::eRejected);
 
-        EXPECT_EQ(serial, timeline ? 0u : 4u);
+        EXPECT_EQ(serial, 0u);
 
-        EXPECT_EQ(queue.GetLastSubmittedSerial(), timeline ? 3u : 4u);
+        EXPECT_EQ(queue.GetLastSubmittedSerial(), 3u);
 
         queue.DiscardPendingWorkloads();
 
@@ -567,7 +427,7 @@ TEST_P(VulkanQueueWaitTest, FailedBatchRetainsOnlyItsAcceptedPrefix)
     });
 }
 
-TEST_P(VulkanQueueWaitTest, DeviceLossDoesNotInventASubmissionSerial)
+TEST_F(VulkanQueueWaitTest, DeviceLossDoesNotInventASubmissionSerial)
 {
     WithQueue([](zen::VulkanQueue& queue) {
         using namespace zen;
@@ -593,13 +453,13 @@ TEST_P(VulkanQueueWaitTest, DeviceLossDoesNotInventASubmissionSerial)
         // Device loss is terminal even when the injection did not lose the real device.
         EXPECT_FALSE(queue.WaitForCompletion(3, UINT64_MAX));
 
-        EXPECT_TRUE(GVulkanRHI->AreSubmissionsBlocked());
+        EXPECT_TRUE(queue.GetDevice()->GetRHI()->AreSubmissionsBlocked());
 
         EXPECT_EQ(queue.GetLastCompletedSerial(), 0u);
     });
 }
 
-TEST_P(VulkanQueueWaitTest, FailedCompletionQueryCannotPublishReturnedGarbage)
+TEST_F(VulkanQueueWaitTest, FailedCompletionQueryCannotPublishReturnedGarbage)
 {
     for (VkResult failure : {VK_ERROR_DEVICE_LOST, VK_ERROR_OUT_OF_HOST_MEMORY})
     {
@@ -607,7 +467,7 @@ TEST_P(VulkanQueueWaitTest, FailedCompletionQueryCannotPublishReturnedGarbage)
     }
 }
 
-TEST_P(VulkanQueueWaitTest, CompletionQueryFailurePreventsNativeSubmission)
+TEST_F(VulkanQueueWaitTest, CompletionQueryFailurePreventsNativeSubmission)
 {
     WithQueue(&VulkanQueueWaitTest::CheckQueryFailureDuringSubmission);
 }

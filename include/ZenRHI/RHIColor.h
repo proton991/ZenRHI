@@ -1,5 +1,7 @@
 #pragma once
 
+namespace zen
+{
 struct Color
 {
     float r, g, b, a;
@@ -20,3 +22,4 @@ struct Color
         return !(*this == _b);
     }
 };
+} // namespace zen

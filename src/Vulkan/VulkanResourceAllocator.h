@@ -4,6 +4,7 @@
 #include "VulkanTexture.h"
 #include "VulkanPipeline.h"
 #include "VulkanViewport.h"
+#include "VulkanRHI.h"
 #include "ZenFoundation/Memory/PagedAllocator.h"
 
 namespace zen
@@ -17,13 +18,6 @@ template <typename... RESOURCE_TYPES> struct VersatileResourceTemplate
     static_assert(MAX_RESOURCE_SIZE % MAX_RESOURCE_ALIGNMENT == 0);
     alignas(RESOURCE_TYPES...) uint8_t data[MAX_RESOURCE_SIZE];
 
-    template <typename T> static T* Alloc(PagedAllocator<VersatileResourceTemplate>& allocator)
-    {
-        T* pMem = (T*)allocator.Alloc();
-        new (pMem) T;
-        return pMem;
-    }
-
     template <typename T> static T* AllocMem(PagedAllocator<VersatileResourceTemplate>& allocator)
     {
         T* pMem = (T*)allocator.Alloc();
@@ -35,4 +29,32 @@ template <typename... RESOURCE_TYPES> struct VersatileResourceTemplate
         p_allocator.Free((VersatileResourceTemplate*)pMem);
     }
 };
+
+// Allocates a resource from the device's resource pages, constructs it and binds it to the device runtime.
+template <typename T, typename... Args> T* NewVulkanResource(VulkanRHI* pRHI, Args&&... args)
+{
+    T* resource = VersatileResource::AllocMem<T>(pRHI->GetResourceAllocator());
+
+    new (resource) T(std::forward<Args>(args)...);
+
+    resource->BindRuntime(&pRHI->GetRuntime());
+
+    return resource;
+}
+
+// Keeps a resource whose initialisation succeeded; otherwise releases it and returns the error.
+template <typename T> RHIResult<T*> KeepIfInitialized(T* resource, const RHIError& error)
+{
+    if (error.IsFailure())
+    {
+        resource->ReleaseReference();
+    }
+
+    return error.IsFailure() ? RHIResult<T*>(error) : RHIResult<T*>(resource);
+}
+
+template <typename T> RHIResult<T*> RejectDescription(const char* rule, const char* source, uint32_t line)
+{
+    return RHIResult<T*>(MakeRHIError(RHIErrorCode::eInvalidArgument, rule, source, line));
+}
 } // namespace zen

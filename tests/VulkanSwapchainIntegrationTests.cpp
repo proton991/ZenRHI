@@ -2,13 +2,13 @@
 #include "VulkanIntegrationFixture.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "ZenFoundation/Templates/HeapVector.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanQueue.h"
 #include "Vulkan/VulkanSwapchain.h"
 #include "Vulkan/VulkanViewport.h"
-#include "Vulkan/Platform/VulkanPlatformCommon.h"
+#include "Vulkan/Platform/VulkanWindowBridge.h"
 #include "Vulkan/VulkanSynchronization.h"
 #include "NativeTestWindow.h"
 #include <gtest/gtest.h>
@@ -24,6 +24,7 @@ using namespace zen;
 // to the driver, optionally exposing extra image slots mapped to real images.
 struct WSIDriver
 {
+    static inline VkQueue                                       graphicsQueue{};
     static inline PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR capabilities;
     static inline PFN_vkGetPhysicalDeviceSurfaceSupportKHR      support;
     static inline PFN_vkGetPhysicalDeviceSurfaceFormatsKHR      formats;
@@ -331,7 +332,7 @@ struct WSIDriver
 
                 // Synthetic WSI still completes real acquire fences; no completion
                 // query is mocked into claiming an unsignaled fence has completed.
-                EXPECT_EQ(submit(GVulkanRHI->GetDevice()->GetGfxQueue()->GetVkHandle(), 0, nullptr, fence), VK_SUCCESS);
+                EXPECT_EQ(submit(graphicsQueue, 0, nullptr, fence), VK_SUCCESS);
 
                 returnValue = acquireResult;
             }
@@ -526,8 +527,7 @@ struct WSIDriver
             {
                 EXPECT_EQ(vkGetFenceStatus(device, heldPresentFence), VK_NOT_READY);
 
-                EXPECT_EQ(submit(GVulkanRHI->GetDevice()->GetGfxQueue()->GetVkHandle(), 0, nullptr, heldPresentFence),
-                          VK_SUCCESS);
+                EXPECT_EQ(submit(graphicsQueue, 0, nullptr, heldPresentFence), VK_SUCCESS);
 
                 heldPresentFence = VK_NULL_HANDLE;
             }
@@ -559,7 +559,7 @@ protected:
     std::unique_ptr<VulkanSwapchain>        swapchain;
     RHIViewport*                            viewport{};
     RHICommandList*                         commands{};
-    FVulkanCommandListContext*              context{};
+    VulkanCommandListContext*               context{};
     VkDebugUtilsMessengerEXT                messenger{};
     HeapVector<std::function<void()>>       restore;
 
@@ -574,9 +574,10 @@ protected:
 
     void SetUp() override
     {
-        session = std::make_unique<test::VulkanSession>();
+        session                  = std::make_unique<test::VulkanSession>();
+        WSIDriver::graphicsQueue = session->rhi.GetDevice()->GetGfxQueue()->GetVkHandle();
 
-        window  = std::make_unique<test::NativeTestWindow>(64, 64);
+        window                   = std::make_unique<test::NativeTestWindow>(64, 64);
         ASSERT_NE(window->GetHandle().window, nullptr);
 
         WSIDriver::Reset();
@@ -619,7 +620,7 @@ protected:
 
         info.pfnUserCallback = WSIDriver::Validation;
 
-        ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(GetVulkanDeviceHandles().instance, &info, nullptr, &messenger), VK_SUCCESS);
+        ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(session->rhi.GetInstance(), &info, nullptr, &messenger), VK_SUCCESS);
     }
 
     void TearDown() override
@@ -647,7 +648,7 @@ protected:
                 restore[i - 1]();
             }
 
-            vkDestroyDebugUtilsMessengerEXT(GetVulkanDeviceHandles().instance, messenger, nullptr);
+            vkDestroyDebugUtilsMessengerEXT(session->rhi.GetInstance(), messenger, nullptr);
 
             window.reset();
 
@@ -665,11 +666,24 @@ protected:
     {
         VulkanSwapchainRecreateInfo surfaceInfo;
 
-        RHIResult<VkSurfaceKHR> created = VulkanPlatform::CreateSurface(GetVulkanDeviceHandles().instance, window->GetHandle());
+        RHIResult<VkSurfaceKHR> created = CreateWindowSurface(session->rhi.GetInstance(), window->GetHandle());
         ASSERT_TRUE(created);
-        surfaceInfo.surface = created.GetValue();
+        surfaceInfo.surface = VulkanSurface(session->rhi.GetInstance(), created.GetValue());
 
-        swapchain           = std::make_unique<VulkanSwapchain>(64, 64, vsync, &surfaceInfo);
+        swapchain           = std::make_unique<VulkanSwapchain>(session->rhi.GetDevice(), 64, 64, vsync, &surfaceInfo);
+    }
+
+    // Presents, then recreates when the swapchain asks, as an inline host does between frames.
+    bool PresentFrame()
+    {
+        const bool presented = viewport->Present().presented;
+
+        if (viewport->NeedsRecreation() && viewport->GetWidth() != 0 && viewport->GetHeight() != 0)
+        {
+            viewport->Resize(viewport->GetWidth(), viewport->GetHeight());
+        }
+
+        return presented;
     }
 
     void CreateNativeViewport()
@@ -678,7 +692,7 @@ protected:
 
         viewport          = session->rhi.CreateViewport(window->GetHandle(), 64, 64, false);
 
-        context  = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        context  = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
         commands = RHICommandList::Create(context);
     }
@@ -698,17 +712,15 @@ protected:
 
         viewport->PrepareForPresent(commands);
 
-        std::vector<RHIPlatformCommandList*> platform;
+        VulkanTranslatedBatch platform;
 
         RHICommandList* lists[]    = {commands};
 
         RHISubmissionResult result = RHISubmissionResult::eRejected;
 
-        if (session->rhi.FinalizeCommandLists({lists, 1}, platform))
+        if (session->rhi.TranslateCommandLists({lists, 1}, platform))
         {
-            session->rhi.SubmitPlatformCommandLists(platform);
-
-            result = session->rhi.FlushAllGPUCommands();
+            result = session->rhi.SubmitTranslated(platform);
         }
         else
         {
@@ -748,7 +760,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NegotiatesFixedExtentUnlimitedCountTransf
 
     EXPECT_EQ(swapchain->GetExtent().width, 96u);
 
-    EXPECT_EQ(WSIDriver::lastCreate.minImageCount, std::max(2u, GRHIFrameState.GetNumFramesInFlight()));
+    EXPECT_EQ(WSIDriver::lastCreate.minImageCount, std::max(2u, session->rhi.GetRuntime().frameState.GetNumFramesInFlight()));
 
     EXPECT_EQ(WSIDriver::lastCreate.preTransform, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR);
 
@@ -822,17 +834,9 @@ TEST_F(VulkanSwapchainIntegrationTest, VSyncChoicesUseOnlyAdvertisedModes)
 
 TEST_F(VulkanSwapchainIntegrationTest, ExplicitPresentModeOverridesVSyncAndFallsBackToFifo)
 {
-    struct PresentModeGuard
-    {
-        ~PresentModeGuard()
-        {
-            RHIOptions::GetInstance().SetPresentMode(RHIPresentMode::eDefault);
-        }
-    } guard;
-
     WSIDriver::presentModes = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
 
-    RHIOptions::GetInstance().SetPresentMode(RHIPresentMode::eMailbox);
+    VulkanRHITestAccess::DeviceDesc(session->rhi).SetPresentMode(RHIPresentMode::eMailbox);
 
     Create(true);
 
@@ -840,7 +844,7 @@ TEST_F(VulkanSwapchainIntegrationTest, ExplicitPresentModeOverridesVSyncAndFalls
 
     swapchain->Destroy(nullptr);
 
-    RHIOptions::GetInstance().SetPresentMode(RHIPresentMode::eFifo);
+    VulkanRHITestAccess::DeviceDesc(session->rhi).SetPresentMode(RHIPresentMode::eFifo);
 
     Create(false);
 
@@ -849,7 +853,7 @@ TEST_F(VulkanSwapchainIntegrationTest, ExplicitPresentModeOverridesVSyncAndFalls
     swapchain->Destroy(nullptr);
 
     // FIFO_RELAXED is not advertised here.
-    RHIOptions::GetInstance().SetPresentMode(RHIPresentMode::eFifoRelaxed);
+    VulkanRHITestAccess::DeviceDesc(session->rhi).SetPresentMode(RHIPresentMode::eFifoRelaxed);
 
     Create(false);
 
@@ -859,7 +863,7 @@ TEST_F(VulkanSwapchainIntegrationTest, ExplicitPresentModeOverridesVSyncAndFalls
 
     WSIDriver::presentModes = {VK_PRESENT_MODE_FIFO_KHR};
 
-    RHIOptions::GetInstance().SetPresentMode(RHIPresentMode::eImmediate);
+    VulkanRHITestAccess::DeviceDesc(session->rhi).SetPresentMode(RHIPresentMode::eImmediate);
 
     Create(false);
 
@@ -1047,7 +1051,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeResizeRebuildsSemaphoresForGrowingA
         {
             ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-            ASSERT_TRUE(viewport->Present());
+            ASSERT_TRUE(PresentFrame());
 
             EXPECT_EQ(previous.count(WSIDriver::lastPresent), 0u);
         }
@@ -1064,56 +1068,45 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeRejectedSubmissionRetriesSameAcquis
 
     const VkSemaphore acquired = WSIDriver::lastAcquire;
 
-    EXPECT_FALSE(viewport->Present());
+    EXPECT_FALSE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::presentedCalls, 0u);
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::acquiredCalls, 1u);
 
     EXPECT_EQ(WSIDriver::lastAcquire, acquired);
 }
 
-class VulkanPresentationSubmissionTest : public VulkanSwapchainIntegrationTest, public testing::WithParamInterface<bool>
+class VulkanPresentationSubmissionTest : public VulkanSwapchainIntegrationTest
 {
 protected:
     void SetUp() override
     {
         VulkanSwapchainIntegrationTest::SetUp();
 
-        if (GetParam())
-        {
-            ASSERT_TRUE(session->rhi.GetDevice()->SupportsTimelineSemaphore());
-        }
-        else
-        {
-            session->rhi.GetDevice()->GetExtensionFlags().hasTimelineSemaphore = 0;
-        }
-
         WSIDriver::count = 0;
 
         CreateNativeViewport();
     }
 
-    void FinalizeRecording(std::vector<RHIPlatformCommandList*>& platform)
+    void FinalizeRecording(VulkanTranslatedBatch& platform)
     {
         RHICommandList* lists[] = {commands};
 
-        ASSERT_TRUE(session->rhi.FinalizeCommandLists({lists, 1}, platform));
+        ASSERT_TRUE(session->rhi.TranslateCommandLists({lists, 1}, platform));
     }
 
     RHISubmissionResult SubmitRecording()
     {
-        std::vector<RHIPlatformCommandList*> platform;
+        VulkanTranslatedBatch platform;
 
         FinalizeRecording(platform);
 
-        session->rhi.SubmitPlatformCommandLists(platform);
-
-        return session->rhi.FlushAllGPUCommands();
+        return session->rhi.SubmitTranslated(platform);
     }
 
     bool ExpectPresentationSkipped()
@@ -1132,7 +1125,7 @@ protected:
 
         bool presented = false;
 
-        presented      = viewport->Present();
+        presented      = PresentFrame();
 
         EXPECT_FALSE(presented);
 
@@ -1142,17 +1135,17 @@ protected:
     }
 };
 
-TEST_P(VulkanPresentationSubmissionTest, RejectedCopyAfterSuccessfulFramesRetainsAcquisition)
+TEST_F(VulkanPresentationSubmissionTest, RejectedCopyAfterSuccessfulFramesRetainsAcquisition)
 {
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    ASSERT_TRUE(viewport->Present());
+    ASSERT_TRUE(PresentFrame());
 
     for (uint32_t frame = 0; frame < 3; ++frame)
     {
         session->rhi.WaitDeviceIdle();
 
-        const uint64_t previousSerial = context->GetLastSubmittedSerial();
+        const uint64_t previousSerial = commands->GetSubmittedSerial();
 
         ASSERT_GT(previousSerial, 0u);
 
@@ -1162,7 +1155,7 @@ TEST_P(VulkanPresentationSubmissionTest, RejectedCopyAfterSuccessfulFramesRetain
 
         ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eRejected);
 
-        EXPECT_EQ(context->GetLastSubmittedSerial(), previousSerial);
+        EXPECT_EQ(commands->GetSubmittedSerial(), 0u);
 
         const VkSemaphore acquired   = WSIDriver::lastAcquire;
 
@@ -1175,7 +1168,7 @@ TEST_P(VulkanPresentationSubmissionTest, RejectedCopyAfterSuccessfulFramesRetain
 
         ASSERT_EQ(SubmitRecording(), RHISubmissionResult::eSuccess);
 
-        EXPECT_GT(context->GetLastSubmittedSerial(), previousSerial);
+        EXPECT_GT(commands->GetSubmittedSerial(), previousSerial);
 
         ASSERT_TRUE(ExpectPresentationSkipped());
 
@@ -1183,7 +1176,7 @@ TEST_P(VulkanPresentationSubmissionTest, RejectedCopyAfterSuccessfulFramesRetain
 
         ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-        ASSERT_TRUE(viewport->Present());
+        ASSERT_TRUE(PresentFrame());
 
         EXPECT_EQ(WSIDriver::acquiredCalls, acquiredCalls);
 
@@ -1193,57 +1186,46 @@ TEST_P(VulkanPresentationSubmissionTest, RejectedCopyAfterSuccessfulFramesRetain
     }
 }
 
-TEST_P(VulkanPresentationSubmissionTest, PreparedCopyIgnoresEarlierSubmissionOnReusedContext)
+TEST_F(VulkanPresentationSubmissionTest, PreparedCopyIgnoresEarlierSubmissionOnReusedContext)
 {
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    ASSERT_TRUE(viewport->Present());
+    ASSERT_TRUE(PresentFrame());
 
     session->rhi.WaitDeviceIdle();
 
-    const uint64_t previousSerial = context->GetLastSubmittedSerial();
+    const uint64_t previousSerial = commands->GetSubmittedSerial();
 
     context->GetCommandBuffer();
 
-    std::vector<RHIPlatformCommandList*> earlier;
+    VulkanTranslatedBatch earlier;
 
     FinalizeRecording(earlier);
 
     viewport->PrepareForPresent(commands);
 
-    // Preparing a new copy must not erase the context's earlier lifetime wait serial.
-    EXPECT_EQ(context->GetLastSubmittedSerial(), previousSerial);
-
-    std::vector<RHIPlatformCommandList*> copy;
+    VulkanTranslatedBatch copy;
 
     FinalizeRecording(copy);
 
-    session->rhi.SubmitPlatformCommandLists(earlier);
+    ASSERT_EQ(session->rhi.SubmitTranslated(earlier), RHISubmissionResult::eSuccess);
 
-    ASSERT_EQ(session->rhi.FlushAllGPUCommands(), RHISubmissionResult::eSuccess);
-
-    EXPECT_GT(context->GetLastSubmittedSerial(), previousSerial);
+    EXPECT_GT(commands->GetSubmittedSerial(), previousSerial);
 
     ASSERT_TRUE(ExpectPresentationSkipped());
 
-    session->rhi.SubmitPlatformCommandLists(copy);
+    ASSERT_EQ(session->rhi.SubmitTranslated(copy), RHISubmissionResult::eSuccess);
 
-    ASSERT_EQ(session->rhi.FlushAllGPUCommands(), RHISubmissionResult::eSuccess);
-
-    ASSERT_TRUE(viewport->Present());
+    ASSERT_TRUE(PresentFrame());
 }
 
-TEST_P(VulkanPresentationSubmissionTest, AcceptedCopySurvivesLaterRejectionAndContextDestruction)
+TEST_F(VulkanPresentationSubmissionTest, AcceptedCopySurvivesLaterRejectionAndContextDestruction)
 {
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    ASSERT_GT(context->GetLastSubmittedSerial(), 0u);
+    ASSERT_GT(commands->GetSubmittedSerial(), 0u);
 
     session->rhi.WaitDeviceIdle();
-
-    context->RHIWaitUntilCompleted();
-
-    EXPECT_EQ(context->GetLastSubmittedSerial(), 0u);
 
     // Completion recycles the copy's workload before the viewport reads its acceptance.
     context->GetCommandBuffer();
@@ -1252,7 +1234,7 @@ TEST_P(VulkanPresentationSubmissionTest, AcceptedCopySurvivesLaterRejectionAndCo
 
     ASSERT_EQ(SubmitRecording(), RHISubmissionResult::eRejected);
 
-    EXPECT_EQ(context->GetLastSubmittedSerial(), 0u);
+    EXPECT_EQ(commands->GetSubmittedSerial(), 0u);
 
     ZEN_DELETE(commands);
 
@@ -1260,20 +1242,20 @@ TEST_P(VulkanPresentationSubmissionTest, AcceptedCopySurvivesLaterRejectionAndCo
 
     context  = nullptr;
 
-    ASSERT_TRUE(viewport->Present());
+    ASSERT_TRUE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::presentedCalls, 1u);
 }
 
-TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSurvivesPoolReuse)
+TEST_F(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSurvivesPoolReuse)
 {
     VulkanQueue* pQueue              = context->GetQueue();
 
     VulkanSemaphoreManager* pManager = session->rhi.GetDevice()->GetSemaphoreManager();
 
-    VulkanSemaphore* first           = pManager->GetOrCreateSemaphore();
+    VulkanSemaphore* first           = pManager->CreateBinarySemaphore();
 
-    VulkanSemaphore* second          = pManager->GetOrCreateSemaphore();
+    VulkanSemaphore* second          = pManager->CreateBinarySemaphore();
 
     const uint64_t firstGeneration   = first->GetSignalGeneration();
 
@@ -1281,7 +1263,7 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSur
 
     const uint64_t beforeSubmission  = pQueue->GetLastSubmittedSerial();
 
-    std::vector<RHIPlatformCommandList*> platform;
+    VulkanTranslatedBatch platform;
 
     // The first workload has no signals; merging transfers the second's two signals to it.
     context->GetCommandBuffer();
@@ -1300,9 +1282,7 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSur
 
     EXPECT_EQ(second->GetSignalSubmissionSerial(pQueue, secondGeneration), 0u);
 
-    session->rhi.SubmitPlatformCommandLists(platform);
-
-    ASSERT_EQ(session->rhi.FlushAllGPUCommands(), RHISubmissionResult::eSuccess);
+    ASSERT_EQ(session->rhi.SubmitTranslated(platform), RHISubmissionResult::eSuccess);
 
     const uint64_t firstSerial  = first->GetSignalSubmissionSerial(pQueue, firstGeneration);
 
@@ -1312,9 +1292,9 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSur
 
     EXPECT_EQ(secondSerial, firstSerial);
 
-    EXPECT_EQ(secondSerial, context->GetLastSubmittedSerial());
+    EXPECT_EQ(secondSerial, commands->GetSubmittedSerial());
 
-    EXPECT_EQ(pQueue->GetLastSubmittedSerial() - beforeSubmission, GetParam() ? 1u : 2u);
+    EXPECT_EQ(pQueue->GetLastSubmittedSerial() - beforeSubmission, 1u);
 
     EXPECT_EQ(first->GetSignalGeneration(), firstGeneration + 1);
 
@@ -1328,7 +1308,7 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSur
 
     session->rhi.WaitDeviceIdle();
 
-    VulkanSemaphore* rejected         = pManager->GetOrCreateSemaphore();
+    VulkanSemaphore* rejected         = pManager->CreateBinarySemaphore();
 
     const uint64_t rejectedGeneration = rejected->GetSignalGeneration();
 
@@ -1344,7 +1324,7 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSur
 
     EXPECT_EQ(rejected->GetSignalGeneration(), rejectedGeneration);
 
-    VulkanSemaphore* replacement = pManager->GetOrCreateSemaphore();
+    VulkanSemaphore* replacement = pManager->CreateBinarySemaphore();
 
     for (uint32_t reuse = 0; reuse < 4; ++reuse)
     {
@@ -1382,74 +1362,15 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceFollowsMergedWorkAndSur
     }
 }
 
-TEST_P(VulkanPresentationSubmissionTest, RecycledSemaphoreDoesNotInheritSignalAcceptance)
-{
-    VulkanQueue* pQueue              = context->GetQueue();
-
-    VulkanSemaphoreManager* pManager = session->rhi.GetDevice()->GetSemaphoreManager();
-
-    VulkanSemaphore* semaphore       = pManager->GetOrCreateSemaphore();
-
-    const uint64_t initialGeneration = semaphore->GetSignalGeneration();
-
-    context->AddSignalSemaphore(semaphore);
-
-    ASSERT_EQ(SubmitRecording(), RHISubmissionResult::eSuccess);
-
-    const uint64_t firstSerial        = semaphore->GetSignalSubmissionSerial(pQueue, initialGeneration);
-
-    const uint64_t acceptedGeneration = semaphore->GetSignalGeneration();
-
-    ASSERT_GT(firstSerial, 0u);
-
-    context->AddWaitSemaphore(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, semaphore);
-
-    ASSERT_EQ(SubmitRecording(), RHISubmissionResult::eSuccess);
-
-    session->rhi.WaitDeviceIdle();
-
-    VulkanSemaphore* original = semaphore;
-
-    pManager->ReleaseSemaphore(semaphore);
-
-    EXPECT_EQ(semaphore, nullptr);
-
-    semaphore = pManager->GetOrCreateSemaphore();
-
-    ASSERT_EQ(semaphore, original);
-
-    EXPECT_EQ(semaphore->GetSignalGeneration(), acceptedGeneration);
-
-    EXPECT_EQ(semaphore->GetSignalSubmissionSerial(pQueue, initialGeneration), 0u);
-
-    context->AddSignalSemaphore(semaphore);
-
-    EXPECT_EQ(semaphore->GetSignalSubmissionSerial(pQueue, acceptedGeneration), 0u);
-
-    ASSERT_EQ(SubmitRecording(), RHISubmissionResult::eSuccess);
-
-    EXPECT_EQ(semaphore->GetSignalGeneration(), acceptedGeneration + 1);
-
-    EXPECT_GT(semaphore->GetSignalSubmissionSerial(pQueue, acceptedGeneration), firstSerial);
-
-    context->AddWaitSemaphore(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, semaphore);
-
-    ASSERT_EQ(SubmitRecording(), RHISubmissionResult::eSuccess);
-
-    session->rhi.WaitDeviceIdle();
-
-    pManager->ReleaseSemaphore(semaphore);
-}
-
-TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceRequiresTheSubmittingQueue)
+TEST_F(VulkanPresentationSubmissionTest, SignalAcceptanceRequiresTheSubmittingQueue)
 {
     VulkanDevice* pDevice      = session->rhi.GetDevice();
 
-    VulkanSemaphore* semaphore = pDevice->GetSemaphoreManager()->GetOrCreateSemaphore();
+    VulkanSemaphore* semaphore = pDevice->GetSemaphoreManager()->CreateBinarySemaphore();
 
     const uint64_t generation  = semaphore->GetSignalGeneration();
 
-    FVulkanCommandListContext compute(RHICommandContextType::eAsyncCompute, pDevice);
+    VulkanCommandListContext compute(RHICommandContextType::eAsyncCompute, pDevice);
 
     compute.AddSignalSemaphore(semaphore);
 
@@ -1470,10 +1391,9 @@ TEST_P(VulkanPresentationSubmissionTest, SignalAcceptanceRequiresTheSubmittingQu
 
     session->rhi.WaitDeviceIdle();
 
-    pDevice->GetSemaphoreManager()->ReleaseSemaphore(semaphore);
+    pDevice->GetSemaphoreManager()->DestroySemaphore(semaphore);
 }
 
-INSTANTIATE_TEST_SUITE_P(TimelineAndFence, VulkanPresentationSubmissionTest, testing::Bool());
 
 TEST_F(VulkanSwapchainIntegrationTest, NativeAcquireTimeoutKeepsSwapchainAndMinimizeSuspendsAcquisition)
 {
@@ -1485,7 +1405,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeAcquireTimeoutKeepsSwapchainAndMini
 
     viewport->PrepareForPresent(commands);
 
-    EXPECT_FALSE(viewport->Present());
+    EXPECT_FALSE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::createdCalls, creations);
 
@@ -1495,7 +1415,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeAcquireTimeoutKeepsSwapchainAndMini
 
     viewport->PrepareForPresent(commands);
 
-    EXPECT_FALSE(viewport->Present());
+    EXPECT_FALSE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::acquiredCalls, 1u);
 
@@ -1503,7 +1423,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeAcquireTimeoutKeepsSwapchainAndMini
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 }
 
 TEST_F(VulkanSwapchainIntegrationTest, NativeSurfaceLossReplacesSurfaceAndOutOfDateReusesIt)
@@ -1516,7 +1436,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeSurfaceLossReplacesSurfaceAndOutOfD
 
         viewport->PrepareForPresent(commands);
 
-        EXPECT_FALSE(viewport->Present());
+        EXPECT_FALSE(PresentFrame());
 
         if (result == VK_ERROR_SURFACE_LOST_KHR)
         {
@@ -1531,7 +1451,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeSurfaceLossReplacesSurfaceAndOutOfD
 
         ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-        EXPECT_TRUE(viewport->Present());
+        EXPECT_TRUE(PresentFrame());
     }
 
     EXPECT_EQ(WSIDriver::createdCalls, 3u);
@@ -1547,7 +1467,7 @@ TEST_F(VulkanSwapchainIntegrationTest, CheckedPresentDefersBackbufferReplacement
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    const RHIPresentResult presented = viewport->PresentChecked();
+    const RHIPresentResult presented = viewport->Present();
 
     EXPECT_TRUE(presented.presented);
 
@@ -1572,7 +1492,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativePresentSuboptimalRecreatesAfterCons
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::createdCalls, 2u);
 
@@ -1580,7 +1500,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativePresentSuboptimalRecreatesAfterCons
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 }
 
 TEST_F(VulkanSwapchainIntegrationTest, NativePresentOutOfDateAndSurfaceLossRecreateTheCorrectObjects)
@@ -1593,7 +1513,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativePresentOutOfDateAndSurfaceLossRecre
 
         ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-        EXPECT_FALSE(viewport->Present());
+        EXPECT_FALSE(PresentFrame());
 
         if (result == VK_ERROR_SURFACE_LOST_KHR)
         {
@@ -1609,7 +1529,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativePresentOutOfDateAndSurfaceLossRecre
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 }
 
 TEST_F(VulkanSwapchainIntegrationTest, FailedViewportCreationCleansUpAndAllowsRetry)
@@ -1628,7 +1548,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FailedViewportCreationCleansUpAndAllowsRe
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 }
 
 TEST_F(VulkanSwapchainIntegrationTest, NativeMinimizeAfterRejectedSubmissionPreservesAcquisition)
@@ -1645,7 +1565,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeMinimizeAfterRejectedSubmissionPres
 
     viewport->PrepareForPresent(commands);
 
-    EXPECT_FALSE(viewport->Present());
+    EXPECT_FALSE(PresentFrame());
 
     EXPECT_EQ(WSIDriver::acquiredCalls, 1u);
 
@@ -1653,7 +1573,7 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeMinimizeAfterRejectedSubmissionPres
 
     ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-    EXPECT_TRUE(viewport->Present());
+    EXPECT_TRUE(PresentFrame());
 
     // Vulkan may reuse a destroyed native handle for the replacement semaphore.
     EXPECT_GT(WSIDriver::semaphoreDestructions, destroyedBeforeResize);
@@ -1665,11 +1585,11 @@ TEST_F(VulkanSwapchainIntegrationTest, NativeDeviceLossBlocksFurtherPresentation
 
     WSIDriver::acquireResult = VK_ERROR_DEVICE_LOST;
 
-    EXPECT_FALSE(viewport->PrepareForPresentChecked(commands));
+    EXPECT_FALSE(viewport->PrepareForPresent(commands));
 
     EXPECT_TRUE(session->rhi.AreSubmissionsBlocked());
 
-    EXPECT_EQ(viewport->PresentChecked().outcome, RHISurfaceOutcome::eFailed);
+    EXPECT_EQ(viewport->Present().outcome, RHISurfaceOutcome::eFailed);
 
     viewport->Resize(128, 128);
 
@@ -1817,7 +1737,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FallbackDefersConsecutiveRetirementsUntil
 
         EXPECT_EQ(WSIDriver::liveSemaphores.size(), generation + 1u);
 
-        swapchain = std::make_unique<VulkanSwapchain>(64, 64, false, &recreate);
+        swapchain = std::make_unique<VulkanSwapchain>(session->rhi.GetDevice(), 64, 64, false, &recreate);
 
         EXPECT_EQ(WSIDriver::destroyedCalls, 0u);
     }
@@ -1866,7 +1786,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FallbackCreationFailureCleansRetiredPrede
 
     WSIDriver::createResult = VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    VulkanSwapchain failed(64, 64, false, &recreate);
+    VulkanSwapchain failed(session->rhi.GetDevice(), 64, 64, false, &recreate);
 
     EXPECT_FALSE(failed.GetStatus());
 
@@ -1878,7 +1798,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FallbackCreationFailureCleansRetiredPrede
 
     EXPECT_EQ(recreate.swapchain, VK_NULL_HANDLE);
 
-    EXPECT_EQ(recreate.surface, VK_NULL_HANDLE);
+    EXPECT_EQ(recreate.surface.Get(), VK_NULL_HANDLE);
 
     EXPECT_TRUE(recreate.retiredSwapchains.empty());
 }
@@ -1923,7 +1843,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FallbackZeroExtentPreservesOldSwapchainLi
 
     WSIDriver::caps.currentExtent = {0, 0};
 
-    swapchain                     = std::make_unique<VulkanSwapchain>(64, 64, false, &recreate);
+    swapchain                     = std::make_unique<VulkanSwapchain>(session->rhi.GetDevice(), 64, 64, false, &recreate);
 
     EXPECT_EQ(swapchain->GetNumSwapchainImages(), 0u);
 
@@ -1935,7 +1855,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FallbackZeroExtentPreservesOldSwapchainLi
 
     WSIDriver::caps.currentExtent = {64, 64};
 
-    swapchain                     = std::make_unique<VulkanSwapchain>(64, 64, false, &recreate);
+    swapchain                     = std::make_unique<VulkanSwapchain>(session->rhi.GetDevice(), 64, 64, false, &recreate);
 
     EXPECT_EQ(WSIDriver::lastCreate.oldSwapchain, oldSwapchain);
 
@@ -1968,7 +1888,7 @@ TEST_F(VulkanSwapchainIntegrationTest, FallbackZeroExtentTeardownDestroysSharedO
 
     WSIDriver::caps.currentExtent = {0, 0};
 
-    swapchain                     = std::make_unique<VulkanSwapchain>(64, 64, false, &recreate);
+    swapchain                     = std::make_unique<VulkanSwapchain>(session->rhi.GetDevice(), 64, 64, false, &recreate);
 
     swapchain->Destroy(nullptr);
 
@@ -2042,14 +1962,14 @@ TEST_P(VulkanSwapchainRetirementIntegrationTest, NativeResizeChurnReturnsToStabl
         {
             ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-            ASSERT_TRUE(viewport->Present());
+            ASSERT_TRUE(PresentFrame());
         }
 
         session->rhi.WaitDeviceIdle();
 
         ASSERT_EQ(RenderAndSubmit(), RHISubmissionResult::eSuccess);
 
-        ASSERT_TRUE(viewport->Present());
+        ASSERT_TRUE(PresentFrame());
 
         EXPECT_EQ(WSIDriver::liveSemaphores.size(), expectedSemaphores) << iteration;
 

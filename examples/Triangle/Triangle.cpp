@@ -4,9 +4,6 @@
 #include <SDL3/SDL_vulkan.h>
 #include <cstdio>
 #include <fstream>
-#if defined(_WIN32)
-#    include <windows.h>
-#endif
 
 namespace
 {
@@ -18,14 +15,12 @@ std::span<const char* const> WindowExtensions()
     return {names, count};
 }
 
-#if !defined(_WIN32)
 VkResult MakeSurface(VkInstance instance, void* window, VkSurfaceKHR* surface)
 {
     return SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(window), instance, nullptr, surface)
              ? VK_SUCCESS
              : VK_ERROR_INITIALIZATION_FAILED;
 }
-#endif
 
 bool LoadStage(RHIShaderCreateInfo& info, RHIShaderStage stage, const char* path)
 {
@@ -61,7 +56,7 @@ bool DrawTriangle(RHICommandListExecutor& device, RHIViewport& viewport)
     info.pShader              = shader;
     info.pRenderingLayout     = &layout;
     info.states.primitiveType = RHIDrawPrimitiveType::eTriangleList;
-    info.states.dynamicStates.Enable(RHIDynamicState::eScissor, RHIDynamicState::eViewPort);
+    info.states.dynamicStates.Enable(RHIDynamicState::eScissor, RHIDynamicState::eViewport);
     info.states.colorBlendState.AddAttachment();
     RHIPipeline* pipeline = shader ? device.CreatePipeline(info) : nullptr;
     success               = pipeline != nullptr;
@@ -72,11 +67,11 @@ bool DrawTriangle(RHICommandListExecutor& device, RHIViewport& viewport)
         commands->BeginRendering(&layout);
         commands->SetViewport(0, 0, viewport.GetWidth(), viewport.GetHeight());
         commands->SetScissor(0, 0, viewport.GetWidth(), viewport.GetHeight());
-        commands->BindPipeline(RHIPipelineType::eGraphics, pipeline);
+        commands->BindPipeline(pipeline);
         commands->Draw(3, 1, 0, 0);
         commands->EndRendering();
         const RHIBatchResult result = device.SubmitFrame(*commands, &viewport).Wait();
-        success                     = result.submission == RHISubmissionResult::eSuccess && result.presented;
+        success                     = result.submission == RHISubmissionResult::eSuccess && result.presentation.presented;
         device.WaitDeviceIdle();
         device.DestroyPipeline(pipeline);
     }
@@ -91,18 +86,11 @@ bool Render(SDL_Window* window)
 {
     RHIDeviceDesc description;
     description.surfaceExtensions = WindowExtensions;
-    RHICommandListExecutor device(CreateRHI(description), RHIExecutionMode::eThreaded);
-#if defined(_WIN32)
-    const SDL_PropertiesID properties = SDL_GetWindowProperties(window);
-    const RHIWindowHandle  handle{RHIWindowType::eWin32,
-                                  SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr),
-                                  GetModuleHandle(nullptr)};
-#else
+    RHICommandListExecutor      device(CreateRHI(description), RHIExecutionMode::eThreaded);
     const VulkanSurfaceProvider provider{MakeSurface, nullptr};
-    const RHIWindowHandle       handle{RHIWindowType::eCustom, window, nullptr, &provider};
-#endif
-    RHIViewport* viewport = device.CreateViewport(handle, 640, 480, true);
-    bool         success  = viewport && viewport->GetColorBackBuffer() && DrawTriangle(device, *viewport);
+    const RHIWindowHandle       handle{window, &provider};
+    RHIViewport*                viewport = device.CreateViewport(handle, 640, 480, true);
+    bool                        success  = viewport && viewport->GetColorBackBuffer() && DrawTriangle(device, *viewport);
     if (viewport)
     {
         device.DestroyViewport(viewport);

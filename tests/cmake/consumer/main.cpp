@@ -35,7 +35,7 @@ int main(int argc, char** argv)
         }
         zen::RHIResult<zen::DynamicRHI*> failure = zen::CreateRHIChecked(desc);
         _putenv_s(setting, saved.c_str());
-        if (failure || !failure.GetError().operation || zen::GetVulkanDeviceHandles().device || GDynamicRHI
+        if (failure || !failure.GetError().operation
             || (unsupported && failure.GetError().code != zen::RHIErrorCode::eUnsupported)
             || (!unsupported && failure.GetError().nativeCode != VK_ERROR_LAYER_NOT_PRESENT))
         {

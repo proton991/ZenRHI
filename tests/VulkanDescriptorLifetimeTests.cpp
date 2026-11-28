@@ -1,5 +1,6 @@
 #include "VulkanIntegrationFixture.h"
 #include "Vulkan/VulkanCommandList.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanSynchronization.h"
 #include <gtest/gtest.h>
@@ -38,7 +39,6 @@ struct DescriptorDriver
     static inline VkResult                                              submitResult;
     static inline std::unordered_map<VkQueue, uint64_t>                 submitted, completed;
     static inline std::unordered_map<VkSemaphore, Submission>           semaphores;
-    static inline std::unordered_map<VkFence, Submission>               fences;
     static inline std::unordered_map<VkDescriptorSet, VkDescriptorPool> owners;
     static inline std::unordered_set<VkDescriptorSet>                   freedSets;
     static inline std::unordered_set<VkDescriptorPool>                  destroyedPools;
@@ -55,7 +55,6 @@ struct DescriptorDriver
 
         semaphores.clear();
 
-        fences.clear();
 
         owners.clear();
 
@@ -150,37 +149,7 @@ struct DescriptorDriver
 
         return VK_SUCCESS;
     }
-    static VKAPI_ATTR VkResult VKAPI_CALL CreateFence(VkDevice,
-                                                      const VkFenceCreateInfo*,
-                                                      const VkAllocationCallbacks*,
-                                                      VkFence* fence)
-    {
-        *fence         = reinterpret_cast<VkFence>(nextHandle++);
-
-        fences[*fence] = {};
-
-        return VK_SUCCESS;
-    }
-    static VKAPI_ATTR void VKAPI_CALL DestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*)
-    {
-        fences.erase(fence);
-    }
-    static VKAPI_ATTR VkResult VKAPI_CALL FenceStatus(VkDevice, VkFence fence)
-    {
-        const Submission submission = fences[fence];
-
-        return submission.serial != 0 && completed[submission.queue] >= submission.serial ? VK_SUCCESS : VK_NOT_READY;
-    }
-    static VKAPI_ATTR VkResult VKAPI_CALL ResetFences(VkDevice, uint32_t count, const VkFence* handles)
-    {
-        for (uint32_t i = 0; i < count; ++i)
-        {
-            fences[handles[i]] = {};
-        }
-
-        return VK_SUCCESS;
-    }
-    static VKAPI_ATTR VkResult VKAPI_CALL Submit(VkQueue queue, uint32_t count, const VkSubmitInfo* infos, VkFence fence)
+    static VKAPI_ATTR VkResult VKAPI_CALL Submit(VkQueue queue, uint32_t count, const VkSubmitInfo* infos, VkFence)
     {
         VkResult returnValue{};
 
@@ -193,11 +162,6 @@ struct DescriptorDriver
             for (uint32_t i = 0; i < count; ++i)
             {
                 const uint64_t serial = ++submitted[queue];
-
-                if (fence != VK_NULL_HANDLE)
-                {
-                    fences[fence] = {queue, serial};
-                }
 
                 if (infos[i].pNext != nullptr)
                 {
@@ -220,7 +184,7 @@ struct DescriptorDriver
     }
 };
 
-class VulkanDescriptorLifetimeTest : public testing::TestWithParam<bool>
+class VulkanDescriptorLifetimeTest : public testing::Test
 {
 protected:
     template <typename Callback> void WithDevice(Callback callback)
@@ -251,39 +215,32 @@ protected:
 
         ScopedFunction counter(vkGetSemaphoreCounterValue, &DescriptorDriver::Counter);
 
-        ScopedFunction createFence(vkCreateFence, &DescriptorDriver::CreateFence);
-
-        ScopedFunction destroyFence(vkDestroyFence, &DescriptorDriver::DestroyFence);
-
-        ScopedFunction fenceStatus(vkGetFenceStatus, &DescriptorDriver::FenceStatus);
-
-        ScopedFunction resetFences(vkResetFences, &DescriptorDriver::ResetFences);
-
         ScopedFunction submit(vkQueueSubmit, &DescriptorDriver::Submit);
 
-        device.GetExtensionFlags().hasTimelineSemaphore = GetParam();
-
-        VulkanDescriptorPoolManager2 manager(&device);
-
-        callback(device, manager);
-
-        manager.Destroy();
-
-        // Drain the public fence manager before restoring the intercepted native calls.
-        device.GetFenceManager()->Destroy();
-
-        EXPECT_TRUE(DescriptorDriver::fences.empty());
+        callback(device);
 
         EXPECT_TRUE(DescriptorDriver::semaphores.empty());
     }
 
-    static VkDescriptorSet Allocate(VulkanDescriptorPoolSetContainer* container)
+    // One set per arena, so every insert after the first starts an arena.
+    static VulkanDescriptorAllocator::Set Insert(VulkanDescriptorAllocator& allocator, uint64_t content)
     {
-        VulkanDescriptorPoolKey key{};
+        VulkanSetLayout layout{};
 
-        key.descriptorCount[ToUnderlying(RHIShaderResourceType::eStorageBuffer)] = 1;
+        layout.handle = reinterpret_cast<VkDescriptorSetLayout>(uintptr_t(1));
 
-        return container->Allocate(key, reinterpret_cast<VkDescriptorSetLayout>(uintptr_t(1)));
+        layout.poolKey.descriptorCount[ToUnderlying(RHIShaderResourceType::eStorageBuffer)] = 1;
+
+        return allocator.Insert({1, {content}}, layout, {});
+    }
+
+    // The ring holds three arenas, so three more arenas retire the oldest one.
+    static void RetireOldestArena(VulkanDescriptorAllocator& allocator)
+    {
+        for (uint64_t content = 100; content < 103; ++content)
+        {
+            Insert(allocator, content);
+        }
     }
 
     static void Enqueue(VulkanCommandContextBase& context, VulkanQueue& queue)
@@ -299,24 +256,24 @@ protected:
     }
 };
 
-TEST_P(VulkanDescriptorLifetimeTest, RetiredPoolSurvivesRecordingAndPendingSubmission)
+TEST_F(VulkanDescriptorLifetimeTest, RetiredPoolSurvivesRecordingAndPendingSubmission)
 {
-    WithDevice([](VulkanDevice& device, VulkanDescriptorPoolManager2& manager) {
+    WithDevice([](VulkanDevice& device) {
         VulkanQueue queue(&device, 0);
 
-        VulkanCommandContextBase context(&queue, VulkanCommandBufferType::ePrimary);
+        VulkanCommandContextBase context(&queue);
 
-        VulkanDescriptorPoolSetContainer* container = manager.AcquireDescriptorPoolSetContainer();
+        VulkanDescriptorAllocator allocator(&device, 1);
 
-        VkDescriptorSet first                       = Allocate(container);
+        const VulkanDescriptorAllocator::Set first = Insert(allocator, 0);
 
-        context.RecordDescriptorPool(container);
+        context.RecordLifetime(first.lifetimeId);
 
-        manager.ReleaseContainer(container);
+        RetireOldestArena(allocator);
 
-        manager.BeginFrame(10);
+        allocator.BeginFrame();
 
-        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first.handle));
 
         Enqueue(context, queue);
 
@@ -326,44 +283,44 @@ TEST_P(VulkanDescriptorLifetimeTest, RetiredPoolSurvivesRecordingAndPendingSubmi
 
         queue.ProcessPendingWorkloads(0);
 
-        manager.BeginFrame(20);
+        allocator.BeginFrame();
 
         EXPECT_EQ(queue.GetLastCompletedSerial(), 0u);
 
-        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first.handle));
 
         DescriptorDriver::Complete(0);
 
         queue.ProcessPendingWorkloads(0);
 
-        manager.BeginFrame(21);
+        allocator.BeginFrame();
 
         EXPECT_EQ(queue.GetLastCompletedSerial(), serial);
 
-        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first.handle));
     });
 }
 
-TEST_P(VulkanDescriptorLifetimeTest, SharedPoolWaitsForBothQueuesAndDeduplicatesRepeatedRetention)
+TEST_F(VulkanDescriptorLifetimeTest, SharedPoolWaitsForBothQueuesAndDeduplicatesRepeatedRetention)
 {
-    WithDevice([](VulkanDevice& device, VulkanDescriptorPoolManager2& manager) {
+    WithDevice([](VulkanDevice& device) {
         VulkanQueue firstQueue(&device, 0), secondQueue(&device, 1);
 
-        VulkanCommandContextBase firstContext(&firstQueue, VulkanCommandBufferType::ePrimary);
+        VulkanCommandContextBase firstContext(&firstQueue);
 
-        VulkanCommandContextBase secondContext(&secondQueue, VulkanCommandBufferType::ePrimary);
+        VulkanCommandContextBase secondContext(&secondQueue);
 
-        VulkanDescriptorPoolSetContainer* container = manager.AcquireDescriptorPoolSetContainer();
+        VulkanDescriptorAllocator allocator(&device, 1);
 
-        VkDescriptorSet first                       = Allocate(container);
+        const VulkanDescriptorAllocator::Set first = Insert(allocator, 0);
 
-        firstContext.RecordDescriptorPool(container);
+        firstContext.RecordLifetime(first.lifetimeId);
 
-        firstContext.RecordDescriptorPool(container);
+        firstContext.RecordLifetime(first.lifetimeId);
 
-        secondContext.RecordDescriptorPool(container);
+        secondContext.RecordLifetime(first.lifetimeId);
 
-        manager.ReleaseContainer(container);
+        RetireOldestArena(allocator);
 
         Enqueue(firstContext, firstQueue);
 
@@ -381,72 +338,72 @@ TEST_P(VulkanDescriptorLifetimeTest, SharedPoolWaitsForBothQueuesAndDeduplicates
 
         secondQueue.ProcessPendingWorkloads(0);
 
-        manager.BeginFrame(1);
+        allocator.BeginFrame();
 
-        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first.handle));
 
         DescriptorDriver::Complete(1);
 
         secondQueue.ProcessPendingWorkloads(0);
 
-        manager.BeginFrame(2);
+        allocator.BeginFrame();
 
-        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first.handle));
     });
 }
 
-TEST_P(VulkanDescriptorLifetimeTest, BatchCompletionReleasesMergedChildOwnership)
+TEST_F(VulkanDescriptorLifetimeTest, BatchCompletionReleasesMergedChildOwnership)
 {
-    WithDevice([](VulkanDevice& device, VulkanDescriptorPoolManager2& manager) {
+    WithDevice([](VulkanDevice& device) {
         VulkanQueue queue(&device, 0);
 
-        VulkanDescriptorPoolSetContainer* container = manager.AcquireDescriptorPoolSetContainer();
+        VulkanDescriptorAllocator allocator(&device, 1);
 
-        VkDescriptorSet first                       = Allocate(container);
+        const VulkanDescriptorAllocator::Set first = Insert(allocator, 0);
 
         for (int i = 0; i < 3; ++i)
         {
-            VulkanCommandContextBase context(&queue, VulkanCommandBufferType::ePrimary);
+            VulkanCommandContextBase context(&queue);
 
-            context.RecordDescriptorPool(container);
+            context.RecordLifetime(first.lifetimeId);
 
             Enqueue(context, queue);
         }
 
-        manager.ReleaseContainer(container);
+        RetireOldestArena(allocator);
 
         uint64_t serial = 0;
 
         ASSERT_EQ(queue.SubmitPendingWorkloads(serial), RHISubmissionResult::eSuccess);
 
-        manager.BeginFrame(1);
+        allocator.BeginFrame();
 
-        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first.handle));
 
         DescriptorDriver::Complete(0);
 
         queue.ProcessPendingWorkloads(0);
 
-        manager.BeginFrame(2);
+        allocator.BeginFrame();
 
-        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first.handle));
     });
 }
 
-TEST_P(VulkanDescriptorLifetimeTest, DefiniteRejectionReleasesPoolOnlyWhenDiscarded)
+TEST_F(VulkanDescriptorLifetimeTest, DefiniteRejectionReleasesPoolOnlyWhenDiscarded)
 {
-    WithDevice([](VulkanDevice& device, VulkanDescriptorPoolManager2& manager) {
+    WithDevice([](VulkanDevice& device) {
         VulkanQueue queue(&device, 0);
 
-        VulkanCommandContextBase context(&queue, VulkanCommandBufferType::ePrimary);
+        VulkanCommandContextBase context(&queue);
 
-        VulkanDescriptorPoolSetContainer* container = manager.AcquireDescriptorPoolSetContainer();
+        VulkanDescriptorAllocator allocator(&device, 1);
 
-        VkDescriptorSet first                       = Allocate(container);
+        const VulkanDescriptorAllocator::Set first = Insert(allocator, 0);
 
-        context.RecordDescriptorPool(container);
+        context.RecordLifetime(first.lifetimeId);
 
-        manager.ReleaseContainer(container);
+        RetireOldestArena(allocator);
 
         Enqueue(context, queue);
 
@@ -456,51 +413,55 @@ TEST_P(VulkanDescriptorLifetimeTest, DefiniteRejectionReleasesPoolOnlyWhenDiscar
 
         EXPECT_EQ(queue.SubmitPendingWorkloads(serial), RHISubmissionResult::eRejected);
 
-        manager.BeginFrame(1);
+        allocator.BeginFrame();
 
-        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_FALSE(DescriptorDriver::freedSets.contains(first.handle));
 
         queue.DiscardPendingWorkloads();
 
-        manager.BeginFrame(2);
+        allocator.BeginFrame();
 
-        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first));
+        EXPECT_TRUE(DescriptorDriver::freedSets.contains(first.handle));
     });
 }
 
-TEST_P(VulkanDescriptorLifetimeTest, UncertainSubmissionKeepsPoolsThroughManagerShutdown)
+TEST_F(VulkanDescriptorLifetimeTest, UncertainSubmissionKeepsPoolsThroughAllocatorShutdown)
 {
-    WithDevice([](VulkanDevice& device, VulkanDescriptorPoolManager2& manager) {
+    WithDevice([](VulkanDevice& device) {
         VkDescriptorPool pool;
 
         {
             VulkanQueue queue(&device, 0);
 
-            VulkanCommandContextBase context(&queue, VulkanCommandBufferType::ePrimary);
+            VulkanCommandContextBase context(&queue);
 
-            VulkanDescriptorPoolSetContainer* container = manager.AcquireDescriptorPoolSetContainer();
+            VkDescriptorSet first = VK_NULL_HANDLE;
 
-            VkDescriptorSet first                       = Allocate(container);
+            {
+                VulkanDescriptorAllocator allocator(&device, 1);
 
-            pool                                        = DescriptorDriver::owners[first];
+                const VulkanDescriptorAllocator::Set set = Insert(allocator, 0);
 
-            context.RecordDescriptorPool(container);
+                first                                    = set.handle;
 
-            manager.ReleaseContainer(container);
+                pool                                     = DescriptorDriver::owners[first];
 
-            Enqueue(context, queue);
+                context.RecordLifetime(set.lifetimeId);
 
-            DescriptorDriver::submitResult = VK_ERROR_DEVICE_LOST;
+                RetireOldestArena(allocator);
 
-            uint64_t serial                = 0;
+                Enqueue(context, queue);
 
-            EXPECT_EQ(queue.SubmitPendingWorkloads(serial), RHISubmissionResult::eFatal);
+                DescriptorDriver::submitResult = VK_ERROR_DEVICE_LOST;
 
-            queue.DiscardPendingWorkloads(true);
+                uint64_t serial                = 0;
 
-            manager.BeginFrame(1);
+                EXPECT_EQ(queue.SubmitPendingWorkloads(serial), RHISubmissionResult::eFatal);
 
-            manager.Destroy();
+                queue.DiscardPendingWorkloads(true);
+
+                allocator.BeginFrame();
+            }
 
             EXPECT_FALSE(DescriptorDriver::freedSets.contains(first));
 
@@ -511,5 +472,4 @@ TEST_P(VulkanDescriptorLifetimeTest, UncertainSubmissionKeepsPoolsThroughManager
     });
 }
 
-INSTANTIATE_TEST_SUITE_P(TimelineAndFence, VulkanDescriptorLifetimeTest, testing::Bool());
 } // namespace

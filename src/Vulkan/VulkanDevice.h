@@ -1,56 +1,43 @@
 #pragma once
 #include "VulkanHeaders.h"
+#include "Vulkan/VulkanExtension.h"
 #include "ZenRHI/RHICommandList.h"
 #include "ZenFoundation/Utils/UniquePtr.h"
 #include "ZenFoundation/Utils/Mutex.h"
 #include "ZenFoundation/Templates/HeapVector.h"
+#include <array>
 #include <string>
 
 namespace zen
 {
+class RHIDeviceDesc;
 class VulkanRHI;
-class VulkanDeviceExtension;
 class VulkanQueue;
-class VulkanFenceManager;
 class VulkanSemaphoreManager;
-class FVulkanCommandBuffer;
+class VulkanCommandBuffer;
 
-struct DeviceExtensionFlags
+// Queue families that share a resource without ownership transfers.
+struct VulkanQueueSharing
 {
-    uint32_t hasBufferDeviceAddress      : 1;
-    uint32_t hasAccelerationStructure    : 1;
-    uint32_t hasRaytracingPipeline       : 1;
-    uint32_t hasTraceRaysIndirect        : 1;
-    uint32_t hasInvocationReorderEXT     : 1;
-    uint32_t hasInvocationReorderNV      : 1;
-    uint32_t hasRayQuery                 : 1;
-    uint32_t hasOpacityMicromap          : 1;
-    uint32_t hasDescriptorIndexing       : 1;
-    uint32_t hasTimelineSemaphore        : 1;
-    uint32_t hasHostQueryReset           : 1;
-
-    uint32_t hasDeferredHostOperation    : 1;
-    uint32_t hasSPIRV_14                 : 1;
-    uint32_t hasDynamicRendering         : 1;
-    uint32_t hasSwapchainMaintenance1    : 1;
-    uint32_t hasCalibratedTimestamps     : 1;
-    uint32_t hasMemoryBudget             : 1;
-    uint32_t hasBufferInt64Atomics       : 1;
-    uint32_t hasSamplerMirrorClampToEdge : 1;
-    uint32_t hasDeviceFault              : 1;
-    uint32_t hasBufferMarker             : 1;
-    uint32_t hasPipelineExecutableInfo   : 1;
+    std::array<uint32_t, 3> families{};
+    uint32_t                count{0};
 };
 
 class VulkanDevice
 {
 public:
-    explicit VulkanDevice(VkPhysicalDevice gpu);
+    // pRHI owns the device; standalone capability probes may pass null.
+    VulkanDevice(VulkanRHI* pRHI, VkPhysicalDevice gpu);
+
+    VulkanRHI* GetRHI() const
+    {
+        return m_pRHI;
+    }
 
     // Empty means the device satisfies the backend's minimum capability profile.
-    static std::string GetUnsupportedReason(VkPhysicalDevice gpu, RHIError* error = nullptr);
+    // Why the GPU cannot host a device created from desc; empty when it can.
+    static std::string GetUnsupportedReason(VkPhysicalDevice gpu, const RHIDeviceDesc& desc, RHIError* error = nullptr);
 
-    void     Init();
     RHIError InitChecked();
 
     void Destroy();
@@ -58,9 +45,9 @@ public:
     // Drain retained queue ownership while allocators and descriptor managers still exist.
     void DestroyQueues();
 
-    void RegisterDiagnosticBuffer(FVulkanCommandBuffer* buffer);
+    void RegisterDiagnosticBuffer(VulkanCommandBuffer* buffer);
 
-    void UnregisterDiagnosticBuffer(FVulkanCommandBuffer* buffer);
+    void UnregisterDiagnosticBuffer(VulkanCommandBuffer* buffer);
 
     void ReportDeviceLoss(const char* operation);
 
@@ -107,14 +94,9 @@ public:
     }
 
 
-    VulkanFenceManager* GetFenceManager() const
-    {
-        return m_pFenceManager;
-    }
-
     VulkanSemaphoreManager* GetSemaphoreManager() const
     {
-        return m_pSemaphoreManger;
+        return m_pSemaphoreManager;
     }
 
     VulkanQueue* GetGfxQueue() const
@@ -130,6 +112,12 @@ public:
     VulkanQueue* GetTransferQueue() const
     {
         return m_pTransferQueue;
+    }
+
+    // Graphics and compute, plus the transfer family for resources with transfer usage. Fixed with the queues.
+    const VulkanQueueSharing& GetQueueSharing(bool transferUsage) const
+    {
+        return m_queueSharing[transferUsage ? 1 : 0];
     }
 
     RHIQueueCapabilities GetQueueCapabilities() const;
@@ -165,39 +153,35 @@ public:
 
     const VkPhysicalDeviceFeatures& GetPhysicalDeviceFeatures()
     {
-        return m_physicalDeviceFeatures;
+        return m_enabledFeatures;
     }
 
-    bool SupportsTimelineSemaphore() const
-    {
-        return m_extensionFlags.hasTimelineSemaphore != 0;
-    }
 
     void WaitForIdle();
 
 private:
     RHIError InitializeSupportedDevice();
-    RHIError SetupDevice(HeapVector<UniquePtr<VulkanDeviceExtension>>& extensions);
+    RHIError SetupDevice(VulkanDeviceExtensionSelection& selection);
 
+    VulkanRHI*       m_pRHI{nullptr};
     VkPhysicalDevice m_gpu{VK_NULL_HANDLE};
 
     // gpu hardware properties
     VkPhysicalDeviceProperties m_gpuProps{};
 
     // logical device
-    VkDevice                          m_device{VK_NULL_HANDLE};
-    VkPipelineCache                   m_pipelineCache{VK_NULL_HANDLE};
-    Mutex                             m_timingPoolMutex;
-    HeapVector<VkQueryPool>           m_timingPools;
-    HeapVector<VkQueryPool>           m_freeTimingPools;
-    HeapVector<FVulkanCommandBuffer*> m_diagnosticBuffers;
-    bool                              m_faultReported{false};
+    VkDevice                         m_device{VK_NULL_HANDLE};
+    VkPipelineCache                  m_pipelineCache{VK_NULL_HANDLE};
+    Mutex                            m_timingPoolMutex;
+    HeapVector<VkQueryPool>          m_timingPools;
+    HeapVector<VkQueryPool>          m_freeTimingPools;
+    HeapVector<VulkanCommandBuffer*> m_diagnosticBuffers;
+    bool                             m_faultReported{false};
 
     // basic features
-    VkPhysicalDeviceFeatures m_physicalDeviceFeatures{};
-
-    // gpu properties
-    VkPhysicalDeviceProperties m_physicalDeviceProperties{};
+    // What the GPU reports, and what this device enabled; capability queries read the enabled set.
+    VkPhysicalDeviceFeatures m_supportedFeatures{};
+    VkPhysicalDeviceFeatures m_enabledFeatures{};
 
     // descriptor indexing properties
     VkPhysicalDeviceDescriptorIndexingProperties       m_descriptorIndexingProperties{};
@@ -214,7 +198,8 @@ private:
     VulkanQueue* m_pComputeQueue{nullptr};
     VulkanQueue* m_pTransferQueue{nullptr};
 
-    VulkanFenceManager*     m_pFenceManager{nullptr};
-    VulkanSemaphoreManager* m_pSemaphoreManger{nullptr};
+    std::array<VulkanQueueSharing, 2> m_queueSharing{};
+
+    VulkanSemaphoreManager* m_pSemaphoreManager{nullptr};
 };
 } // namespace zen

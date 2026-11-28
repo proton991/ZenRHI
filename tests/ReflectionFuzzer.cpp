@@ -34,7 +34,7 @@ zen::RHIShaderStage InputStage(std::span<const uint8_t> data)
     return stage;
 }
 
-void IgnoreShaderDiagnostic(zen::RHIMessageSeverity, std::string_view) noexcept {}
+void IgnoreShaderDiagnostic(const zen::RHIMessage& diagnostic) noexcept {}
 } // namespace
 
 extern "C" int LLVMFuzzerInitialize(int*, char***)

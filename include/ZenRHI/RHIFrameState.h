@@ -56,14 +56,7 @@ public:
         return m_timeline.GetNumFramesInFlight();
     }
 
-    uint64_t NumFramesSince(Number frame) const
-    {
-        return m_timeline.NumFramesSince(frame);
-    }
-
 private:
     TFrameTimeline<RHIFrameState> m_timeline;
 };
 } // namespace zen
-
-extern zen::RHIFrameState GRHIFrameState;

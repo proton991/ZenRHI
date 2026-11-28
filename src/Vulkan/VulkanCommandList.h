@@ -3,36 +3,26 @@
 #include <span>
 #include "VulkanQueue.h"
 #include "VulkanRHI.h"
-#include "Vulkan/VulkanPlatformCommandList.h"
-#include "VulkanDescriptorPool.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "VulkanDescriptorState.h"
 #include "VulkanMemory.h"
+#include "Vulkan/VulkanCommandRecorders.h"
 #include "ZenFoundation/Templates/HeapVector.h"
 #include "ZenFoundation/Templates/VectorView.h"
 #include "ZenFoundation/Utils/Mutex.h"
 
-#ifndef ZEN_VK_RHI_DEBUG
-#    define ZEN_VK_RHI_DEBUG 0
-#endif
-
 namespace zen
 {
-enum class VulkanCommandBufferType
-{
-    ePrimary = 0
-};
-
-class VulkanDescriptorPoolSetContainer;
 class VulkanDescriptorSetState;
 class VulkanBuffer;
 class VulkanPipeline;
-class FVulkanCommandBufferPool;
-class VulkanFence;
+class VulkanCommandBufferPool;
 class VulkanSemaphore;
 class VulkanQueue;
 struct RHIRenderingLayout;
-class FVulkanCommandListContext;
+class VulkanCommandListContext;
 
-class FVulkanCommandBuffer
+class VulkanCommandBuffer
 {
 public:
     enum class State : uint8_t
@@ -50,11 +40,25 @@ public:
 
     bool End();
 
-    void BeginBreadcrumb(NameID name);
+    void BeginBreadcrumb(NameID name)
+    {
+        m_breadcrumbs.Begin(*this, name);
+    }
 
-    void EndBreadcrumb();
+    void EndBreadcrumb()
+    {
+        m_breadcrumbs.End(*this);
+    }
 
-    void ReportBreadcrumbs(class VulkanFaultReport& report) const;
+    void ReportBreadcrumbs(VulkanFaultReport& report) const
+    {
+        m_breadcrumbs.Report(*this, report);
+    }
+
+    VulkanDevice* GetDevice() const
+    {
+        return m_pDevice;
+    }
 
     const RHIError& GetError() const
     {
@@ -95,14 +99,15 @@ public:
 
     void SetCompleted();
 
-    static constexpr uint32_t kMaxGPUTimingScopes = 512;
-    // Directional-GI startup can record over 180 native buffers before steady-state reuse.
-    // Bound profiler storage while accommodating startup and the frames in flight.
-    static constexpr uint32_t kMaxGPUTimingPools = 256;
+    void BeginGPUTiming(const RHIGPUTimingPtr& result)
+    {
+        m_timing.Begin(*this, result);
+    }
 
-    void BeginGPUTiming(const RHIGPUTimingPtr& result);
-
-    void EndGPUTiming(const RHIGPUTimingPtr& result);
+    void EndGPUTiming(const RHIGPUTimingPtr& result)
+    {
+        m_timing.End(*this, result);
+    }
 
     bool IsInsideRenderPass() const
     {
@@ -139,66 +144,39 @@ public:
         return m_vkHandle;
     }
 
-    FVulkanCommandBufferPool* GetCommandBufferPool() const
+    VulkanCommandBufferPool* GetCommandBufferPool() const
     {
         return m_pCmdBufferPool;
     }
 
-    VulkanCommandBufferType GetCommandBufferType() const;
-
 protected:
-    friend class FVulkanCommandBufferPool;
+    friend class VulkanCommandBufferPool;
     friend class VulkanCommandContextBase;
 
-    FVulkanCommandBuffer(FVulkanCommandBufferPool* pPool);
+    VulkanCommandBuffer(VulkanCommandBufferPool* pPool);
 
-    ~FVulkanCommandBuffer();
+    ~VulkanCommandBuffer();
 
 private:
     void AllocMemory();
 
     void FreeMemory();
 
-    void WriteBreadcrumb(uint32_t index, uint32_t value);
-
-    RHIGPUTimingStatus PrepareGPUTimingPool();
-
-    void ResolveGPUTimings();
-
-    void DiscardGPUTimings();
-
-    void ReleaseGPUTimingPool();
-
     VkCommandBuffer m_vkHandle{VK_NULL_HANDLE};
 
-    FVulkanCommandBufferPool* m_pCmdBufferPool{nullptr};
+    VulkanCommandBufferPool* m_pCmdBufferPool{nullptr};
+
+    VulkanDevice* m_pDevice{nullptr};
 
     State m_state{State::eNotAllocated};
 
-    RHIError                  m_error{};
-    static constexpr uint32_t kMaxBreadcrumbs = 1024;
-    VkBuffer                  m_breadcrumbBuffer{VK_NULL_HANDLE};
-    VulkanMemoryAllocation    m_breadcrumbAllocation;
-    HeapVector<NameID>        m_breadcrumbNames;
-    HeapVector<uint32_t>      m_openBreadcrumbs;
-    bool                      m_registeredForDiagnostics{};
-    HeapVector<NameID>        m_openLabels;
+    RHIError                 m_error{};
+    VulkanBreadcrumbRecorder m_breadcrumbs;
+    VulkanGPUTimingRecorder  m_timing;
 
     double m_submitTime{0.0f};
 
 
-    struct GPUTimingScope
-    {
-        RHIGPUTimingPtr result;
-        bool            ended{false};
-    };
-    VkQueryPool                m_timestampPool{VK_NULL_HANDLE};
-    HeapVector<GPUTimingScope> m_timingScopes;
-    uint32_t                   m_timestampValidBits{0};
-    double                     m_timestampPeriod{0};
-    bool                       m_timestampsReset{false};
-    RHIGPUTimingPtr            m_frameTimingInterval;
-    bool                       m_nativeTimingRecording{false};
 
     struct BoundPipelineState
     {
@@ -224,14 +202,14 @@ private:
     VkIndexType m_boundIndexType{VK_INDEX_TYPE_UINT16};
 };
 
-class FVulkanCommandBufferPool
+class VulkanCommandBufferPool
 {
     friend class VulkanCommandContextBase;
 
 public:
-    FVulkanCommandBufferPool(VulkanQueue* pQueue, VulkanCommandBufferType type);
+    explicit VulkanCommandBufferPool(VulkanQueue* pQueue);
 
-    ~FVulkanCommandBufferPool();
+    ~VulkanCommandBufferPool();
 
     void FreeUnusedCommandBuffers();
 
@@ -250,35 +228,20 @@ public:
         return m_pQueue;
     }
 
-    VulkanCommandBufferType GetCommandBufferType() const
-    {
-        return m_type;
-    }
-
 private:
-    FVulkanCommandBuffer* CreateCmdBuffer();
+    VulkanCommandBuffer* CreateCmdBuffer();
 
     Mutex m_mutex;
 
     VulkanQueue* m_pQueue{nullptr};
 
-    VulkanCommandBufferType m_type;
-
     VkCommandPool m_vkHandle{VK_NULL_HANDLE};
 
-    HeapVector<FVulkanCommandBuffer*> m_cmdBuffersInUse;
-    HeapVector<FVulkanCommandBuffer*> m_cmdBuffersFree;
-
-#if ZEN_VK_RHI_DEBUG
-    uint64_t m_numCmdBufferRequests{0};
-    uint64_t m_numReadyCmdBufferReuses{0};
-    uint64_t m_numFreeCmdBufferReuses{0};
-    uint64_t m_numCmdBufferAllocations{0};
-#endif
+    HeapVector<VulkanCommandBuffer*> m_cmdBuffersInUse;
+    HeapVector<VulkanCommandBuffer*> m_cmdBuffersFree;
 };
 
-// Hodls submission info for VulkanQueue
-// In the future, adds GPU profiling related metrics in this structure
+// Native submission state for one VulkanQueue submission.
 class VulkanWorkload
 {
     friend class VulkanCommandContextBase;
@@ -304,33 +267,43 @@ public:
     };
 
 private:
-    FVulkanCommandBuffer* GetLastCommandBuffer() const;
+    VulkanCommandBuffer* GetLastCommandBuffer() const;
 
     bool HasCommandBuffers() const
     {
         return !m_commandBuffers.empty();
     }
 
-    void AddCommandBuffer(FVulkanCommandBuffer* pCmdBuffer);
+    void AddCommandBuffer(VulkanCommandBuffer* pCmdBuffer);
 
     void Merge(VulkanWorkload* pOtherWorkload);
 
-    VulkanQueue*                      m_pQueue{nullptr};
-    HeapVector<FVulkanCommandBuffer*> m_commandBuffers;
-    uint64_t                          m_submissionSerial{0};
-    bool                              m_submissionBoundary{false};
-    uint64_t                          m_bindlessTransaction{};
-    bool                              m_ownsBindlessTransaction{};
-    VulkanWorkload*                   m_pMergedInto{nullptr};
-    HeapVector<VulkanWorkload*>       m_mergedWorkloads;
-    HeapVector<uint64_t>              m_lifetimeIds;
-    RHIResourceReferences             m_resources;
+    VulkanQueue*                     m_pQueue{nullptr};
+    HeapVector<VulkanCommandBuffer*> m_commandBuffers;
+    uint64_t                         m_submissionSerial{0};
+    bool                             m_submissionBoundary{false};
+    VulkanWorkload*                  m_pMergedInto{nullptr};
+    HeapVector<VulkanWorkload*>      m_mergedWorkloads;
+
+    // What the workload keeps alive until its queue serial completes. Merging moves the recordings to the root;
+    // each workload keeps its own references and bindless transaction.
+    struct Ownership
+    {
+        HeapVector<uint64_t>  lifetimeIds;
+        RHIResourceReferences resources;
+        uint64_t              bindlessTransaction{0};
+        bool                  ownsBindlessTransaction{false};
+
+        // After a successful submission: the recordings follow the serial and an owned transaction commits.
+        void Accept(VulkanRHI& rhi, const VulkanQueue* pQueue, uint64_t serial);
+
+        // Without a submission: the recordings, references and an owned transaction are dropped.
+        void Release(VulkanRHI& rhi);
+    } m_ownership;
 
     // DO NOT own the semaphores, only hold reference
     HeapVector<WaitSemaphoreInfo>   m_waitSemaphoreInfos;
     HeapVector<SignalSemaphoreInfo> m_signalSemaphoreInfos;
-
-    VulkanFence* m_pFence{nullptr}; // Used at vkQueueSubmit
 };
 
 // manages VulkanWorkload
@@ -338,13 +311,13 @@ private:
 class VulkanCommandContextBase
 {
 public:
-    VulkanCommandContextBase(VulkanQueue* pQueue, VulkanCommandBufferType type) :
-        m_pQueue(pQueue), m_pCmdBufferPool(pQueue->AcquireCommandBufferPool(type))
+    explicit VulkanCommandContextBase(VulkanQueue* pQueue) :
+        m_pQueue(pQueue), m_pCmdBufferPool(pQueue->AcquireCommandBufferPool())
     {}
 
     virtual ~VulkanCommandContextBase();
 
-    FVulkanCommandBuffer* GetCommandBuffer()
+    VulkanCommandBuffer* GetCommandBuffer()
     {
         VulkanWorkload* pWorkload = GetWorkload(WorkloadPhase::eExecute);
 
@@ -407,17 +380,6 @@ public:
         }
     }
 
-    void AddWaitSemaphores(VkPipelineStageFlags waitFlags, std::span<VulkanSemaphore*> waitSemaphores)
-    {
-        VulkanWorkload* pCurrentWorkload = GetWorkload(WorkloadPhase::eWait);
-
-        for (uint32_t i = 0; i < waitSemaphores.size(); i++)
-        {
-            pCurrentWorkload->m_waitSemaphoreInfos.emplace_back(
-                VulkanWorkload::WaitSemaphoreInfo{waitFlags, waitSemaphores[i], 0});
-        }
-    }
-
     void AddSignalSemaphore(VulkanSemaphore* pSignalSemaphore)
     {
         AddSignalSemaphore(pSignalSemaphore, 0);
@@ -429,17 +391,6 @@ public:
         pCurrentWorkload->m_signalSemaphoreInfos.emplace_back(VulkanWorkload::SignalSemaphoreInfo{pSignalSemaphore, value});
     }
 
-    void AddSignalSemaphores(std::span<VulkanSemaphore*> signalSemaphores)
-    {
-        VulkanWorkload* pCurrentWorkload = GetWorkload(WorkloadPhase::eSignal);
-
-        for (uint32_t i = 0; i < signalSemaphores.size(); i++)
-        {
-            pCurrentWorkload->m_signalSemaphoreInfos.emplace_back(VulkanWorkload::SignalSemaphoreInfo{signalSemaphores[i], 0});
-        }
-    }
-
-    void RecordDescriptorPool(VulkanDescriptorPoolSetContainer* pContainer);
 
     void RecordLifetime(uint64_t id);
 
@@ -460,27 +411,9 @@ public:
     // Finalize the current workload and submit all staged workloads immediately.
     RHISubmissionResult SubmitRecordedWorkloads();
 
-    void WaitForLastSubmittedWork(uint64_t timeToWaitNS);
-
     VulkanQueue* GetQueue() const
     {
         return m_pQueue;
-    }
-
-    void SetLastSubmittedSerial(uint64_t submissionSerial)
-    {
-        m_lastSubmittedSerial     = std::max(m_lastSubmittedSerial, submissionSerial);
-        m_hasPendingFlushWorkload = false;
-    }
-
-    void MarkWorkloadPendingFlush()
-    {
-        m_hasPendingFlushWorkload = true;
-    }
-
-    uint64_t GetLastSubmittedSerial() const
-    {
-        return m_lastSubmittedSerial;
     }
 
 private:
@@ -505,26 +438,44 @@ private:
 
     VulkanQueue* m_pQueue{nullptr};
 
-    FVulkanCommandBufferPool* m_pCmdBufferPool{nullptr};
+    VulkanCommandBufferPool* m_pCmdBufferPool{nullptr};
 
     VulkanWorkload*             m_pCurrentWorkload{nullptr};
     HeapVector<VulkanWorkload*> m_finalizedWorkloads;
     WorkloadPhase               m_currentWorkloadPhase{WorkloadPhase::eWait};
     uint64_t                    m_workloadGeneration{0};
-    bool                        m_hasPendingFlushWorkload{false};
-    uint64_t                    m_lastSubmittedSerial{0};
 
     RHIError m_recordingError{};
 
     uint64_t m_recordingTransaction{0};
 };
 
-class VulkanGfxState
+// Pipeline and descriptor bindings for one bind point.
+class VulkanBindPointState
 {
 public:
-    VulkanGfxState();
+    explicit VulkanBindPointState(VulkanRHI* pRHI) : m_descriptorSetState(pRHI) {}
 
-    ~VulkanGfxState();
+    void SetPipelineState(RHIPipeline* pPipeline);
+
+    bool SetShaderParameters(RHIShaderParameterView parameters, uint64_t recordedEpoch = 0, uint64_t transaction = 0);
+
+    // Binds the pipeline and its descriptor sets. Returns the command buffer, or null after latching an error.
+    VulkanCommandBuffer* BindForCommand(VulkanCommandListContext* pContext);
+
+protected:
+    VulkanPipeline* m_pCurrentPipeline{nullptr};
+
+private:
+    HeapVector<VkDescriptorSet> m_descriptorSets;
+    HeapVector<uint32_t>        m_dynamicOffsets;
+    VulkanDescriptorSetState    m_descriptorSetState;
+};
+
+class VulkanGfxState : public VulkanBindPointState
+{
+public:
+    using VulkanBindPointState::VulkanBindPointState;
 
     void SetViewport(uint32_t minX, uint32_t minY, uint32_t maxX, uint32_t maxY);
 
@@ -540,20 +491,11 @@ public:
 
     void ClearVertexBuffers();
 
-    void SetPipelineState(RHIPipeline* pPipeline);
-
-    bool SetShaderParameters(RHIShaderParameterView parameters, uint64_t recordedEpoch = 0, uint64_t transaction = 0);
-
-    bool PreDraw(FVulkanCommandListContext* pContext);
+    bool PreDraw(VulkanCommandListContext* pContext);
 
 private:
     HeapVector<VkViewport> m_viewports;
     HeapVector<VkRect2D>   m_scissors;
-
-    VulkanPipeline*             m_pCurrentPipeline{nullptr};
-    HeapVector<VkDescriptorSet> m_descriptorSets;
-    HeapVector<uint32_t>        m_dynamicOffsets;
-    VulkanDescriptorSetState*   m_pDescriptorSetState{nullptr};
 
     HeapVector<VkBuffer> m_vertexBuffers;
     HeapVector<uint64_t> m_vertexBufferOffsets;
@@ -571,32 +513,10 @@ private:
     float m_blendConstants[4]{};
 };
 
-class VulkanDispatchState
+class VulkanCommandListContext : public IRHICommandContext, public VulkanCommandContextBase
 {
 public:
-    VulkanDispatchState();
-
-    ~VulkanDispatchState();
-
-    void SetPipelineState(RHIPipeline* pPipeline);
-
-    bool SetShaderParameters(RHIShaderParameterView parameters, uint64_t recordedEpoch = 0, uint64_t transaction = 0);
-
-    bool PreDispatch(FVulkanCommandListContext* pContext);
-
-private:
-    VulkanPipeline*             m_pCurrentPipeline{nullptr};
-    HeapVector<VkDescriptorSet> m_descriptorSets;
-    HeapVector<uint32_t>        m_dynamicOffsets;
-    VulkanDescriptorSetState*   m_pDescriptorSetState{nullptr};
-};
-
-class FVulkanCommandListContext : public IRHICommandContext, public VulkanCommandContextBase
-{
-public:
-    FVulkanCommandListContext(RHICommandContextType contextType, VulkanDevice* pDevice);
-
-    virtual ~FVulkanCommandListContext();
+    VulkanCommandListContext(RHICommandContextType contextType, VulkanDevice* pDevice);
 
     RHICommandContextType GetContextType() override;
 
@@ -610,11 +530,6 @@ public:
     void DiscardRecording() override;
 
     void ResetShaderBindings();
-
-    uint64_t RHIGetLastSubmittedSerial() const override
-    {
-        return GetLastSubmittedSerial();
-    }
 
     void RHIBeginRendering(const RHIRenderingLayout* pRenderingLayout) override;
 
@@ -700,7 +615,7 @@ public:
 
     void RHICopyBuffer(RHIBuffer* pSrcBuffer, RHIBuffer* pDstBuffer, const RHIBufferCopyRegion& region) override;
 
-    void RHIClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubResourceRange& range) override;
+    void RHIClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubresourceRange& range) override;
 
     void RHICopyTexture(RHITexture* pSrcTexture, RHITexture* pDstTexture, std::span<RHITextureCopyRegion> regions) override;
 
@@ -724,8 +639,6 @@ public:
                            uint32_t    dstLayer,
                            uint32_t    dstMipmap) override;
 
-    void RHIWaitUntilCompleted() override;
-
     // todo: need a function to collect recorded workload in this context
 private:
     void MakeHostReadAvailable(RHIBuffer* buffer, uint64_t offset, uint64_t size);
@@ -740,9 +653,9 @@ private:
 
     uint64_t m_recordedBindlessEpoch{0};
 
-    VulkanGfxState*      m_pGfxState{nullptr};
-    VulkanDispatchState* m_pComputeState{nullptr};
-    VulkanDispatchState* m_pRayTracingState{nullptr};
+    VulkanGfxState       m_gfxState;
+    VulkanBindPointState m_computeState;
+    VulkanBindPointState m_rayTracingState;
 };
 
 } // namespace zen

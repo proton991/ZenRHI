@@ -1,4 +1,6 @@
 #include "ZenRHI/TestSupport/FakeRHI.h"
+#include "ZenRHI/RHIDeviceDesc.h"
+#include "Core/RHICommands.h"
 using namespace zen;
 
 TEST(RHIQueueCapabilitiesTest, ExecutorCachesNativeSharingWithoutBackendQueriesInEitherMode)
@@ -9,7 +11,6 @@ TEST(RHIQueueCapabilitiesTest, ExecutorCachesNativeSharingWithoutBackendQueriesI
         backend->submissionQueueCapabilities = {true, true, {0, 1, 1}};
         {
             RHICommandListExecutor executor(backend, mode);
-            GDynamicRHI = &executor;
             EXPECT_EQ(backend->queueCapabilityQueries, 1u);
             // Hardware capabilities are immutable for this executor's lifetime.
             backend->submissionQueueCapabilities = {};
@@ -27,7 +28,6 @@ TEST(RHIQueueCapabilitiesTest, ExecutorCachesNativeSharingWithoutBackendQueriesI
             EXPECT_EQ(backend->contextCreations, 0u);
             EXPECT_EQ(backend->submissionAttempts, 0u);
         }
-        GDynamicRHI = nullptr;
     }
 }
 
@@ -68,12 +68,12 @@ TEST_F(RHIExecutorTest, DetachedListsKeepContextAliveUntilFinalReleaseOnRhi)
     EXPECT_EQ(context->GetRefCount(), 3u);
     producer.reset();
     EXPECT_EQ(context->GetRefCount(), 2u);
-    GetRHIThread().Invoke(&RHICommandList::ResetForReuse, first.get());
+    executor->GetRuntime().thread.Invoke(&RHICommandList::ResetForReuse, first.get());
     EXPECT_EQ(context->GetRefCount(), 1u);
     EXPECT_EQ(rhi->graphics.proxyDestructions, 0u);
     first.reset();
     second.reset();
-    const std::thread::id worker = GetRHIThread().Invoke([] { return std::this_thread::get_id(); });
+    const std::thread::id worker = executor->GetRuntime().thread.Invoke([] { return std::this_thread::get_id(); });
     EXPECT_EQ(rhi->graphics.proxyDestructions, 1u);
     EXPECT_EQ(rhi->graphics.lastProxyDestroyThread, worker);
 }
@@ -94,7 +94,7 @@ TEST_F(RHIExecutorTest, RecyclesPresentContextsAndReleasesProducerContextOnRhi)
     EXPECT_EQ(rhi->contextCreations, 2u);
     EXPECT_EQ(rhi->graphics.proxyDestructions, 0u);
     commands.reset();
-    const std::thread::id worker = GetRHIThread().Invoke([] { return std::this_thread::get_id(); });
+    const std::thread::id worker = executor->GetRuntime().thread.Invoke([] { return std::this_thread::get_id(); });
     EXPECT_EQ(rhi->graphics.proxyDestructions, 1u);
     EXPECT_EQ(rhi->graphics.lastProxyDestroyThread, worker);
     viewport.ReleaseForTeardown();
@@ -121,7 +121,7 @@ TEST_F(RHIExecutorTest, DelayedGpuCompletionRetainsListsAndBoundsTheRetiredCache
     ASSERT_NE(buffer, nullptr);
     const uint64_t bufferId = buffer->GetStableId();
     executor->ReleaseWhenComplete(RHIResourcePtr<RHIResource>::Adopt(buffer));
-    executor->CollectGarbage();
+    executor->FlushRHIThread();
     EXPECT_FALSE(destroyed.contains(bufferId));
     commands.reset();
     executor->FlushRHIThread();
@@ -130,7 +130,7 @@ TEST_F(RHIExecutorTest, DelayedGpuCompletionRetainsListsAndBoundsTheRetiredCache
     EXPECT_TRUE(executor->WaitForCompletion(RHICommandContextType::eGraphics,
                                             result.requiredSerials.Get(RHICommandContextType::eGraphics)));
     EXPECT_EQ(rhi->contextCreations - rhi->graphics.proxyDestructions, RHIFrameState::kMaxFramesInFlight);
-    executor->CollectGarbage();
+    executor->FlushRHIThread();
     EXPECT_TRUE(destroyed.contains(bufferId));
     viewport.ReleaseForTeardown();
     executor->Destroy();
@@ -200,23 +200,24 @@ namespace
 struct CancellationFrameProbe
 {
     static inline std::string message;
-    static void               Capture(RHIMessageSeverity, std::string_view text) noexcept
+    static void               Capture(const RHIMessage& diagnostic) noexcept
     {
-        if (text.starts_with("RHI stopped at frame"))
+        if (diagnostic.text.starts_with("RHI stopped at frame"))
         {
-            message.assign(text);
+            message.assign(diagnostic.text);
         }
     }
 
     void Advance()
     {
-        GRHIFrameState.Advance();
+        frameState->Advance();
         started.Signal();
         while (!done.load(std::memory_order_relaxed))
         {
-            GRHIFrameState.Advance();
+            frameState->Advance();
         }
     }
+    RHIFrameState*    frameState{nullptr};
     RHIThreadEvent    started;
     std::atomic<bool> done{};
 };
@@ -226,15 +227,16 @@ TEST_F(RHIExecutorTest, CancellationPrintsOneCoherentFrameWhileWorkerAdvances)
 {
     executor->EndFrame();
     executor->FlushRHIThread();
-    const uint64_t           publishedFrame = ToValue(GRHIFrameState.GetFrameNumber());
-    CancellationFrameProbe   probe;
+    const uint64_t         publishedFrame = ToValue(executor->GetRuntime().frameState.GetFrameNumber());
+    CancellationFrameProbe probe;
+    probe.frameState                  = &executor->GetRuntime().frameState;
     const RHIMessageCallback previous = GetRHIMessageCallback();
     CancellationFrameProbe::message.clear();
     SetRHIMessageCallback(CancellationFrameProbe::Capture);
-    GetRHIThread().Dispatch(std::bind_front(&CancellationFrameProbe::Advance, &probe));
+    executor->GetRuntime().thread.Dispatch(std::bind_front(&CancellationFrameProbe::Advance, &probe));
     probe.started.Wait();
-    std::thread stopper([] { GetRHIThread().Stop(); });
-    while (!GetRHIThread().IsStopping())
+    std::thread stopper([this] { executor->GetRuntime().thread.Stop(); });
+    while (!executor->GetRuntime().thread.IsStopping())
     {
         std::this_thread::yield();
     }
@@ -247,7 +249,7 @@ TEST_F(RHIExecutorTest, CancellationPrintsOneCoherentFrameWhileWorkerAdvances)
     unsigned int       slot  = 0;
     ASSERT_EQ(std::sscanf(CancellationFrameProbe::message.c_str(), "RHI stopped at frame %llu (slot %u)", &frame, &slot), 2);
     EXPECT_EQ(frame, publishedFrame);
-    EXPECT_EQ(frame % GRHIFrameState.GetNumFramesInFlight(), slot);
+    EXPECT_EQ(frame % executor->GetRuntime().frameState.GetNumFramesInFlight(), slot);
 }
 
 TEST_F(RHIExecutorTest, RollbackReleasesNewReferencesAndKeepsEarlierCommands)
@@ -258,7 +260,7 @@ TEST_F(RHIExecutorTest, RollbackReleasesNewReferencesAndKeepsEarlierCommands)
     RHIBuffer*        second = executor->CreateBuffer(info);
     RHICommandListPtr commands(RHICommandList::Create(executor->GetCommandContext(RHICommandContextType::eGraphics)));
     commands->ClearBuffer(first, 0, 64);
-    const RHICommandListBase::CommandCheckpoint checkpoint = commands->GetCommandCheckpoint();
+    const RHICommandList::CommandCheckpoint checkpoint = commands->GetCommandCheckpoint();
     commands->CopyBuffer(first, second, RHIBufferCopyRegion{});
     EXPECT_EQ(first->GetRefCount(), 2u);
     EXPECT_EQ(second->GetRefCount(), 2u);
@@ -272,21 +274,20 @@ TEST_F(RHIExecutorTest, RollbackReleasesNewReferencesAndKeepsEarlierCommands)
     second->ReleaseReference();
 }
 
-
 TEST_F(RHIExecutorTest, FlushSamplesGpuProgressWithoutWaitingForGpuCompletion)
 {
     RHITextureCreateInfo info{};
     RHITexture*          texture = executor->CreateTexture(info);
     const uint64_t       id      = texture->GetStableId();
     RHICommandListPtr    commands(RHICommandList::Create(executor->GetCommandContext(RHICommandContextType::eGraphics)));
-    commands->ClearTexture(texture, Color(0.f), RHITextureSubResourceRange());
+    commands->ClearTexture(texture, Color(0.f), RHITextureSubresourceRange());
     const RHIBatchResult result = executor->SubmitFrame(*commands, nullptr).Wait();
     ASSERT_GT(result.requiredSerials.Get(RHICommandContextType::eGraphics), 0u);
     texture->ReleaseReference();
     executor->FlushRHIThread();
     EXPECT_EQ(executor->QueryLastCompletedSerial(RHICommandContextType::eGraphics), 0u);
     EXPECT_FALSE(destroyed.contains(id));
-    GetRHIThread().Invoke([this] { rhi->completed = rhi->submitted; });
+    executor->GetRuntime().thread.Invoke([this] { rhi->completed = rhi->submitted; });
     executor->FlushRHIThread();
     EXPECT_EQ(executor->QueryLastCompletedSerial(RHICommandContextType::eGraphics),
               result.requiredSerials.Get(RHICommandContextType::eGraphics));
@@ -298,28 +299,28 @@ TEST_F(RHIExecutorTest, FlushSamplesGpuProgressWithoutWaitingForGpuCompletion)
 TEST_F(RHIExecutorTest, ProgressPollsCoalesceWhileTheWorkerIsBusy)
 {
     ArmGate();
-    GetRHIThread().Dispatch(std::bind_front(&RHISubmissionGate::OnSubmission, &gate));
+    executor->GetRuntime().thread.Dispatch(std::bind_front(&RHISubmissionGate::OnSubmission, &gate));
     ASSERT_EQ(gate.entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     for (uint32_t poll = 0; poll < 128; ++poll)
     {
         executor->PollGPUProgress();
     }
     // A poll request must leave capacity for real work even when the worker is blocked.
-    EXPECT_TRUE(GetRHIThread().TryDispatch([] {}));
+    EXPECT_TRUE(executor->GetRuntime().thread.TryDispatch([] {}));
     gate.Open();
-    GetRHIThread().Flush();
+    executor->GetRuntime().thread.Flush();
     EXPECT_TRUE(gate.releasedInTime);
     EXPECT_FALSE(executor->AreSubmissionsBlocked());
 }
 
 TEST_F(RHIExecutorTest, ProgressPollRetriesAfterQueueSaturationWithoutBlocking)
 {
-    GetRHIThread().Invoke([this] { rhi->submitted[0] = rhi->completed[0] = 1; });
+    executor->GetRuntime().thread.Invoke([this] { rhi->submitted[0] = rhi->completed[0] = 1; });
     ArmGate();
-    GetRHIThread().Dispatch(std::bind_front(&RHISubmissionGate::OnSubmission, &gate));
+    executor->GetRuntime().thread.Dispatch(std::bind_front(&RHISubmissionGate::OnSubmission, &gate));
     ASSERT_EQ(gate.entered.wait_for(std::chrono::seconds(2)), std::future_status::ready);
     uint32_t queued = 0;
-    while (queued < 128 && GetRHIThread().TryDispatch([] {}))
+    while (queued < 128 && executor->GetRuntime().thread.TryDispatch([] {}))
     {
         ++queued;
     }
@@ -327,12 +328,12 @@ TEST_F(RHIExecutorTest, ProgressPollRetriesAfterQueueSaturationWithoutBlocking)
     EXPECT_LT(queued, 128u);
     executor->PollGPUProgress();
     gate.Open();
-    GetRHIThread().Flush();
+    executor->GetRuntime().thread.Flush();
     EXPECT_TRUE(gate.releasedInTime);
     // The failed enqueue must clear the pending flag so an idle caller can retry.
-    GetRHIThread().Invoke([this] { rhi->submitted[0] = rhi->completed[0] = 2; });
+    executor->GetRuntime().thread.Invoke([this] { rhi->submitted[0] = rhi->completed[0] = 2; });
     executor->PollGPUProgress();
-    GetRHIThread().Flush();
+    executor->GetRuntime().thread.Flush();
     EXPECT_EQ(executor->QueryLastCompletedSerial(RHICommandContextType::eGraphics), 2u);
     EXPECT_TRUE(rhi->submissionWaits.empty());
     EXPECT_EQ(rhi->deviceIdleWaits, 0u);
@@ -441,8 +442,6 @@ public:
     uint32_t destroyCalls{0};
 
 protected:
-    void Init() override {}
-
     void Destroy() override
     {
         ++destroyCalls;
@@ -465,16 +464,17 @@ private:
     uint32_t& m_destructions;
 };
 
-// Starts and destroys an executor over a fake backend, which retires that backend.
-void RetireExecutor(RHIExecutionMode mode)
+// Starts and destroys an executor over a fake backend. The returned runtime has closed cleanup admission.
+RHIDeviceRuntimePtr RetireExecutor(RHIExecutionMode mode)
 {
     RHICommandListExecutor* executor = ZEN_NEW() RHICommandListExecutor(ZEN_NEW() TestRHI(), mode);
-
-    GDynamicRHI                      = executor;
+    RHIDeviceRuntimePtr     runtime(&executor->GetRuntime());
 
     executor->Destroy();
 
     ZEN_DELETE(executor);
+
+    return runtime;
 }
 
 class RHILateReleaseTest : public testing::TestWithParam<RHIExecutionMode>
@@ -482,7 +482,7 @@ class RHILateReleaseTest : public testing::TestWithParam<RHIExecutionMode>
 protected:
     void SetUp() override
     {
-        m_strict = RHIOptions::GetInstance().StrictTeardownChecks();
+        m_strict = GetRHIStrictTeardownChecks();
 
         message.clear();
         SetRHIMessageCallback(Capture);
@@ -490,19 +490,19 @@ protected:
 
     void TearDown() override
     {
-        RHIOptions::GetInstance().SetStrictTeardownChecks(m_strict);
+        SetRHIStrictTeardownChecks(m_strict);
 
         SetRHIMessageCallback(nullptr);
     }
 
     bool m_strict{true};
 
-    static void Capture(RHIMessageSeverity severity, std::string_view text) noexcept
+    static void Capture(const RHIMessage& diagnostic) noexcept
     {
-        if (severity == RHIMessageSeverity::eError)
+        if (diagnostic.severity == RHIMessageSeverity::eError)
         {
             const std::lock_guard<std::mutex> lock(messageMutex);
-            message.assign(text);
+            message.assign(diagnostic.text);
         }
     }
     static inline std::mutex  messageMutex;
@@ -514,13 +514,11 @@ using RHILateReleaseDeathTest = RHILateReleaseTest;
 
 TEST_P(RHILateReleaseTest, NonStrictReleaseAfterExecutorDestructionIsLoggedAndLeaked)
 {
-    RHIOptions::GetInstance().SetStrictTeardownChecks(false);
+    SetRHIStrictTeardownChecks(false);
 
     LateReleaseResource* late = ZEN_NEW() LateReleaseResource();
 
-    RetireExecutor(GetParam());
-
-    EXPECT_EQ(GDynamicRHI, nullptr);
+    late->BindRuntime(RetireExecutor(GetParam()).Get());
 
     // Admission rejects the release before Destroy, so nothing reaches the retired backend.
     EXPECT_EQ(late->ReleaseReference(), 0u);
@@ -529,9 +527,9 @@ TEST_P(RHILateReleaseTest, NonStrictReleaseAfterExecutorDestructionIsLoggedAndLe
 
     EXPECT_NE(message.find("Resource released after RHI cleanup admission closed"), std::string::npos);
 
-    // A new standalone backend reopens admission, and releases run inline again.
+    // Another backend has its own open admission, and its unstarted worker releases inline.
     TestRHI              backend;
-    LateReleaseResource* current = ZEN_NEW() LateReleaseResource();
+    LateReleaseResource* current = backend.Bind(ZEN_NEW() LateReleaseResource());
 
     EXPECT_EQ(current->ReleaseReference(), 0u);
 
@@ -544,7 +542,7 @@ TEST_P(RHILateReleaseTest, NonStrictReleaseAfterExecutorDestructionIsLoggedAndLe
 
 TEST_P(RHILateReleaseTest, NonStrictContextReleaseIsLoggedWithoutRunningItsDestructor)
 {
-    RHIOptions::GetInstance().SetStrictTeardownChecks(false);
+    SetRHIStrictTeardownChecks(false);
 
     uint32_t destructions    = 0;
 
@@ -552,7 +550,7 @@ TEST_P(RHILateReleaseTest, NonStrictContextReleaseIsLoggedWithoutRunningItsDestr
 
     late->AddRef();
 
-    RetireExecutor(GetParam());
+    late->BindRuntime(RetireExecutor(GetParam()).Get());
 
     EXPECT_EQ(late->Release(), 0u);
 
@@ -622,11 +620,11 @@ TEST_P(RHILateReleaseDeathTest, StrictReleaseAfterExecutorDestructionStops)
     // Only the death-test child creates the executor.
     EXPECT_DEATH(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(true);
+            SetRHIStrictTeardownChecks(true);
 
             LateReleaseResource* late = ZEN_NEW() LateReleaseResource();
 
-            RetireExecutor(GetParam());
+            late->BindRuntime(RetireExecutor(GetParam()).Get());
 
             late->ReleaseReference();
         },
@@ -637,14 +635,14 @@ TEST_P(RHILateReleaseDeathTest, StrictContextReleaseAfterExecutorDestructionStop
 {
     EXPECT_DEATH(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(true);
+            SetRHIStrictTeardownChecks(true);
 
             uint32_t            destructions = 0;
             LateReleaseContext* late         = ZEN_NEW() LateReleaseContext(destructions);
 
             late->AddRef();
 
-            RetireExecutor(GetParam());
+            late->BindRuntime(RetireExecutor(GetParam()).Get());
 
             late->Release();
         },
@@ -654,12 +652,7 @@ TEST_P(RHILateReleaseDeathTest, StrictContextReleaseAfterExecutorDestructionStop
 TEST_P(RHILateReleaseDeathTest, SynchronousInvocationAfterExecutorDestructionStops)
 {
     EXPECT_DEATH(
-        {
-            RetireExecutor(GetParam());
-
-            GetRHIThread().Invoke([] {});
-        },
-        "Synchronous RHI invocation after cleanup admission closed");
+        { RetireExecutor(GetParam())->thread.Invoke([] {}); }, "Synchronous RHI invocation after cleanup admission closed");
 }
 
 INSTANTIATE_TEST_SUITE_P(ExecutionModes,
@@ -672,9 +665,9 @@ INSTANTIATE_TEST_SUITE_P(ExecutionModes,
 
 namespace
 {
-void CountLateCleanup(std::atomic<uint32_t>& executed)
+void CountLateCleanup(const RHIThread& thread, std::atomic<uint32_t>& executed)
 {
-    EXPECT_TRUE(GetRHIThread().IsCurrentThread());
+    EXPECT_TRUE(thread.IsCurrentThread());
     ++executed;
 }
 
@@ -694,7 +687,7 @@ void ProduceLateCleanup(RHIThread&             thread,
     started = true;
     do
     {
-        if (thread.DispatchCleanup(std::bind_front(&CountLateCleanup, std::ref(executed))))
+        if (thread.DispatchCleanup(std::bind_front(&CountLateCleanup, std::cref(thread), std::ref(executed))))
         {
             ++accepted;
         }
@@ -705,7 +698,7 @@ void ProduceLateCleanup(RHIThread&             thread,
 
 TEST(RHIThreadTest, StopWithoutFinalizerRunsLateCleanupExactlyOnce)
 {
-    RHIThread& thread = GetRHIThread();
+    RHIThread thread;
     for (uint32_t iteration = 0; iteration < 1000; ++iteration)
     {
         std::atomic<bool>     stop{false}, started{false};
@@ -752,21 +745,21 @@ TEST(RHIThreadTest, DISABLED_QueueThroughputBenchmark)
            std::chrono::duration<double, std::milli>(invokeEnd - dispatchEnd).count());
 }
 
-
 TEST_F(RHIExecutorTest, CancelledQueuedBatchCompletesItsTicketAfterTaskFailure)
 {
     RHICommandListPtr commands(RHICommandList::Create(executor->GetCommandContext(RHICommandContextType::eGraphics)));
     RHIThreadEvent    entered;
     RHIThreadEvent    release;
 
-    GetRHIThread().Dispatch([&entered, &release] {
+    executor->GetRuntime().thread.Dispatch([&entered, &release] {
         entered.Signal();
         release.Wait();
     });
     entered.Wait();
 
-    GetRHIThread().Dispatch([] {
-        GetRHIThread().Fail(MakeRHIError(RHIErrorCode::eBackendFailure, "injected batch task failure", __FILE__, __LINE__));
+    executor->GetRuntime().thread.Dispatch([this] {
+        executor->GetRuntime().thread.Fail(
+            MakeRHIError(RHIErrorCode::eBackendFailure, "injected batch task failure", __FILE__, __LINE__));
     });
     const RHISubmissionTicket ticket = executor->SubmitFrame(*commands, nullptr);
     release.Signal();
@@ -823,14 +816,17 @@ TEST_F(RHIExecutorTest, MissingPresentationListDeclinesSynchronousFrameAndAllows
     executor->Destroy();
 }
 
-
-
-class FailingFinalizeRHI : public TestRHI
+class FailingTranslationRHI : public TestRHI
 {
 public:
-    RHIStatus FinalizeCommandLists(std::span<RHICommandList*>, std::vector<RHIPlatformCommandList*>&) override
+    RHISubmissionResult SubmitCommandLists(std::span<RHICommandList*>) override
     {
-        return {{RHIErrorCode::eOutOfDeviceMemory, -2, "injected vkEndCommandBuffer", __FILE__, 73, 19}};
+        return RHISubmissionResult::eRejected;
+    }
+
+    RHIError GetLastSubmissionError() const override
+    {
+        return {RHIErrorCode::eOutOfDeviceMemory, -2, "injected vkEndCommandBuffer", __FILE__, 73, 19};
     }
 };
 
@@ -838,7 +834,7 @@ TEST(RHIThreadProductionTest, FrameTicketPreservesFinalizationCauseAndBlocksNewR
 {
     for (RHIExecutionMode mode : {RHIExecutionMode::eInline, RHIExecutionMode::eThreaded})
     {
-        RHICommandListExecutor executor(ZEN_NEW() FailingFinalizeRHI(), mode);
+        RHICommandListExecutor executor(ZEN_NEW() FailingTranslationRHI(), mode);
 
         RHICommandListPtr commands(RHICommandList::Create(executor.GetCommandContext(RHICommandContextType::eGraphics)));
 
@@ -860,11 +856,9 @@ TEST(RHIThreadProductionTest, FrameTicketPreservesFinalizationCauseAndBlocksNewR
 
         EXPECT_STREQ(executor.GetTerminalError().operation, "injected vkEndCommandBuffer");
 
-        const RHIProgressResult progress = executor.QueryProgressChecked();
+        EXPECT_EQ(executor.GetTerminalError().nativeCode, -2);
 
-        EXPECT_EQ(progress.error.nativeCode, -2);
-
-        EXPECT_EQ(executor.WaitForCompletionChecked(RHICommandContextType::eGraphics, 1, 0).outcome, RHIWaitOutcome::eFailed);
+        EXPECT_EQ(executor.WaitForCompletion(RHICommandContextType::eGraphics, 1, 0).outcome, RHIWaitOutcome::eFailed);
 
         EXPECT_EQ(executor.CreateBuffer({}), nullptr);
 
@@ -881,8 +875,8 @@ TEST(RHIThreadProductionTest, FailedWorkerCompletesQueuedFrameTiming)
         RHICommandListExecutor executor(ZEN_NEW() TestRHI(), mode);
         RHIGPUFrameTimingPtr   timing = MakeShared<RHIGPUFrameTiming, MultiThreadCounter>();
 
-        GetRHIThread().Dispatch([] {
-            GetRHIThread().Fail(
+        executor.GetRuntime().thread.Dispatch([&executor] {
+            executor.GetRuntime().thread.Fail(
                 MakeRHIError(RHIErrorCode::eBackendFailure, "injected timing task failure", __FILE__, __LINE__));
         });
         executor.BeginGPUFrameTiming(timing);
@@ -1003,4 +997,134 @@ TEST(RHIPresentModeTest, ParsesConfigurationNames)
     EXPECT_EQ(mode, RHIPresentMode::eDefault);
     EXPECT_FALSE(ParseRHIPresentMode("vsync", mode));
     EXPECT_EQ(mode, RHIPresentMode::eDefault);
+}
+
+TEST_F(RHIExecutorTest, ParameterSnapshotsPreserveOffsetsArrayMetadataAndBindlessResources)
+{
+    RHITextureCreateInfo textureInfo{};
+    textureInfo.format = DataFormat::eR8G8B8A8UNORM;
+    textureInfo.type   = RHITextureType::e2D;
+    textureInfo.width = textureInfo.height = 8;
+    RHITexture*         texture            = executor->CreateTexture(textureInfo);
+    RHIBufferCreateInfo bufferInfo{};
+    bufferInfo.size     = 64;
+    RHIBuffer*  buffer  = executor->CreateBuffer(bufferInfo);
+    RHISampler* sampler = executor->CreateSampler({});
+    ASSERT_NE(texture, nullptr);
+    ASSERT_NE(buffer, nullptr);
+    ASSERT_NE(sampler, nullptr);
+
+    RHIBatchedShaderParameters source;
+
+    RHIShaderResourceDescriptor value{};
+
+    value.set     = 2;
+
+    value.binding = 5;
+
+    source.AddValueParam(value, std::array<uint32_t, 2>{7, 11});
+
+    value.set     = 4;
+
+    value.binding = 9;
+
+    source.AddValueParam(value, uint8_t(0xEF));
+
+    RHIShaderResourceDescriptor resource{};
+
+    resource.set     = 3;
+
+    resource.binding = 6;
+
+    resource.type    = RHIShaderResourceType::eSamplerWithTexture;
+
+    source.AddResourceParam(resource, texture->GetDefaultView(), sampler, 17);
+
+    resource.bindless = true;
+
+    resource.type     = RHIShaderResourceType::eStorageBuffer;
+
+    source.AddResourceParam(resource, buffer, nullptr, 23);
+
+    RHICommandList storage;
+
+    RHICommandSetShaderParameters command(storage, source.GetView());
+
+    source.Reset();
+
+    source.AddValueParam(value, uint64_t(0)); // Reuse and overwrite the original byte storage.
+
+    const RHIShaderParameterView& snapshot          = command.parameters;
+
+    std::span<const RHIShaderValueParameter> values = snapshot.GetValueParams();
+
+    ASSERT_EQ(values.size(), 2u);
+
+    EXPECT_EQ(values[0].set, 2u);
+
+    EXPECT_EQ(values[0].binding, 5u);
+
+    EXPECT_EQ(values[0].byteOffset, 0u);
+
+    EXPECT_EQ(values[1].set, 4u);
+
+    EXPECT_EQ(values[1].binding, 9u);
+
+    EXPECT_EQ(values[1].byteOffset, 8u);
+
+    std::array<uint32_t, 2> result;
+
+    std::span<const uint8_t> bytes = snapshot.GetValueBytes(values[0]);
+
+    ASSERT_EQ(bytes.size(), sizeof(result));
+
+    std::memcpy(result.data(), bytes.data(), bytes.size());
+
+    EXPECT_EQ(result, (std::array<uint32_t, 2>{7, 11}));
+
+    ASSERT_EQ(snapshot.GetValueBytes(values[1]).size(), 1u);
+
+    EXPECT_EQ(snapshot.GetValueBytes(values[1])[0], 0xEF);
+
+    std::span<const RHIShaderResourceParameter> resources = snapshot.GetResourceParams();
+
+    ASSERT_EQ(resources.size(), 1u);
+
+    EXPECT_EQ(resources[0].set, 3u);
+
+    EXPECT_EQ(resources[0].binding, 6u);
+
+    EXPECT_EQ(resources[0].arrayIndex, 17u);
+
+    EXPECT_EQ(resources[0].resourceType, RHIShaderResourceType::eSamplerWithTexture);
+
+    EXPECT_EQ(resources[0].pResource, texture->GetDefaultView());
+
+    EXPECT_EQ(resources[0].pAuxResource, sampler);
+
+    std::span<const RHIShaderResourceParameter> bindless = snapshot.GetBindlessParams();
+
+    ASSERT_EQ(bindless.size(), 1u);
+
+    EXPECT_EQ(bindless[0].set, 3u);
+
+    EXPECT_EQ(bindless[0].binding, 6u);
+
+    EXPECT_EQ(bindless[0].arrayIndex, 23u);
+
+    EXPECT_EQ(bindless[0].resourceType, RHIShaderResourceType::eStorageBuffer);
+
+    EXPECT_EQ(bindless[0].pResource, buffer);
+
+    EXPECT_EQ(bindless[0].pAuxResource, nullptr);
+
+    source.Reset();
+
+    storage.Reset();
+
+    executor->DestroyTexture(texture);
+
+    executor->DestroyBuffer(buffer);
+
+    executor->DestroySampler(sampler);
 }

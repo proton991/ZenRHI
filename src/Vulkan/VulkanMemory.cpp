@@ -1,7 +1,7 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include "Vulkan/VulkanMemory.h"
 #include "ZenRHI/RHICommon.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanRHI.h"
 
@@ -77,11 +77,10 @@ VulkanMemoryAllocator::~VulkanMemoryAllocator()
     }
 }
 
-VkResult VulkanMemoryAllocator::Init(VkInstance       instance,
-                                     VkPhysicalDevice gpu,
-                                     VkDevice         device,
-                                     bool             bufferDeviceAddress,
-                                     bool             memoryBudget)
+VkResult VulkanMemoryAllocator::Init(VkInstance                       instance,
+                                     VkPhysicalDevice                 gpu,
+                                     VkDevice                         device,
+                                     const VulkanMemoryAllocatorDesc& desc)
 {
     // pass dynamic function pointers to vma
     VmaVulkanFunctions vmaVkFunc{};
@@ -132,14 +131,14 @@ VkResult VulkanMemoryAllocator::Init(VkInstance       instance,
 
     allocatorCI.physicalDevice   = gpu;
 
-    allocatorCI.vulkanApiVersion = VK_API_VERSION_1_2;
+    allocatorCI.vulkanApiVersion = kVulkanApiVersion;
 
-    if (bufferDeviceAddress)
+    if (desc.bufferDeviceAddress)
     {
         allocatorCI.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     }
 
-    m_memoryBudget = memoryBudget;
+    m_memoryBudget = desc.memoryBudget;
 
     if (m_memoryBudget)
     {
@@ -148,7 +147,7 @@ VkResult VulkanMemoryAllocator::Init(VkInstance       instance,
 
     allocatorCI.pVulkanFunctions = &vmaVkFunc;
 
-    m_logMemoryStats             = RHIOptions::GetInstance().GPUMemoryStats();
+    m_logMemoryStats             = desc.logMemoryStats;
 
     // Block allocation/free callbacks are inexpensive and keep the live UI available
     // without enabling the optional shutdown log or scanning allocations every frame.
@@ -159,7 +158,7 @@ VkResult VulkanMemoryAllocator::Init(VkInstance       instance,
     // VMA rejects allocations past a heap limit and reports budgets within it, so every budget-driven
     // choice (field scratch, shadow preflight, frames in flight) sees the limited device.
     VkDeviceSize   heapLimits[VK_MAX_MEMORY_HEAPS];
-    const uint64_t limit = RHIOptions::GetInstance().DeviceMemoryLimit();
+    const uint64_t limit = desc.deviceMemoryLimit;
 
     for (uint32_t i = 0; i < m_memoryProperties.memoryHeapCount; ++i)
     {
@@ -225,13 +224,13 @@ RHIGPUMemoryStats VulkanMemoryAllocator::GetGPUMemoryStats() const
 
 RHIGPUMemoryStats VulkanRHI::GetGPUMemoryStats() const
 {
-    return GVkMemAllocator != nullptr ? GVkMemAllocator->GetGPUMemoryStats() : RHIGPUMemoryStats{};
+    return m_pMemoryAllocator != nullptr ? m_pMemoryAllocator->GetGPUMemoryStats() : RHIGPUMemoryStats{};
 }
 
-bool VulkanMemoryAllocator::AllocImage(const VkImageCreateInfo* pImageCI,
-                                       bool                     cpuReadable,
-                                       VkImage*                 pImage,
-                                       VulkanMemoryAllocation*  pAllocation)
+RHIError VulkanMemoryAllocator::AllocImage(const VkImageCreateInfo* pImageCI,
+                                           bool                     cpuReadable,
+                                           VkImage*                 pImage,
+                                           VulkanMemoryAllocation*  pAllocation)
 {
     // VMA's default pools sub-allocate small images and buffers from shared blocks.
     VmaAllocationCreateInfo vmaAllocationCI{};
@@ -252,11 +251,11 @@ bool VulkanMemoryAllocator::AllocImage(const VkImageCreateInfo* pImageCI,
     const VkResult result =
         vmaCreateImage(m_vmaAllocator, pImageCI, &vmaAllocationCI, pImage, &pAllocation->handle, &pAllocation->info);
 
-    const bool ready = result == VK_SUCCESS;
+    RHIError error{};
 
-    if (!ready)
+    if (result != VK_SUCCESS)
     {
-        ReportVulkanCreationFailure(result, "vmaCreateImage", __FILE__, __LINE__);
+        error = m_pRHI->ReportCreationFailure(result, "vmaCreateImage", __FILE__, __LINE__);
 
         ZEN_RHI_LOG_ERROR("Image allocation failed: {}", GetResultString(result));
 
@@ -265,7 +264,7 @@ bool VulkanMemoryAllocator::AllocImage(const VkImageCreateInfo* pImageCI,
         *pAllocation = {};
     }
 
-    return ready;
+    return error;
 }
 
 void VulkanMemoryAllocator::FreeImage(VkImage image, const VulkanMemoryAllocation& memAlloc)
@@ -304,11 +303,10 @@ VmaAllocationCreateInfo MakeVmaBufferAllocation(RHIBufferAllocateType allocType,
     return vmaAllocationCI;
 }
 
-bool VulkanMemoryAllocator::AllocBuffer(uint64_t                  size,
-                                        const VkBufferCreateInfo* pBufferCI,
-                                        RHIBufferAllocateType     allocType,
-                                        VkBuffer*                 pBuffer,
-                                        VulkanMemoryAllocation*   pAllocation)
+RHIError VulkanMemoryAllocator::AllocBuffer(const VkBufferCreateInfo* pBufferCI,
+                                            RHIBufferAllocateType     allocType,
+                                            VkBuffer*                 pBuffer,
+                                            VulkanMemoryAllocation*   pAllocation)
 {
     VmaAllocationCreateInfo vmaAllocationCI = MakeVmaBufferAllocation(allocType, m_memoryBudget);
 
@@ -329,6 +327,8 @@ bool VulkanMemoryAllocator::AllocBuffer(uint64_t                  size,
     const bool ready          = result == VK_SUCCESS && *pBuffer != VK_NULL_HANDLE && pAllocation->handle != VK_NULL_HANDLE
                              && (!mappedRequired || pAllocation->info.pMappedData != nullptr);
 
+    RHIError error{};
+
     if (ready)
     {
         pAllocation->hostUpload =
@@ -340,7 +340,7 @@ bool VulkanMemoryAllocator::AllocBuffer(uint64_t                  size,
     }
     else
     {
-        ReportVulkanCreationFailure(result, "vmaCreateBuffer", __FILE__, __LINE__);
+        error = m_pRHI->ReportCreationFailure(result, "vmaCreateBuffer", __FILE__, __LINE__);
 
         ZEN_RHI_LOG_ERROR("Buffer allocation or persistent mapping failed: {}", GetResultString(result));
 
@@ -354,7 +354,7 @@ bool VulkanMemoryAllocator::AllocBuffer(uint64_t                  size,
         *pAllocation = {};
     }
 
-    return ready;
+    return error;
 }
 
 void VulkanMemoryAllocator::FreeBuffer(VkBuffer buffer, const VulkanMemoryAllocation& memAlloc)

@@ -1,4 +1,5 @@
-#include "ZenRHI/Vulkan/VulkanRHIFactory.h"
+#include "ZenRHI/DynamicRHI.h"
+#include "ZenRHI/RHIThread.h"
 #include "ZenRHI/Vulkan/VulkanInterop.h"
 #include "VulkanRHI.h"
 
@@ -8,41 +9,30 @@ namespace
 {
 RHIError InitializeBackend(const RHIDeviceDesc& description, VulkanRHI*& backend, std::vector<RHIAdapterInfo>* adapters)
 {
-    RHIError error;
-    if (GVulkanRHI || GDynamicRHI)
+    RHIWorkerTimer::SetEnabled(description.WorkerTimingEnabled());
+    backend = ZEN_NEW() VulkanRHI(description);
+    RHIError error =
+        backend ? RHIError{} : MakeRHIError(RHIErrorCode::eOutOfHostMemory, "Allocate VulkanRHI", __FILE__, __LINE__);
+    if (backend)
     {
-        error = MakeRHIError(RHIErrorCode::eInvalidArgument, "Vulkan backend already active", __FILE__, __LINE__);
+        backend->GetRuntime().thread.SetStallReports(description.StallReportThreshold(), description.StallFatalThreshold(),
+                                                     description.StallStackCapture());
+        error = backend->InitChecked(adapters);
     }
-    else
+    if (error.IsFailure() || adapters)
     {
-        const RHIDeviceDesc      previous = RHIOptions::GetInstance();
-        const RHIMessageCallback callback = GetRHIMessageCallback();
-        SetRHIMessageCallback(description.messageCallback);
-        RHIOptions::GetInstance().Configure(description);
-        backend = ZEN_NEW() VulkanRHI();
-        error   = backend ? backend->InitChecked(adapters)
-                          : MakeRHIError(RHIErrorCode::eOutOfHostMemory, "Allocate VulkanRHI", __FILE__, __LINE__);
-        if (error.IsFailure() || adapters)
+        if (backend)
         {
-            if (backend)
-            {
-                backend->Destroy();
-            }
-            ZEN_DELETE(backend);
-            backend = nullptr;
-            RHIOptions::GetInstance().Configure(previous);
-            SetRHIMessageCallback(callback);
+            backend->Destroy();
         }
-        else
-        {
-            GDynamicRHI = backend;
-        }
+        ZEN_DELETE(backend);
+        backend = nullptr;
     }
     return error;
 }
 } // namespace
 
-RHIResult<std::vector<RHIAdapterInfo>> EnumerateVulkanAdapters(const RHIDeviceDesc& description)
+RHIResult<std::vector<RHIAdapterInfo>> EnumerateRHIAdapters(const RHIDeviceDesc& description)
 {
     VulkanRHI*                  backend{};
     std::vector<RHIAdapterInfo> adapters;
@@ -51,27 +41,24 @@ RHIResult<std::vector<RHIAdapterInfo>> EnumerateVulkanAdapters(const RHIDeviceDe
     return error.IsFailure() ? Result(error) : Result(std::move(adapters));
 }
 
-RHIResult<DynamicRHI*> CreateVulkanRHIChecked(const RHIDeviceDesc& description)
+RHIResult<DynamicRHI*> CreateRHIChecked(const RHIDeviceDesc& description)
 {
     VulkanRHI*     backend{};
     const RHIError error = InitializeBackend(description, backend, nullptr);
     return error.IsFailure() ? RHIResult<DynamicRHI*>(error) : RHIResult<DynamicRHI*>(backend);
 }
 
-DynamicRHI* CreateVulkanRHI(const RHIDeviceDesc& description)
+DynamicRHI* CreateRHI(const RHIDeviceDesc& description)
 {
-    RHIResult<DynamicRHI*> result = CreateVulkanRHIChecked(description);
+    RHIResult<DynamicRHI*> result = CreateRHIChecked(description);
     ZEN_RHI_VERIFY_MSG_F(result, "{} failed ({})", result.GetError().operation, result.GetError().nativeCode);
     return result.GetValue();
 }
 
-VulkanDeviceHandles GetVulkanDeviceHandles()
+VulkanDeviceHandles GetVulkanDeviceHandles(const DynamicRHI& rhi)
 {
-    VulkanDeviceHandles handles;
-    if (GVulkanRHI && GVulkanRHI->IsInitialized())
-    {
-        handles = {GVulkanRHI->GetInstance(), GVulkanRHI->GetPhysicalDevice(), GVulkanRHI->GetVkDevice()};
-    }
-    return handles;
+    return {reinterpret_cast<VkInstance>(rhi.GetNativeObject(RHINativeObject::eInstance)),
+            reinterpret_cast<VkPhysicalDevice>(rhi.GetNativeObject(RHINativeObject::ePhysicalDevice)),
+            reinterpret_cast<VkDevice>(rhi.GetNativeObject(RHINativeObject::eDevice))};
 }
 } // namespace zen

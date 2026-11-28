@@ -1,7 +1,6 @@
 #pragma once
 #include "ZenRHI/RHIDiagnostics.h"
 #include "ZenFoundation/Utils/Errors.h"
-#include "RHIOptions.h"
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -64,6 +63,12 @@ struct [[nodiscard]] RHIWaitResult
 {
     RHIWaitOutcome outcome{RHIWaitOutcome::eIncomplete};
     RHIError       error{};
+
+    // True only for completion; an incomplete or failed wait never grants reuse.
+    explicit operator bool() const
+    {
+        return outcome == RHIWaitOutcome::eCompleted;
+    }
 };
 
 enum class RHIJobAdmission : uint8_t
@@ -154,6 +159,11 @@ public:
         return *m_value;
     }
 
+    T GetValueOr(T fallback) const
+    {
+        return m_value.has_value() ? *m_value : fallback;
+    }
+
 private:
     std::optional<T> m_value;
     RHIError         m_error{};
@@ -188,19 +198,6 @@ private:
     RHIError m_error{};
 };
 
-// Teardown ownership is fatal under RHIOptions::StrictTeardownChecks and logged otherwise.
-inline void VerifyTeardownOwnership(bool released, const char* message, const char* pFile, int line)
-{
-    if (!released)
-    {
-        if (RHIOptions::GetInstance().StrictTeardownChecks())
-        {
-            VerificationFailure("teardown ownership", pFile, line, message);
-        }
-        else
-        {
-            ZEN_RHI_LOG_ERROR("{}", message);
-        }
-    }
-}
+// Teardown ownership is fatal under GetRHIStrictTeardownChecks() and logged otherwise.
+void VerifyTeardownOwnership(bool released, const char* message, const char* pFile, int line);
 } // namespace zen

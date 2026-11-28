@@ -2,6 +2,7 @@
 #include <vk_mem_alloc.h>
 #include <atomic>
 #include "ZenRHI/RHICommon.h"
+#include "ZenRHI/RHIError.h"
 #include "ZenRHI/RHIGPUMemoryStats.h"
 
 namespace zen
@@ -15,36 +16,47 @@ struct VulkanMemoryAllocation
     bool              hostUpload{false};
 };
 
+class VulkanRHI;
+
+struct VulkanMemoryAllocatorDesc
+{
+    bool     bufferDeviceAddress{false};
+    bool     memoryBudget{false};
+    uint64_t deviceMemoryLimit{0}; // RHIDeviceDesc::DeviceMemoryLimit
+    bool     logMemoryStats{false};
+};
+
 class VulkanMemoryAllocator
 {
 public:
-    VulkanMemoryAllocator() = default;
+    // pRHI receives creation failures.
+    explicit VulkanMemoryAllocator(VulkanRHI* pRHI) : m_pRHI(pRHI) {}
 
     ~VulkanMemoryAllocator();
 
-    VkResult Init(VkInstance       instance,
-                  VkPhysicalDevice gpu,
-                  VkDevice         device,
-                  bool             bufferDeviceAddress,
-                  bool             memoryBudget = false);
+    VkResult Init(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, const VulkanMemoryAllocatorDesc& desc);
 
     void BeginFrame(uint32_t frame);
 
     RHIGPUMemoryStats GetGPUMemoryStats() const;
 
-    bool AllocImage(const VkImageCreateInfo* pImageCI, bool cpuReadable, VkImage* pImage, VulkanMemoryAllocation* pAllocation);
+    RHIError AllocImage(const VkImageCreateInfo* pImageCI,
+                        bool                     cpuReadable,
+                        VkImage*                 pImage,
+                        VulkanMemoryAllocation*  pAllocation);
 
     void FreeImage(VkImage image, const VulkanMemoryAllocation& memAlloc);
 
-    bool AllocBuffer(uint64_t                  size,
-                     const VkBufferCreateInfo* pBufferCI,
-                     RHIBufferAllocateType     allocType,
-                     VkBuffer*                 pBuffer,
-                     VulkanMemoryAllocation*   pAllocation);
+    RHIError AllocBuffer(const VkBufferCreateInfo* pBufferCI,
+                         RHIBufferAllocateType     allocType,
+                         VkBuffer*                 pBuffer,
+                         VulkanMemoryAllocation*   pAllocation);
 
     void FreeBuffer(VkBuffer buffer, const VulkanMemoryAllocation& memAlloc);
 
 private:
+    VulkanRHI* m_pRHI{nullptr};
+
     static void VKAPI_PTR
     MemoryAllocated(VmaAllocator allocator, uint32_t memoryType, VkDeviceMemory memory, VkDeviceSize size, void* userData);
 

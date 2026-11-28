@@ -133,31 +133,6 @@ TEST(VulkanSynchronizationTests, UploadToUniformBufferUsesUniformReadAccess)
               VkAccessFlags(VK_ACCESS_SHADER_READ_BIT));
 }
 
-TEST(VulkanSynchronizationTests, ReleasingUnusedSemaphoreSlotsDoesNotPopulateThePool)
-{
-    static std::string diagnostics;
-    diagnostics.clear();
-    zen::SetRHIMessageCallback([](zen::RHIMessageSeverity, std::string_view message) noexcept { diagnostics.append(message); });
-
-    zen::VulkanSemaphoreManager manager(nullptr);
-
-    zen::VulkanSemaphore* semaphore = nullptr;
-
-    manager.ReleaseSemaphore(semaphore);
-
-    manager.ReleaseSemaphore(semaphore);
-
-    manager.Destroy();
-
-    manager.Destroy();
-
-    zen::SetRHIMessageCallback(nullptr);
-
-    EXPECT_EQ(semaphore, nullptr);
-
-    EXPECT_TRUE(diagnostics.empty()) << diagnostics;
-}
-
 namespace
 {
 using zen::test::ScopedVulkanCall;

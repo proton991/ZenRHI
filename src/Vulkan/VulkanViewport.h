@@ -10,14 +10,14 @@ class VulkanRHI;
 class VulkanQueue;
 class VulkanDevice;
 class VulkanSemaphore;
-class VulkanCommandBuffer;
-struct VulkanTexture;
-struct FVulkanCommandListContext;
+class VulkanTexture;
+struct VulkanCommandListContext;
 
 class VulkanViewport : public RHIViewport
 {
 public:
-    static VulkanViewport* CreateObject(zen::RHIWindowHandle         pWindow,
+    static VulkanViewport* CreateObject(VulkanDevice*                pDevice,
+                                        zen::RHIWindowHandle         pWindow,
                                         uint32_t                     width,
                                         uint32_t                     height,
                                         bool                         enableVSync,
@@ -45,13 +45,9 @@ public:
         return m_depthFormat;
     }
 
-    void PrepareForPresent(RHICommandList* pCmdList) final;
+    RHIStatus PrepareForPresent(RHICommandList* commands) final;
 
-    bool Present() final;
-
-    RHIStatus PrepareForPresentChecked(RHICommandList* commands) override;
-
-    RHIPresentResult PresentChecked() override;
+    RHIPresentResult Present() final;
 
     bool NeedsRecreation() const final;
 
@@ -59,9 +55,9 @@ public:
 
     RHITexture* GetColorBackBuffer() final;
 
-    RHITextureSubResourceRange GetColorBackBufferRange() final
+    RHITextureSubresourceRange GetColorBackBufferRange() final
     {
-        RHITextureSubResourceRange range;
+        RHITextureSubresourceRange range;
         range.aspect.SetFlag(RHITextureAspectFlagBits::eColor);
         range.layerCount     = 1;
         range.levelCount     = 1;
@@ -73,9 +69,9 @@ public:
 
     RHITexture* GetDepthStencilBackBuffer() final;
 
-    RHITextureSubResourceRange GetDepthStencilBackBufferRange() final
+    RHITextureSubresourceRange GetDepthStencilBackBufferRange() final
     {
-        RHITextureSubResourceRange range{};
+        RHITextureSubresourceRange range{};
         range.aspect.SetFlag(RHITextureAspectFlagBits::eDepth);
 
         if (FormatIsDepthStencil(m_depthFormat))
@@ -94,22 +90,25 @@ public:
     void Resize(uint32_t width, uint32_t height) final;
 
 protected:
-    void Init() override;
+    void Init();
 
     void Destroy() override;
 
 private:
     friend struct VulkanViewportTestAccess;
 
-    VulkanViewport(zen::RHIWindowHandle pWindowPtr, uint32_t width, uint32_t height, bool enableVSync);
+    VulkanViewport(VulkanDevice* pDevice, zen::RHIWindowHandle pWindowPtr, uint32_t width, uint32_t height, bool enableVSync);
 
     bool CreateSwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo);
+
+    // Creates the color and depth back buffers and records their first transition; a failure lands in m_recreationError.
+    bool CreateBackBuffers();
 
     void DestroySwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo);
 
     bool TryAcquireNextImage();
 
-    bool PresentInternal(bool deferRecreation);
+    void RecordPresentCopy(RHICommandList* pCommandList);
 
     bool BeginResize(uint32_t width, uint32_t height, VulkanSwapchainRecreateInfo* recreateInfo);
 
@@ -122,13 +121,10 @@ private:
 
     VulkanDevice* m_pDevice{nullptr};
 
-    DataFormat          m_depthFormat;
-    VulkanSwapchain*    m_pSwapchain{nullptr};
-    int32_t             m_acquiredImageIndex{-1};
-    VulkanSemaphore*    m_pImageAcquiredSemaphore{nullptr};
-    HeapVector<VkImage> m_swapchainImages;
-    VulkanTexture*      m_pColorBackBuffer{nullptr};
-    VulkanTexture*      m_pDepthStencilBackBuffer{nullptr};
+    DataFormat       m_depthFormat;
+    VulkanSwapchain* m_pSwapchain{nullptr};
+    VulkanTexture*   m_pColorBackBuffer{nullptr};
+    VulkanTexture*   m_pDepthStencilBackBuffer{nullptr};
 
     uint64_t         m_presentSignalGeneration{0};
     bool             m_presentAcquiredFailed{false};

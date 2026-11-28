@@ -229,9 +229,32 @@ inline bool DescriptorBindingAllowsAccess(const SpvReflectDescriptorBinding& bin
     return allowed;
 }
 
+// How a reflected descriptor maps to a shader resource. Dynamic buffers have no mapping.
+struct SpvDescriptorMapping
+{
+    SpvReflectDescriptorType spirv;
+    RHIShaderResourceType    type;
+    // The binding is a block with a size.
+    bool block;
+    // NonWritable and NonReadable decorations restrict the access; other types are read-only.
+    bool storage;
+};
+
+inline constexpr SpvDescriptorMapping kSpvDescriptorMappings[] = {
+    {SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLER, RHIShaderResourceType::eSampler, false, false},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, RHIShaderResourceType::eSamplerWithTexture, false, false},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE, RHIShaderResourceType::eTexture, false, false},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE, RHIShaderResourceType::eImage, false, true},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, RHIShaderResourceType::eTextureBuffer, false, false},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, RHIShaderResourceType::eImageBuffer, false, true},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER, RHIShaderResourceType::eUniformBuffer, true, false},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER, RHIShaderResourceType::eStorageBuffer, true, true},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, RHIShaderResourceType::eInputAttachment, false, false},
+    {SPV_REFLECT_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, RHIShaderResourceType::eAccelerationStructure, false, false},
+};
+
 inline bool ParseSpvReflectDescriptorBinding(const SpvReflectDescriptorBinding& reflBinding, RHIShaderResourceDescriptor& srd)
 {
-    bool needArrayDims = false;
     bool needBlockSize = false;
     bool writable      = false;
     bool readable      = true;
@@ -245,104 +268,34 @@ inline bool ParseSpvReflectDescriptorBinding(const SpvReflectDescriptorBinding& 
         srd.name = reflBinding.name != nullptr ? reflBinding.name : "";
     }
 
-    srd.set       = reflBinding.set;
-    srd.binding   = reflBinding.binding;
-    srd.arraySize = 1;
+    srd.set                             = reflBinding.set;
+    srd.binding                         = reflBinding.binding;
+    srd.arraySize                       = 1;
 
-    switch (reflBinding.descriptor_type)
+    const SpvDescriptorMapping* mapping = nullptr;
+
+    for (const SpvDescriptorMapping& candidate : kSpvDescriptorMappings)
     {
-        case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLER:
+        if (candidate.spirv == reflBinding.descriptor_type)
         {
-            srd.type      = RHIShaderResourceType::eSampler;
-            needArrayDims = true;
+            mapping = &candidate;
         }
-        break;
+    }
 
-        case SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    if (mapping != nullptr)
+    {
+        srd.type      = mapping->type;
+        needBlockSize = mapping->block;
+        if (mapping->storage)
         {
-            srd.type      = RHIShaderResourceType::eSamplerWithTexture;
-            needArrayDims = true;
+            writable = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_WRITABLE);
+            readable = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_READABLE);
         }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-        {
-            srd.type      = RHIShaderResourceType::eTexture;
-            needArrayDims = true;
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-        {
-            srd.type      = RHIShaderResourceType::eImage;
-            needArrayDims = true;
-            writable      = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_WRITABLE);
-            readable      = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_READABLE);
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-        {
-            srd.type      = RHIShaderResourceType::eTextureBuffer;
-            needArrayDims = true;
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-        {
-            srd.type      = RHIShaderResourceType::eImageBuffer;
-            needArrayDims = true;
-            writable      = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_WRITABLE);
-            readable      = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_READABLE);
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-        {
-            srd.type      = RHIShaderResourceType::eUniformBuffer;
-            needBlockSize = true;
-            needArrayDims = true;
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-        {
-            srd.type      = RHIShaderResourceType::eStorageBuffer;
-            needBlockSize = true;
-            needArrayDims = true;
-            writable      = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_WRITABLE);
-            readable      = DescriptorBindingAllowsAccess(reflBinding, SPV_REFLECT_DECORATION_NON_READABLE);
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-        {
-            ZEN_RHI_LOG_ERROR("Dynamic srd buffer not supported.");
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-        {
-            ZEN_RHI_LOG_ERROR("Dynamic storage buffer not supported.");
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-        {
-            srd.type      = RHIShaderResourceType::eInputAttachment;
-            needArrayDims = true;
-        }
-        break;
-
-        case SPV_REFLECT_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
-        {
-            srd.type      = RHIShaderResourceType::eAccelerationStructure;
-            needArrayDims = true;
-            readable      = true;
-            writable      = false;
-        }
-        break;
-        default: break;
+    }
+    else
+    {
+        ZEN_RHI_LOG_ERROR("Descriptor '{}' has unsupported type {}", srd.name,
+                          static_cast<int32_t>(reflBinding.descriptor_type));
     }
 
     // Contradictory or incomplete restrictions must not suppress both capabilities.
@@ -354,7 +307,7 @@ inline bool ParseSpvReflectDescriptorBinding(const SpvReflectDescriptorBinding& 
     srd.readable = readable;
     srd.writable = writable;
 
-    if (needArrayDims)
+    if (mapping != nullptr)
     {
         for (uint32_t i = 0; i < reflBinding.array.dims_count; i++)
         {

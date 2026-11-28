@@ -100,7 +100,7 @@ protected:
     std::unique_ptr<test::ScopedVulkanCall<PFN_vkCmdBeginRenderingKHR>>    observeBegin;
     std::unique_ptr<test::ScopedVulkanCall<PFN_vkCreateImageView>>         observeView;
     std::unique_ptr<test::ScopedVulkanCall<PFN_vkCreateGraphicsPipelines>> observePipeline;
-    FVulkanCommandListContext*                                             context{};
+    VulkanCommandListContext*                                              context{};
     VkDebugUtilsMessengerEXT                                               messenger{};
     HeapVector<RHITexture*>                                                textures;
     HeapVector<RHIBuffer*>                                                 buffers;
@@ -140,7 +140,7 @@ protected:
         observeView =
             std::make_unique<test::ScopedVulkanCall<PFN_vkCreateImageView>>(vkCreateImageView, AttachmentObserver::CreateView);
 
-        context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        context = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
         observePipeline = std::make_unique<test::ScopedVulkanCall<PFN_vkCreateGraphicsPipelines>>(
             vkCreateGraphicsPipelines, AttachmentObserver::CreatePipeline);
@@ -384,7 +384,7 @@ protected:
             info.stageFlags.SetFlag(RHIShaderStageToFlagBits(stage));
 
             zen::test::LoadShaderModule(info, stage,
-                                        std::filesystem::path(RDG_REFLECTION_TEST_PATH)
+                                        std::filesystem::path(ZENRHI_TEST_SHADER_DIR)
                                             / (stage == RHIShaderStage::eVertex
                                                    ? "pipeline.vert.spv"
                                                    : (depthOnly ? "pipeline_depth.frag.spv" : "pipeline.frag.spv")));
@@ -1137,7 +1137,7 @@ TEST_F(VulkanAttachmentIntegrationTest, SingleLayerArrayViewsSampleAndStoreWitho
     RHIShaderCreateInfo shaderInfo{};
     shaderInfo.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
     zen::test::LoadShaderModule(shaderInfo, RHIShaderStage::eCompute,
-                                std::filesystem::path(RDG_REFLECTION_TEST_PATH) / "binding_single_layer_array.comp.spv");
+                                std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / "binding_single_layer_array.comp.spv");
     RHIShader* shader = session->rhi.CreateShader(shaderInfo);
     ASSERT_NE(shader, nullptr);
     shaders.push_back(shader);
@@ -1228,7 +1228,7 @@ TEST_F(VulkanAttachmentIntegrationTest, BC4AndBC5SamplingExposeNativeChannelsWit
     RHIShaderCreateInfo shaderInfo{};
     shaderInfo.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
     zen::test::LoadShaderModule(shaderInfo, RHIShaderStage::eCompute,
-                                std::filesystem::path(RDG_REFLECTION_TEST_PATH) / "binding_sampler.comp.spv");
+                                std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / "binding_sampler.comp.spv");
     RHIShader* shader = session->rhi.CreateShader(shaderInfo);
     ASSERT_NE(shader, nullptr);
     shaders.push_back(shader);
@@ -1408,21 +1408,22 @@ struct TextureAllocationDriver
 class ScopedTextureTestAllocator
 {
 public:
-    explicit ScopedTextureTestAllocator(VulkanRHI& rhi) : m_previous(GVkMemAllocator)
+    explicit ScopedTextureTestAllocator(VulkanRHI& rhi) : m_rhi(rhi), m_allocator(&rhi)
     {
         m_allocator.Init(rhi.GetInstance(), rhi.GetPhysicalDevice(), rhi.GetVkDevice(),
-                         rhi.GetDevice()->GetExtensionFlags().hasBufferDeviceAddress != 0);
+                         {rhi.GetDevice()->GetExtensionFlags().hasBufferDeviceAddress != 0});
 
-        GVkMemAllocator = &m_allocator;
+        m_previous = VulkanRHITestAccess::ReplaceMemoryAllocator(rhi, &m_allocator);
     }
 
     ~ScopedTextureTestAllocator()
     {
-        GVkMemAllocator = m_previous;
+        VulkanRHITestAccess::ReplaceMemoryAllocator(m_rhi, m_previous);
     }
 
 private:
-    VulkanMemoryAllocator* m_previous;
+    VulkanRHI&             m_rhi;
+    VulkanMemoryAllocator* m_previous{nullptr};
     VulkanMemoryAllocator  m_allocator;
 };
 
@@ -1559,8 +1560,7 @@ TEST_F(VulkanAttachmentIntegrationTest, IntegerAttachmentAndTextureClearReadBack
             RHIRenderingLayout layout{};
             layout.SetRenderArea(0, 0, 8, 8);
             layout.AddColorRenderTarget(DataFormat::eR32UInt, texture, RHIRenderTargetLoadOp::eClear,
-                                        RHIRenderTargetStoreOp::eStore,
-                                        RHIRenderTargetClearValue::ColorClear(Color(7, 0, 0, 0)));
+                                        RHIRenderTargetStoreOp::eStore, RHIRenderTargetClearValue(Color(7, 0, 0, 0)));
             context->RHIBeginRendering(&layout);
             context->RHIEndRendering();
             Transition(texture, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);

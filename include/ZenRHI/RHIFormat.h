@@ -80,17 +80,6 @@ enum class SampleCount : uint32_t
     eMax = 7
 };
 
-struct TextureFormat
-{
-    DataFormat  internalFormat{DataFormat::eUndefined};
-    SampleCount samples{SampleCount::e1};
-    uint32_t    width{1};
-    uint32_t    height{1};
-    uint32_t    depth{1};
-    uint32_t    arrayLayers{1};
-    uint32_t    mipmaps{1};
-};
-
 // Logical texel-block bytes; allocation padding comes from native image memory requirements.
 inline uint32_t GetTextureFormatPixelSize(DataFormat format)
 {

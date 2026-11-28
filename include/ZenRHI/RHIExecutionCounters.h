@@ -1,8 +1,11 @@
 #pragma once
 
-#include "RHIOptions.h"
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 
 namespace zen
 {
@@ -25,7 +28,7 @@ class RHIWorkerTimer
 {
 public:
     explicit RHIWorkerTimer(RHIWorkerTime category, bool measure = true) :
-        m_enabled(measure && RHIOptions::GetInstance().WorkerTimingEnabled()), m_category(category)
+        m_enabled(measure && s_enabled.load(std::memory_order_relaxed)), m_category(category)
     {
         if (m_enabled)
         {
@@ -53,10 +56,16 @@ public:
     RHIWorkerTimer(const RHIWorkerTimer&)            = delete;
     RHIWorkerTimer& operator=(const RHIWorkerTimer&) = delete;
 
+    // Process-wide, like the totals it guards. Device creation applies RHIDeviceDesc::WorkerTimingEnabled.
+    static void SetEnabled(bool enabled)
+    {
+        s_enabled.store(enabled, std::memory_order_relaxed);
+    }
+
     static RHIWorkerTimes Read()
     {
         RHIWorkerTimes times{};
-        if (RHIOptions::GetInstance().WorkerTimingEnabled())
+        if (s_enabled.load(std::memory_order_relaxed))
         {
             for (size_t i = 0; i < times.size(); ++i)
             {
@@ -73,6 +82,7 @@ private:
     std::chrono::steady_clock::time_point m_start;
     uint64_t                              m_children{};
 
+    static inline std::atomic<bool>                                                             s_enabled{};
     static inline thread_local RHIWorkerTimer*                                                  s_active{};
     static inline std::array<std::atomic<uint64_t>, static_cast<size_t>(RHIWorkerTime::eCount)> s_totals{};
 };
@@ -113,10 +123,12 @@ struct RHIExecutionCounterStorage
     std::atomic<uint64_t> buffersCreated{0};
     std::atomic<uint64_t> buffersDestroyed{0};
     std::atomic<uint64_t> rayTraces{0};
+    // Set by the owning backend before it counts anything.
+    bool enabled{true};
 
     void Increment(std::atomic<uint64_t>& counter)
     {
-        if (RHIOptions::GetInstance().ExecutionCountersEnabled())
+        if (enabled)
         {
             counter.fetch_add(1, std::memory_order_relaxed);
         }

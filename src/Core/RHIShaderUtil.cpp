@@ -1,5 +1,6 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include "ShaderReflection.h"
+#include "ZenFoundation/Templates/HashMap.h"
 #include <spirv-tools/libspirv.h>
 
 namespace zen
@@ -103,6 +104,57 @@ bool RHIShaderUtil::ReflectShaderGroupInfo(RHIShaderGroupSPIRVPtr spirv, uint32_
         output = std::move(info);
     }
 
+    return valid;
+}
+
+bool RHIShaderUtil::ValidateShaderLayout(const RHIShaderGroupInfo& info, uint32_t maxDescriptorSets)
+{
+    // Set indices are table positions, so the table size bounds every index and the layout count.
+    bool valid = info.SRDTable.size() <= maxDescriptorSets;
+
+    if (!valid)
+    {
+        ZEN_RHI_LOG_ERROR("Shader '{}' uses {} descriptor sets; the device supports {}", info.name.c_str(),
+                          info.SRDTable.size(), maxDescriptorSets);
+    }
+
+    HashMap<NameID, const RHIShaderResourceDescriptor*> names;
+    for (const std::vector<RHIShaderResourceDescriptor>& set : info.SRDTable)
+    {
+        for (const RHIShaderResourceDescriptor& descriptor : set)
+        {
+            const char* rule = nullptr;
+            if (descriptor.type >= RHIShaderResourceType::eMax)
+            {
+                rule = "unsupported descriptor type";
+            }
+            else if (descriptor.bindless && descriptor.set != kGlobalBindlessHeapIndex)
+            {
+                rule = "runtime arrays are supported only in the global heap";
+            }
+            else if (descriptor.set == kGlobalBindlessHeapIndex
+                     && (!descriptor.bindless || !IsGlobalHeapBinding(descriptor.set, descriptor.binding, descriptor.type)))
+            {
+                rule = "set 0 is reserved for the global heap bindings";
+            }
+            if (!descriptor.name.empty())
+            {
+                const HashMap<NameID, const RHIShaderResourceDescriptor*>::const_iterator found = names.find(descriptor.name);
+                if (found != names.end()
+                    && (found->second->set != descriptor.set || found->second->binding != descriptor.binding))
+                {
+                    rule = "descriptor names must be unique across sets and bindings";
+                }
+                names.emplace(descriptor.name, &descriptor);
+            }
+            if (rule != nullptr)
+            {
+                ZEN_RHI_LOG_ERROR("Shader '{}' stages {} set {} binding {}: {}", info.name.c_str(),
+                                  RHIShaderStageFlagToString(descriptor.stageFlags), descriptor.set, descriptor.binding, rule);
+                valid = false;
+            }
+        }
+    }
     return valid;
 }
 } // namespace zen

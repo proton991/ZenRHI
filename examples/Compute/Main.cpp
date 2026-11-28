@@ -12,7 +12,7 @@ RHICommandListPtr ComputePass::Commands(RHICommandContextType queue)
 void ComputePass::Dispatch(RHICommandList& commands, RHIBatchedShaderParameters& parameters)
 {
     parameters.AddResourceParam(*shader.GetSRDByLocation(1, 0), &output, nullptr, 0);
-    commands.BindPipeline(RHIPipelineType::eCompute, &pipeline);
+    commands.BindPipeline(&pipeline);
     commands.SetShaderParameters(parameters);
     commands.Dispatch(1, 1, 1);
     RHIMemoryTransition readback{RHIAccessFlagBits::eShaderWrite, RHIAccessFlagBits::eHostRead};

@@ -1,5 +1,5 @@
 #include "Vulkan/VulkanLifetimeTracker.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include <gtest/gtest.h>
 
 namespace
@@ -16,7 +16,7 @@ TEST(VulkanLifetimeTrackerDeathTest, TeardownHonorsOwnershipPolicy)
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     EXPECT_EXIT(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(false);
+            SetRHIStrictTeardownChecks(false);
             VulkanLifetimeTracker tracker;
             tracker.Create();
             tracker.Destroy();
@@ -25,7 +25,7 @@ TEST(VulkanLifetimeTrackerDeathTest, TeardownHonorsOwnershipPolicy)
         testing::ExitedWithCode(0), "lifetime");
     EXPECT_DEATH(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(true);
+            SetRHIStrictTeardownChecks(true);
             VulkanLifetimeTracker tracker;
             tracker.Create();
             tracker.Destroy();

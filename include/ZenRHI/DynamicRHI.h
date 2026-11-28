@@ -2,6 +2,8 @@
 #include <span>
 #include "RHICommandList.h"
 #include "RHICommon.h"
+#include "RHIDeviceDesc.h"
+#include "RHIDeviceRuntime.h"
 #include "RHIResource.h"
 #include "RHIFrameState.h"
 #include "RHIGPUFrameTiming.h"
@@ -10,13 +12,6 @@
 
 namespace zen
 {
-struct [[nodiscard]] RHIProgressResult
-{
-    RHICompletionSet submitted;
-    RHICompletionSet completed;
-    RHIError         error{};
-};
-
 class DynamicRHI;
 struct RHIAdapterInfo
 {
@@ -33,24 +28,19 @@ RHIResult<std::vector<RHIAdapterInfo>> EnumerateRHIAdapters(const RHIDeviceDesc&
 RHIResult<DynamicRHI*>                 CreateRHIChecked(const RHIDeviceDesc& description);
 DynamicRHI*                            CreateRHI(const RHIDeviceDesc& description);
 
+enum class RHINativeObject : uint8_t
+{
+    eInstance,
+    ePhysicalDevice,
+    eDevice
+};
+
 class DynamicRHI
 {
 public:
-    static DynamicRHI* Create(RHIAPIType type);
-
-    // A new backend or executor reopens RHI cleanup admission closed by an earlier backend.
-    DynamicRHI();
-
-    // Clears GDynamicRHI when it still points to this object.
-    virtual ~DynamicRHI();
-
-    virtual void Init()    = 0;
+    virtual ~DynamicRHI()  = default;
 
     virtual void Destroy() = 0;
-
-    // Final buffer/texture destruction can occur on RHI after RenderCore releases
-    // its owners. Raw backends do not consume RenderCore retirement bookkeeping.
-    virtual void NotifyResourceDestroyed(uint64_t resourceId) {}
 
     virtual RHIExecutionCounters GetExecutionCounters() const
     {
@@ -73,7 +63,7 @@ public:
 
     virtual void EndFrame()
     {
-        GRHIFrameState.Advance();
+        GetRuntime().frameState.Advance();
     }
 
     RHICompletionSet GetSubmittedSerials() const
@@ -100,23 +90,7 @@ public:
         return result;
     }
 
-    // The snapshots remain valid on failure; they do not certify new completion.
-    RHIProgressResult QueryProgressChecked()
-    {
-        RHIProgressResult result;
-
-        result.completed = QueryCompletedSerials();
-
-        result.submitted = GetSubmittedSerials();
-
-        result.error     = GetTerminalError();
-
-        return result;
-    }
-
     virtual IRHICommandContext* GetCommandContext(RHICommandContextType contextType) = 0;
-
-    virtual IRHICommandContext* GetTransferCommandContext()                          = 0;
 
     virtual RHIAPIType GetAPIType()                                                  = 0;
 
@@ -131,11 +105,14 @@ public:
     // Called on the window owner after outstanding frames drain, as for CreateViewport/Resize.
     // The owner may destroy the native window next, so backends release everything bound to it
     // before returning. Other GPU resource destruction runs through RHI cleanup.
-    virtual void DestroyViewport(RHIViewport* pViewport)                                = 0;
+    virtual void DestroyViewport(RHIViewport* pViewport)                   = 0;
 
-    virtual RHIShader* CreateShader(const RHIShaderCreateInfo& createInfo)              = 0;
+    virtual RHIShader* CreateShader(const RHIShaderCreateInfo& createInfo) = 0;
 
-    virtual void DestroyShader(RHIShader* pShader)                                      = 0;
+    void DestroyShader(RHIShader* pShader)
+    {
+        ReleaseResource(pShader);
+    }
 
     virtual RHIPipeline* CreatePipeline(const RHIComputePipelineCreateInfo& createInfo) = 0;
 
@@ -152,11 +129,17 @@ public:
         return MakeRHIError(RHIErrorCode::eUnsupported, "SnapshotPipelineCache", __FILE__, __LINE__);
     }
 
-    virtual void DestroyPipeline(RHIPipeline* pPipeline)                      = 0;
+    void DestroyPipeline(RHIPipeline* pPipeline)
+    {
+        ReleaseResource(pPipeline);
+    }
 
     virtual RHISampler* CreateSampler(const RHISamplerCreateInfo& createInfo) = 0;
 
-    virtual void DestroySampler(RHISampler* pSampler)                         = 0;
+    void DestroySampler(RHISampler* pSampler)
+    {
+        ReleaseResource(pSampler);
+    }
 
     virtual RHIBindlessHandle RegisterBindlessResource(RHIResource* pResource, uint32_t slotIndex = kInvalidBindlessSlotIndex)
     {
@@ -189,7 +172,10 @@ public:
 
     virtual RHITextureView* CreateTextureView(RHITexture* pBaseTexture, const RHITextureViewCreateInfo& createInfo) = 0;
 
-    virtual void DestroyTexture(RHITexture* pTexture)                                                               = 0;
+    void DestroyTexture(RHITexture* pTexture)
+    {
+        ReleaseResource(pTexture);
+    }
 
     virtual RHIAccelerationStructureBuildSizes GetAccelerationStructureBuildSizes(const RHIAccelerationStructureBuildDesc& desc)
     {
@@ -201,14 +187,6 @@ public:
         return nullptr;
     }
 
-    virtual void DestroyAccelerationStructure(RHIAccelerationStructure* structure)
-    {
-        if (structure != nullptr)
-        {
-            structure->ReleaseReference();
-        }
-    }
-
     virtual RHIBuffer* CreateBuffer(const RHIBufferCreateInfo& createInfo) = 0;
 
     // Native buffer allocation extent, including resource padding, without allocating buffer memory.
@@ -218,17 +196,22 @@ public:
         return 0;
     }
 
-    virtual void DestroyBuffer(RHIBuffer* pBuffer) = 0;
+    void DestroyBuffer(RHIBuffer* pBuffer)
+    {
+        ReleaseResource(pBuffer);
+    }
 
-    // Input lists remain alive through FlushAllGPUCommands. Backends preserve marked
-    // group boundaries and publish each list's accepted serial before releasing outputs.
-    virtual RHIStatus FinalizeCommandLists(std::span<RHICommandList*>            cmdLists,
-                                           std::vector<RHIPlatformCommandList*>& outCommandLists) = 0;
+    // Translates and submits the lists in order, then any other work pending on the queues. Backends keep
+    // marked group boundaries and publish each list's accepted serial before returning; the lists stay alive
+    // until then. A translation failure rejects the whole batch. Rejected work is never retried implicitly.
+    // GetLastSubmissionError() names the cause of a failure.
+    virtual RHISubmissionResult SubmitCommandLists(std::span<RHICommandList*> lists) = 0;
 
-    virtual void SubmitPlatformCommandLists(std::span<RHIPlatformCommandList*> commandLists)      = 0;
-
-    // Consumes all queued platform lists, including rejected work. Never retries them implicitly.
-    virtual RHISubmissionResult FlushAllGPUCommands() = 0;
+    // Submits the work already pending on the queues.
+    RHISubmissionResult FlushAllGPUCommands()
+    {
+        return SubmitCommandLists({});
+    }
 
     // Terminal backend failure, including failures discovered while polling GPU progress.
     // Raw backends are queried on their owning thread; executors publish a thread-safe snapshot.
@@ -254,38 +237,9 @@ public:
         return GetTerminalError();
     }
 
-    virtual RHIStatus WaitDeviceIdleChecked()
-    {
-        WaitDeviceIdle();
-
-        return {GetTerminalError()};
-    }
-
-    virtual RHIWaitResult WaitForCompletionChecked(RHICommandContextType type, uint64_t serial, uint64_t timeoutNS = UINT64_MAX)
-    {
-        const bool completed = WaitForCompletion(type, serial, timeoutNS);
-
-        const RHIError error = GetTerminalError();
-
-        return {error.IsFailure() ? RHIWaitOutcome::eFailed
-                : completed       ? RHIWaitOutcome::eCompleted
-                                  : RHIWaitOutcome::eIncomplete,
-                error};
-    }
-
-    bool IsTransferQueueSharedWithGraphics() const
-    {
-        return GetQueueCapabilities().AreQueuesShared(RHICommandContextType::eTransfer, RHICommandContextType::eGraphics);
-    }
-
     virtual RHIQueueCapabilities GetQueueCapabilities() const
     {
         return {};
-    }
-
-    bool SupportsAsyncSubmissionDependencies() const
-    {
-        return GetQueueCapabilities().asyncSubmissionDependencies;
     }
 
     // Attach dependencies before recording/finalizing the consumer context. Producers must
@@ -308,7 +262,7 @@ public:
                 const bool                  shared   = GetQueueCapabilities().AreQueuesShared(dependency.queue, consumer);
                 if (result && !shared && QueryLastCompletedSerial(dependency.queue) < serial)
                 {
-                    result = WaitForCompletion(dependency.queue, serial);
+                    result = static_cast<bool>(WaitForCompletion(dependency.queue, serial));
                 }
             }
         }
@@ -322,13 +276,25 @@ public:
 
     // Wait only for an already-submitted queue serial. Zero is already complete; zero timeout
     // polls. False means timeout/failure and must never be treated as permission to reuse work.
-    virtual bool WaitForCompletion(RHICommandContextType contextType,
-                                   uint64_t              submissionSerial,
-                                   uint64_t              timeoutNS = UINT64_MAX) = 0;
+    virtual RHIWaitResult WaitForCompletion(RHICommandContextType contextType,
+                                            uint64_t              submissionSerial,
+                                            uint64_t              timeoutNS = UINT64_MAX) = 0;
 
-    virtual void WaitDeviceIdle()                                                = 0;
+    virtual void WaitDeviceIdle()                                                         = 0;
 
-    virtual const RHIGPUInfo& QueryGPUInfo() const                               = 0;
+    virtual const RHIGPUInfo& QueryGPUInfo() const                                        = 0;
+
+    // The description the backend was created with. Immutable, so any thread may read it.
+    virtual const RHIDeviceDesc& GetDeviceDesc() const = 0;
+
+    // The worker, frame pacing and destruction listener of the device. An executor returns its backend's.
+    virtual RHIDeviceRuntime& GetRuntime() = 0;
+
+    // A borrowed native handle, or zero when the backend has none. Valid between initialization and teardown.
+    virtual uint64_t GetNativeObject(RHINativeObject object) const
+    {
+        return 0;
+    }
 
     // Safe to read while the initialized backend is alive, including from the render
     // thread. Reads published counters only; never waits for RHI/GPU work or polls a driver.
@@ -341,15 +307,28 @@ public:
 
     virtual RHIQueueCopyCapabilities GetQueueCopyCapabilities(RHICommandContextType type) const = 0;
 
-    RHIResourceFactory* GetResourceFactory() const
+protected:
+    // A wait reports failure whenever the backend has stopped, even if the serial completed earlier.
+    RHIWaitResult MakeWaitResult(bool completed) const
     {
-        return m_pResourceFactory;
+        const RHIError error = GetTerminalError();
+
+        return {error.IsFailure() ? RHIWaitOutcome::eFailed
+                : completed       ? RHIWaitOutcome::eCompleted
+                                  : RHIWaitOutcome::eIncomplete,
+                error};
     }
 
-protected:
-    RHIResourceFactory* m_pResourceFactory{nullptr};
+private:
+    // Destroy* releases one reference. Final destruction runs on the RHI thread after earlier queued work.
+    static void ReleaseResource(RHIResource* pResource)
+    {
+        if (pResource != nullptr)
+        {
+            pResource->ReleaseReference();
+        }
+    }
 };
 
 // Global instance pointer
 } // namespace zen
-extern zen::DynamicRHI* GDynamicRHI;

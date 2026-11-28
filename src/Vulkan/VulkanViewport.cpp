@@ -3,57 +3,41 @@
 #include "Vulkan/VulkanViewport.h"
 #include "ZenRHI/RHICommandList.h"
 #include "ZenFoundation/Utils/Mutex.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "Vulkan/VulkanTexture.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanBuffer.h"
-#include "Vulkan/VulkanDescriptorPool.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
 #include "Vulkan/VulkanQueue.h"
 #include "Vulkan/VulkanRHI.h"
+#include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanResourceAllocator.h"
 #include "Vulkan/VulkanSynchronization.h"
-#include "Vulkan/Platform/VulkanPlatformCommon.h"
+#include "Vulkan/Platform/VulkanWindowBridge.h"
 
 namespace zen
 {
-namespace
-{
-struct ScopedViewportSurface
-{
-    VkInstance                  instance;
-    VulkanSwapchainRecreateInfo info;
-
-    ~ScopedViewportSurface()
-    {
-        // The swapchain clears the handle when it consumes ownership. Also covers
-        // deferred zero-extent initialization and failures before that handoff.
-        VulkanPlatform::DestroySurface(instance, info.surface);
-    }
-};
-
-RHIResult<VkSurfaceKHR> CreateViewportSurface(RHIWindowHandle window)
-{
-    return VulkanPlatform::CreateSurface(GVulkanRHI->GetInstance(), window);
-}
-} // namespace
 RHIViewport* VulkanRHI::CreateViewport(zen::RHIWindowHandle pWindow, uint32_t width, uint32_t height, bool enableVSync)
 {
-    ScopedViewportSurface surface{GetInstance()};
+    // The viewport's swapchain takes the surface; otherwise the info destroys it on return.
+    VulkanSwapchainRecreateInfo surfaceInfo;
 
     RHIViewport* viewport = nullptr;
 
     if (!AreSubmissionsBlocked())
     {
-        RHIResult<VkSurfaceKHR> created = CreateViewportSurface(pWindow);
+        RHIResult<VkSurfaceKHR> created = CreateWindowSurface(GetInstance(), pWindow);
         if (created)
         {
-            surface.info.surface = created.GetValue();
-            viewport = GetRHIThread().Invoke(&VulkanViewport::CreateObject, pWindow, width, height, enableVSync, &surface.info);
+            surfaceInfo.surface = VulkanSurface(GetInstance(), created.GetValue());
+            viewport = m_runtime->thread.Invoke(&VulkanViewport::CreateObject, m_pDevice, pWindow, width, height, enableVSync,
+                                                &surfaceInfo);
         }
         else
         {
-            GetRHIThread().Invoke(&VulkanRHI::SetCreationError, this, created.GetError());
+            ZEN_RHI_LOG_ERROR("CreateWindowSurface failed: {}",
+                              GetResultString(static_cast<VkResult>(created.GetError().nativeCode)));
         }
     }
 
@@ -64,20 +48,22 @@ void VulkanRHI::DestroyViewport(RHIViewport* pViewport)
 {
     // As in CreateViewport, the window owner waits for the RHI thread: it may destroy the
     // native window next, so the swapchain and surface must be gone before this returns.
-    GetRHIThread().Invoke(&RHIResource::ReleaseReference, pViewport);
+    m_runtime->thread.Invoke(&RHIResource::ReleaseReference, pViewport);
 }
 
-VulkanViewport* VulkanViewport::CreateObject(zen::RHIWindowHandle         pWindow,
+VulkanViewport* VulkanViewport::CreateObject(VulkanDevice*                pDevice,
+                                             zen::RHIWindowHandle         pWindow,
                                              uint32_t                     width,
                                              uint32_t                     height,
                                              bool                         enableVSync,
                                              VulkanSwapchainRecreateInfo* surfaceInfo)
 {
-    ZEN_ASSERT(GetRHIThread().IsCurrentThread());
+    ZEN_ASSERT(pDevice->GetRHI()->GetRuntime().thread.IsCurrentThread());
 
-    VulkanViewport* pViewport = VersatileResource::AllocMem<VulkanViewport>(GVulkanRHI->GetResourceAllocator());
+    VulkanViewport* pViewport = VersatileResource::AllocMem<VulkanViewport>(pDevice->GetRHI()->GetResourceAllocator());
 
-    new (pViewport) VulkanViewport(pWindow, width, height, enableVSync);
+    new (pViewport) VulkanViewport(pDevice, pWindow, width, height, enableVSync);
+    pViewport->BindRuntime(&pDevice->GetRHI()->GetRuntime());
 
     pViewport->Init();
 
@@ -91,17 +77,17 @@ VulkanViewport* VulkanViewport::CreateObject(zen::RHIWindowHandle         pWindo
     return pViewport;
 }
 
-VulkanViewport::VulkanViewport(zen::RHIWindowHandle pWindowPtr, uint32_t width, uint32_t height, bool enableVSync) :
-    RHIViewport(pWindowPtr, width, height, enableVSync), m_pDevice(GVulkanRHI->GetDevice())
-// m_windowPtr(windowPtr),
-// m_width(width),
-// m_height(height),
-// m_enableVSync(enableVSync)
+VulkanViewport::VulkanViewport(VulkanDevice*        pDevice,
+                               zen::RHIWindowHandle pWindowPtr,
+                               uint32_t             width,
+                               uint32_t             height,
+                               bool                 enableVSync) :
+    RHIViewport(pWindowPtr, width, height, enableVSync), m_pDevice(pDevice)
 {}
 
 void VulkanViewport::Init()
 {
-    m_depthFormat = GVulkanRHI->GetSupportedDepthFormat();
+    m_depthFormat = m_pDevice->GetRHI()->GetSupportedDepthFormat();
 
     ZEN_RHI_LOG_INFO("Viewport backbuffer depth format: {}", VkToString(static_cast<VkFormat>(m_depthFormat)));
 }
@@ -112,7 +98,7 @@ void VulkanViewport::Destroy()
 
     this->~VulkanViewport();
 
-    VersatileResource::Free(GVulkanRHI->GetResourceAllocator(), this);
+    VersatileResource::Free(m_pDevice->GetRHI()->GetResourceAllocator(), this);
 }
 
 bool VulkanViewport::CreateSwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo)
@@ -121,27 +107,20 @@ bool VulkanViewport::CreateSwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo)
 
     m_recreationError = {};
 
-    GVulkanRHI->SetCreationError({});
-
-    m_suspended = m_width == 0 || m_height == 0;
+    m_suspended       = m_width == 0 || m_height == 0;
 
     if (!m_suspended)
     {
-        m_pSwapchain             = ZEN_NEW() VulkanSwapchain(m_width, m_height, m_enableVSync, pRecreateInfo);
+        m_pSwapchain      = ZEN_NEW() VulkanSwapchain(m_pDevice, m_width, m_height, m_enableVSync, pRecreateInfo);
 
-        ready                    = static_cast<bool>(m_pSwapchain->GetStatus());
+        ready             = static_cast<bool>(m_pSwapchain->GetStatus());
 
-        m_recreationError        = m_pSwapchain->GetStatus().error;
+        m_recreationError = m_pSwapchain->GetStatus().error;
 
-        const VkImage* pImages   = m_pSwapchain->GetSwapchainImages();
+        // No images means the surface has no presentable extent yet.
+        m_suspended = m_pSwapchain->GetNumSwapchainImages() == 0;
 
-        const uint32_t numImages = m_pSwapchain->GetNumSwapchainImages();
-
-        if (numImages == 0)
-        {
-            m_suspended = true;
-        }
-        else if (ready)
+        if (!m_suspended && ready)
         {
             const VkExtent2D extent = m_pSwapchain->GetExtent();
 
@@ -149,100 +128,100 @@ bool VulkanViewport::CreateSwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo)
 
             m_height                = extent.height;
 
-            m_swapchainImages.resize(numImages);
-
             // Swapchain images belong to the presentation engine until acquired. Their first
             // transition is recorded by PrepareForPresent after acquisition, with a semaphore
             // wait before CopyBackBufferToSwapchainImage overwrites the entire image.
-            for (uint32_t i = 0; i < numImages; i++)
-            {
-                m_swapchainImages[i] = pImages[i];
-            }
-
-            RHITextureCreateInfo colorTexInfo{};
-
-            colorTexInfo.width  = m_width;
-
-            colorTexInfo.height = m_height;
-
-            colorTexInfo.format = GetSwapchainFormat();
-
-            colorTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eColorAttachment);
-
-            colorTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eTransferSrc);
-
-            // UI-only frames clear the logical presentation image through RDG.
-            colorTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eTransferDst);
-
-            colorTexInfo.type  = RHITextureType::e2D;
-
-            colorTexInfo.tag   = "color_back_buffer";
-
-            m_pColorBackBuffer = VulkanTexture::CreateObject(colorTexInfo);
-
-            RHITextureCreateInfo depthStencilTexInfo{};
-
-            depthStencilTexInfo.width  = m_width;
-
-            depthStencilTexInfo.height = m_height;
-
-            depthStencilTexInfo.format = GetDepthStencilFormat();
-
-            depthStencilTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eDepthStencilAttachment);
-
-            depthStencilTexInfo.type  = RHITextureType::e2D;
-
-            depthStencilTexInfo.tag   = "depth_stencil_back_buffer";
-
-            m_pDepthStencilBackBuffer = VulkanTexture::CreateObject(depthStencilTexInfo);
-
-            const bool created        = m_pColorBackBuffer != nullptr && m_pDepthStencilBackBuffer != nullptr;
-
-            FVulkanCommandListContext context(RHICommandContextType::eGraphics, m_pDevice);
-
-            ready = created && context.IsValid() && context.EnsureRecording();
-
-            if (ready)
-            {
-                const VkCommandBuffer cmdBuffer = context.GetCommandBuffer()->GetVkHandle();
-
-                VulkanPipelineBarrier barrier;
-
-                barrier.AddImageBarrier(m_pColorBackBuffer->GetVkImage(), VK_IMAGE_LAYOUT_UNDEFINED,
-                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, m_pColorBackBuffer->GetVkSubresourceRange(),
-                                        0, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-
-                barrier.AddImageBarrier(
-                    m_pDepthStencilBackBuffer->GetVkImage(), VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, m_pDepthStencilBackBuffer->GetVkSubresourceRange(), 0,
-                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
-
-                barrier.Execute(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
-                                    | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
-
-                ready = context.SubmitRecordedWorkloads() == RHISubmissionResult::eSuccess;
-
-                if (!ready)
-                {
-                    m_recreationError = GVulkanRHI->GetSubmissionFailureCause();
-                }
-            }
-            else if (!created)
-            {
-                m_recreationError =
-                    RHIErrorOr(GVulkanRHI->GetLastCreationError(),
-                               MakeRHIError(RHIErrorCode::eBackendFailure, "Viewport backbuffer creation", __FILE__, __LINE__));
-            }
-            else
-            {
-                m_recreationError =
-                    RHIErrorOr(context.GetRecordingError(), MakeRHIError(RHIErrorCode::eBackendFailure,
-                                                                         "Viewport backbuffer recording", __FILE__, __LINE__));
-            }
-
-            m_acquiredImageIndex = -1;
+            ready = CreateBackBuffers();
         }
+    }
+
+    return ready;
+}
+
+bool VulkanViewport::CreateBackBuffers()
+{
+    RHITextureCreateInfo colorTexInfo{};
+
+    colorTexInfo.width  = m_width;
+
+    colorTexInfo.height = m_height;
+
+    colorTexInfo.format = GetSwapchainFormat();
+
+    colorTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eColorAttachment);
+
+    colorTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eTransferSrc);
+
+    // Frames without scene rendering clear the logical presentation image with a transfer.
+    colorTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eTransferDst);
+
+    colorTexInfo.type                     = RHITextureType::e2D;
+
+    colorTexInfo.tag                      = "color_back_buffer";
+
+    const RHIResult<VulkanTexture*> color = VulkanTexture::CreateObject(m_pDevice->GetRHI(), colorTexInfo);
+
+    m_pColorBackBuffer                    = color.GetValueOr(nullptr);
+
+    RHITextureCreateInfo depthStencilTexInfo{};
+
+    depthStencilTexInfo.width  = m_width;
+
+    depthStencilTexInfo.height = m_height;
+
+    depthStencilTexInfo.format = GetDepthStencilFormat();
+
+    depthStencilTexInfo.usageFlags.SetFlag(RHITextureUsageFlagBits::eDepthStencilAttachment);
+
+    depthStencilTexInfo.type                     = RHITextureType::e2D;
+
+    depthStencilTexInfo.tag                      = "depth_stencil_back_buffer";
+
+    const RHIResult<VulkanTexture*> depthStencil = VulkanTexture::CreateObject(m_pDevice->GetRHI(), depthStencilTexInfo);
+
+    m_pDepthStencilBackBuffer                    = depthStencil.GetValueOr(nullptr);
+
+    const bool created                           = m_pColorBackBuffer != nullptr && m_pDepthStencilBackBuffer != nullptr;
+
+    VulkanCommandListContext context(RHICommandContextType::eGraphics, m_pDevice);
+
+    bool ready = created && context.IsValid() && context.EnsureRecording();
+
+    if (ready)
+    {
+        const VkCommandBuffer cmdBuffer = context.GetCommandBuffer()->GetVkHandle();
+
+        VulkanPipelineBarrier barrier;
+
+        barrier.AddImageBarrier(m_pColorBackBuffer->GetVkImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, m_pColorBackBuffer->GetVkSubresourceRange(), 0,
+                                VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+
+        barrier.AddImageBarrier(m_pDepthStencilBackBuffer->GetVkImage(), VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                m_pDepthStencilBackBuffer->GetVkSubresourceRange(), 0,
+                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+        barrier.Execute(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                            | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT);
+
+        ready = context.SubmitRecordedWorkloads() == RHISubmissionResult::eSuccess;
+
+        if (!ready)
+        {
+            m_recreationError = m_pDevice->GetRHI()->GetSubmissionFailureCause();
+        }
+    }
+    else if (!created)
+    {
+        m_recreationError = color ? depthStencil.GetError() : color.GetError();
+    }
+    else
+    {
+        m_recreationError =
+            RHIErrorOr(context.GetRecordingError(),
+                       MakeRHIError(RHIErrorCode::eBackendFailure, "Viewport backbuffer recording", __FILE__, __LINE__));
     }
 
     return ready;
@@ -254,31 +233,25 @@ void VulkanViewport::DestroySwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo
 
     if (m_pSwapchain != nullptr)
     {
-        m_pSwapchain->Destroy(GVulkanRHI->AreSubmissionsBlocked() ? nullptr : pRecreateInfo);
+        m_pSwapchain->Destroy(m_pDevice->GetRHI()->AreSubmissionsBlocked() ? nullptr : pRecreateInfo);
 
         ZEN_DELETE(m_pSwapchain);
 
         m_pSwapchain = nullptr;
     }
 
-    m_swapchainImages.clear();
-
-    m_acquiredImageIndex      = -1;
-
-    m_pImageAcquiredSemaphore = nullptr;
-
     m_presentSignalGeneration = 0;
 
     if (m_pColorBackBuffer)
     {
-        GVulkanRHI->DestroyTexture(m_pColorBackBuffer);
+        m_pDevice->GetRHI()->DestroyTexture(m_pColorBackBuffer);
 
         m_pColorBackBuffer = nullptr;
     }
 
     if (m_pDepthStencilBackBuffer)
     {
-        GVulkanRHI->DestroyTexture(m_pDepthStencilBackBuffer);
+        m_pDevice->GetRHI()->DestroyTexture(m_pDepthStencilBackBuffer);
 
         m_pDepthStencilBackBuffer = nullptr;
     }
@@ -286,11 +259,11 @@ void VulkanViewport::DestroySwapchain(VulkanSwapchainRecreateInfo* pRecreateInfo
 
 bool VulkanViewport::BeginResize(uint32_t width, uint32_t height, VulkanSwapchainRecreateInfo* recreateInfo)
 {
-    ZEN_ASSERT(GetRHIThread().IsCurrentThread());
+    ZEN_ASSERT(m_pDevice->GetRHI()->GetRuntime().thread.IsCurrentThread());
 
     bool rebuild = false;
 
-    if (GVulkanRHI->AreSubmissionsBlocked())
+    if (m_pDevice->GetRHI()->AreSubmissionsBlocked())
     {
         ZEN_RHI_LOG_ERROR("Cannot resize while Vulkan submissions are blocked");
     }
@@ -309,7 +282,7 @@ bool VulkanViewport::BeginResize(uint32_t width, uint32_t height, VulkanSwapchai
 
         DestroySwapchain(recreateSurface ? nullptr : recreateInfo);
 
-        if (GVulkanRHI->AreSubmissionsBlocked())
+        if (m_pDevice->GetRHI()->AreSubmissionsBlocked())
         {
             // Destruction is still legal after device loss, but recreation is not.
             if (recreateInfo->swapchain != VK_NULL_HANDLE)
@@ -317,8 +290,7 @@ bool VulkanViewport::BeginResize(uint32_t width, uint32_t height, VulkanSwapchai
                 vkDestroySwapchainKHR(m_pDevice->GetVkHandle(), recreateInfo->swapchain, nullptr);
             }
 
-            VulkanPlatform::DestroySurface(GVulkanRHI->GetInstance(), recreateInfo->surface);
-
+            // Resetting the info destroys its surface.
             *recreateInfo = {};
 
             ZEN_RHI_LOG_ERROR("Cannot recreate a swapchain after a failed device idle wait");
@@ -334,14 +306,10 @@ bool VulkanViewport::BeginResize(uint32_t width, uint32_t height, VulkanSwapchai
 
 bool VulkanViewport::FinishResize(VulkanSwapchainRecreateInfo* recreateInfo, RHIError surfaceError)
 {
-    ZEN_ASSERT(GetRHIThread().IsCurrentThread());
+    ZEN_ASSERT(m_pDevice->GetRHI()->GetRuntime().thread.IsCurrentThread());
 
     bool replaceSurface = false;
     m_recreationError   = surfaceError;
-    if (surfaceError.IsFailure())
-    {
-        GVulkanRHI->SetCreationError(surfaceError);
-    }
     if (surfaceError.IsFailure() || !CreateSwapchain(recreateInfo))
     {
         DestroySwapchain(nullptr);
@@ -349,10 +317,10 @@ bool VulkanViewport::FinishResize(VulkanSwapchainRecreateInfo* recreateInfo, RHI
         m_suspended    = true;
 
         replaceSurface = !surfaceError.IsFailure() && m_recreationError.nativeCode == VK_ERROR_SURFACE_LOST_KHR
-                      && !GVulkanRHI->AreSubmissionsBlocked();
+                      && !m_pDevice->GetRHI()->AreSubmissionsBlocked();
         if (!replaceSurface)
         {
-            GVulkanRHI->BlockSubmissions(
+            m_pDevice->GetRHI()->BlockSubmissions(
                 RHIErrorOr(m_recreationError,
                            MakeRHIError(RHIErrorCode::eBackendFailure, "Viewport backbuffer recreation", __FILE__, __LINE__)));
 
@@ -360,7 +328,7 @@ bool VulkanViewport::FinishResize(VulkanSwapchainRecreateInfo* recreateInfo, RHI
         }
     }
 
-    ZEN_RHI_VERIFY(recreateInfo->surface == VK_NULL_HANDLE);
+    ZEN_RHI_VERIFY(recreateInfo->surface.Get() == VK_NULL_HANDLE);
 
     ZEN_RHI_VERIFY(recreateInfo->swapchain == VK_NULL_HANDLE);
 
@@ -369,30 +337,18 @@ bool VulkanViewport::FinishResize(VulkanSwapchainRecreateInfo* recreateInfo, RHI
 
 bool VulkanViewport::TryAcquireNextImage()
 {
-    bool returnValue{};
+    const bool usable = !m_suspended && m_pSwapchain != nullptr;
 
-    if (m_suspended)
+    // A rejected presentation-copy submission did not consume the acquire semaphore.
+    // Retry the already acquired image instead of leaking another swapchain acquisition.
+    if (usable && m_pSwapchain->GetAcquiredImageIndex() < 0)
     {
-        returnValue = false;
-    }
-    else
-    {
-        // A rejected presentation-copy submission did not consume the acquire semaphore.
-        // Retry the already acquired image instead of leaking another swapchain acquisition.
-        if (!m_suspended && m_acquiredImageIndex < 0 && m_pSwapchain != nullptr)
-        {
-            const int32_t imageIndex = m_pSwapchain->AcquireNextImage(&m_pImageAcquiredSemaphore);
+        VulkanSemaphore* semaphore = nullptr;
 
-            if (imageIndex >= 0)
-            {
-                m_acquiredImageIndex = imageIndex;
-            }
-        }
-
-        returnValue = m_acquiredImageIndex >= 0;
+        m_pSwapchain->AcquireNextImage(&semaphore);
     }
 
-    return returnValue;
+    return usable && m_pSwapchain->GetAcquiredImageIndex() >= 0;
 }
 
 void VulkanViewport::CopyBackBufferToSwapchainImage(VkCommandBuffer cmdBufferVk,
@@ -477,30 +433,32 @@ void VulkanViewport::CopyBackBufferToSwapchainImage(VkCommandBuffer cmdBufferVk,
     }
 }
 
-void VulkanViewport::PrepareForPresent(RHICommandList* pCommandList)
+void VulkanViewport::RecordPresentCopy(RHICommandList* pCommandList)
 {
-    GetRHIThread().CheckOwnership();
+    m_pDevice->GetRHI()->GetRuntime().thread.CheckOwnership();
 
-    if (!GVulkanRHI->AreSubmissionsBlocked() && TryAcquireNextImage())
+    if (!m_pDevice->GetRHI()->AreSubmissionsBlocked() && TryAcquireNextImage())
     {
-        m_presentAcquiredFailed                      = false;
+        m_presentAcquiredFailed = false;
 
-        VulkanSemaphore* pRenderingCompleteSemaphore = m_pSwapchain->GetRenderingCompleteSemaphore(m_acquiredImageIndex);
+        VulkanSemaphore* pRenderingCompleteSemaphore =
+            m_pSwapchain->GetRenderingCompleteSemaphore(m_pSwapchain->GetAcquiredImageIndex());
 
-        m_presentSignalGeneration                    = pRenderingCompleteSemaphore->GetSignalGeneration();
+        m_presentSignalGeneration          = pRenderingCompleteSemaphore->GetSignalGeneration();
 
-        FVulkanCommandListContext* pContext          = static_cast<FVulkanCommandListContext*>(pCommandList->GetContext());
+        VulkanCommandListContext* pContext = static_cast<VulkanCommandListContext*>(pCommandList->GetContext());
 
-        const VkExtent2D extent                      = m_pSwapchain->GetExtent();
+        const VkExtent2D extent            = m_pSwapchain->GetExtent();
 
         // The wait must precede the copy's command buffer to stay in the same workload.
-        pContext->AddWaitSemaphore(VK_PIPELINE_STAGE_TRANSFER_BIT, m_pImageAcquiredSemaphore);
+        pContext->AddWaitSemaphore(VK_PIPELINE_STAGE_TRANSFER_BIT, m_pSwapchain->GetAcquireSemaphore());
 
         // A failed recording rejects the whole batch, which discards the unsubmitted wait.
         // Record nothing into its native buffer; the acquired image stays held for a retry.
         if (pContext->EnsureRecording())
         {
-            CopyBackBufferToSwapchainImage(pContext->GetCommandBuffer()->GetVkHandle(), m_swapchainImages[m_acquiredImageIndex],
+            CopyBackBufferToSwapchainImage(pContext->GetCommandBuffer()->GetVkHandle(),
+                                           m_pSwapchain->GetSwapchainImages()[m_pSwapchain->GetAcquiredImageIndex()],
                                            extent.width, extent.height);
 
             pContext->AddSignalSemaphore(pRenderingCompleteSemaphore);
@@ -512,22 +470,16 @@ void VulkanViewport::PrepareForPresent(RHICommandList* pCommandList)
     }
 }
 
-bool VulkanViewport::Present()
+RHIPresentResult VulkanViewport::Present()
 {
-    return PresentInternal(false);
-}
-
-bool VulkanViewport::PresentInternal(bool deferRecreation)
-{
-    GetRHIThread().CheckOwnership();
-
-    bool result     = false;
+    m_pDevice->GetRHI()->GetRuntime().thread.CheckOwnership();
 
     m_presentResult = {};
 
-    if (GVulkanRHI->AreSubmissionsBlocked())
+    if (m_pDevice->GetRHI()->AreSubmissionsBlocked())
     {
-        m_presentResult = {RHISurfaceOutcome::eFailed, RHIPresentAcceptance::eNotAttempted, GVulkanRHI->GetTerminalError()};
+        m_presentResult = {RHISurfaceOutcome::eFailed, RHIPresentAcceptance::eNotAttempted,
+                           m_pDevice->GetRHI()->GetTerminalError()};
     }
     else if (!m_suspended && m_pSwapchain != nullptr)
     {
@@ -539,10 +491,10 @@ bool VulkanViewport::PresentInternal(bool deferRecreation)
 
             m_presentResult.error   = m_pSwapchain->GetAcquireResult().error;
         }
-        else if (m_acquiredImageIndex >= 0)
+        else if (m_pSwapchain->GetAcquiredImageIndex() >= 0)
         {
             // Only a new accepted graphics-queue signal authorizes this copy.
-            VulkanSemaphore* semaphore = m_pSwapchain->GetRenderingCompleteSemaphore(m_acquiredImageIndex);
+            VulkanSemaphore* semaphore = m_pSwapchain->GetRenderingCompleteSemaphore(m_pSwapchain->GetAcquiredImageIndex());
 
             const uint64_t serial = semaphore->GetSignalSubmissionSerial(m_pDevice->GetGfxQueue(), m_presentSignalGeneration);
 
@@ -550,34 +502,23 @@ bool VulkanViewport::PresentInternal(bool deferRecreation)
             {
                 m_pSwapchain->MarkAcquireSemaphoreSubmitted(serial);
 
-                result                    = m_pSwapchain->Present(semaphore);
+                m_pSwapchain->Present(semaphore);
 
                 m_presentResult           = m_pSwapchain->GetPresentResult();
-
-                m_acquiredImageIndex      = -1;
-
-                m_pImageAcquiredSemaphore = nullptr;
 
                 m_presentSignalGeneration = 0;
             }
         }
-
-        // Checked submission defers recreation to RenderCore between frames in both
-        // execution modes. The direct legacy API retains its synchronous behavior.
-        if (!deferRecreation && m_pSwapchain->NeedsRecreation() && !GetRHIThread().IsThreaded())
-        {
-            Resize(m_width, m_height);
-        }
     }
 
-    return result;
+    return m_presentResult;
 }
 
-RHIStatus VulkanViewport::PrepareForPresentChecked(RHICommandList* commands)
+RHIStatus VulkanViewport::PrepareForPresent(RHICommandList* commands)
 {
-    PrepareForPresent(commands);
+    RecordPresentCopy(commands);
 
-    RHIError error = GVulkanRHI->GetTerminalError();
+    RHIError error = m_pDevice->GetRHI()->GetTerminalError();
 
     if (!error.IsFailure() && m_pSwapchain != nullptr)
     {
@@ -587,23 +528,19 @@ RHIStatus VulkanViewport::PrepareForPresentChecked(RHICommandList* commands)
     return {error};
 }
 
-RHIPresentResult VulkanViewport::PresentChecked()
-{
-    PresentInternal(true);
-
-    return m_presentResult;
-}
-
 bool VulkanViewport::NeedsRecreation() const
 {
-    return m_suspended || (m_pSwapchain != nullptr && m_pSwapchain->NeedsRecreation());
+    // The swapchain belongs to the RHI thread; other threads wait for the answer there.
+    return m_pDevice->GetRHI()->GetRuntime().thread.Invoke(
+        [this] { return m_suspended || (m_pSwapchain != nullptr && m_pSwapchain->NeedsRecreation()); });
 }
 
 bool VulkanViewport::CanRecreate() const
 {
-    GetRHIThread().CheckOwnership();
-
-    return m_pSwapchain == nullptr || m_pSwapchain->GetNumSwapchainImages() != 0 || m_pSwapchain->HasPresentableExtent();
+    // The surface query runs on the RHI thread; other threads wait for the answer there.
+    return m_pDevice->GetRHI()->GetRuntime().thread.Invoke([this] {
+        return m_pSwapchain == nullptr || m_pSwapchain->GetNumSwapchainImages() != 0 || m_pSwapchain->HasPresentableExtent();
+    });
 }
 
 void VulkanViewport::Resize(uint32_t width, uint32_t height)
@@ -615,19 +552,20 @@ void VulkanViewport::Resize(uint32_t width, uint32_t height)
 
     VulkanSwapchainRecreateInfo recreateInfo;
 
-    bool recreate = GetRHIThread().Invoke(&VulkanViewport::BeginResize, this, width, height, &recreateInfo);
+    bool recreate =
+        m_pDevice->GetRHI()->GetRuntime().thread.Invoke(&VulkanViewport::BeginResize, this, width, height, &recreateInfo);
 
     // Surface loss during native reconstruction must return to the window owner. Retry once
     // immediately; repeated loss remains suspended and pending for the next frame.
     for (uint32_t attempt = 0; recreate && attempt < 2; ++attempt)
     {
         RHIError surfaceError;
-        if (recreateInfo.surface == VK_NULL_HANDLE)
+        if (recreateInfo.surface.Get() == VK_NULL_HANDLE)
         {
-            RHIResult<VkSurfaceKHR> created = CreateViewportSurface(m_pWindow);
+            RHIResult<VkSurfaceKHR> created = CreateWindowSurface(m_pDevice->GetRHI()->GetInstance(), m_pWindow);
             if (created)
             {
-                recreateInfo.surface = created.GetValue();
+                recreateInfo.surface = VulkanSurface(m_pDevice->GetRHI()->GetInstance(), created.GetValue());
             }
             else
             {
@@ -635,7 +573,8 @@ void VulkanViewport::Resize(uint32_t width, uint32_t height)
             }
         }
 
-        recreate = GetRHIThread().Invoke(&VulkanViewport::FinishResize, this, &recreateInfo, surfaceError);
+        recreate =
+            m_pDevice->GetRHI()->GetRuntime().thread.Invoke(&VulkanViewport::FinishResize, this, &recreateInfo, surfaceError);
     }
 }
 

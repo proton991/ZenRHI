@@ -1,14 +1,17 @@
 #include "ZenRHI/Vulkan/VulkanInterop.h"
 #include "TestShaderModule.h"
 #include "VulkanIntegrationFixture.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "Vulkan/VulkanSetLayout.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanPipeline.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanMemory.h"
-#include "Vulkan/VulkanDescriptorPool.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "Vulkan/VulkanBindlessHeap.h"
 #include "Vulkan/VulkanSynchronization.h"
 #include "Vulkan/VulkanCommandList.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include <gtest/gtest.h>
 #include <filesystem>
 #include "ZenRHI/TestSupport/Validation.h"
@@ -54,9 +57,9 @@ VKAPI_ATTR void VKAPI_CALL RejectBindless(VkDevice,
     support->supported = VK_FALSE;
 }
 
-void InjectStartupFault(RHIMessageSeverity, std::string_view message) noexcept
+void InjectStartupFault(const RHIMessage& diagnostic) noexcept
 {
-    if (message.starts_with("Active validation layer="))
+    if (diagnostic.text.starts_with("Active validation layer="))
     {
         originalDestroyInstance = vkDestroyInstance;
         vkDestroyInstance       = CountDestroyedInstance;
@@ -65,7 +68,7 @@ void InjectStartupFault(RHIMessageSeverity, std::string_view message) noexcept
             vkEnumeratePhysicalDevices = FailEnumeration;
         }
     }
-    if (startupFault == StartupFault::eDevice && message.starts_with("Vulkan queues:"))
+    if (startupFault == StartupFault::eDevice && diagnostic.text.starts_with("Vulkan queues:"))
     {
         originalDestroyDevice           = vkDestroyDevice;
         vkDestroyDevice                 = CountDestroyedDevice;
@@ -76,9 +79,8 @@ void InjectStartupFault(RHIMessageSeverity, std::string_view message) noexcept
 TEST(VulkanProductionFailureTest, CheckedStartupRestoresHostAndRetries)
 {
     const RHIMessageCallback previous = GetRHIMessageCallback();
-    const RHIDeviceDesc      original = RHIOptions::GetInstance();
-    RHIDeviceDesc            desc     = original;
-    desc.messageCallback              = InjectStartupFault;
+    RHIDeviceDesc            desc     = test::MakeTestDeviceDesc();
+    SetRHIMessageCallback(InjectStartupFault);
     desc.SetPreferredDevice("startup retry test");
     // Force the same physical adapter as the rest of this hardware run.
     const char* preferred = std::getenv("ZEN_VULKAN_DEVICE");
@@ -96,16 +98,12 @@ TEST(VulkanProductionFailureTest, CheckedStartupRestoresHostAndRetries)
                   fault == StartupFault::eInstance ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_FEATURE_NOT_PRESENT);
         EXPECT_EQ(destroyedInstances, 1u);
         EXPECT_EQ(destroyedDevices, fault == StartupFault::eDevice ? 1u : 0u);
-        EXPECT_EQ(GDynamicRHI, nullptr);
-        EXPECT_EQ(GetVulkanDeviceHandles().device, VK_NULL_HANDLE);
-        EXPECT_EQ(GetRHIMessageCallback(), previous);
-        EXPECT_EQ(RHIOptions::GetInstance().PreferredDevice(), original.PreferredDevice());
     }
     desc.surfaceExtensions = []() -> std::span<const char* const> {
         static constexpr const char* names[] = {"VK_ZEN_unavailable_host_surface"};
         return names;
     };
-    desc.messageCallback           = previous;
+    SetRHIMessageCallback(previous);
     RHIResult<DynamicRHI*> missing = CreateRHIChecked(desc);
     if (missing)
     {
@@ -115,9 +113,9 @@ TEST(VulkanProductionFailureTest, CheckedStartupRestoresHostAndRetries)
     ASSERT_FALSE(missing);
     EXPECT_EQ(missing.GetError().nativeCode, VK_ERROR_EXTENSION_NOT_PRESENT);
 
-    RHIResult<DynamicRHI*> created = CreateRHIChecked(original);
+    RHIResult<DynamicRHI*> created = CreateRHIChecked(test::MakeTestDeviceDesc());
     ASSERT_TRUE(created);
-    EXPECT_NE(GetVulkanDeviceHandles().device, VK_NULL_HANDLE);
+    EXPECT_NE(GetVulkanDeviceHandles(*created.GetValue()).device, VK_NULL_HANDLE);
     created.GetValue()->Destroy();
     ZEN_DELETE(created.GetValue());
 }
@@ -175,7 +173,7 @@ void AddProductionStage(RHIShaderCreateInfo& info, RHIShaderStage stage, const c
 {
     info.stageFlags.SetFlag(RHIShaderStageToFlagBits(stage));
 
-    zen::test::LoadShaderModule(info, stage, std::filesystem::path(RDG_REFLECTION_TEST_PATH) / file);
+    zen::test::LoadShaderModule(info, stage, std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / file);
 }
 
 TEST(VulkanProductionFailureTest, GraphicsAndComputeFailuresCleanPartialOutputsAndAllowRetry)
@@ -299,7 +297,7 @@ TEST(VulkanProductionFailureTest, BufferAllocationAndMappingFailureReturnNullWit
 
     for (bool mapping : {false, true})
     {
-        VulkanMemoryAllocator allocator;
+        VulkanMemoryAllocator allocator(&session.rhi);
 
         const PFN_vkAllocateMemory allocate = vkAllocateMemory;
 
@@ -320,11 +318,9 @@ TEST(VulkanProductionFailureTest, BufferAllocationAndMappingFailureReturnNullWit
         }
 
         allocator.Init(session.rhi.GetInstance(), session.rhi.GetDevice()->GetPhysicalDeviceHandle(), session.rhi.GetVkDevice(),
-                       false);
+                       {});
 
-        VulkanMemoryAllocator* original = GVkMemAllocator;
-
-        GVkMemAllocator                 = &allocator;
+        VulkanMemoryAllocator* original = VulkanRHITestAccess::ReplaceMemoryAllocator(session.rhi, &allocator);
 
         RHIBufferCreateInfo info{};
 
@@ -345,7 +341,7 @@ TEST(VulkanProductionFailureTest, BufferAllocationAndMappingFailureReturnNullWit
             EXPECT_EQ(allocator.GetGPUMemoryStats().committedBytes, 0u);
         }
 
-        GVkMemAllocator = original;
+        VulkanRHITestAccess::ReplaceMemoryAllocator(session.rhi, original);
     }
 }
 
@@ -425,26 +421,37 @@ TEST(VulkanProductionFailureTest, ShaderStagesLayoutsAndSamplerRejectNativeFailu
     session.rhi.DestroyShader(retry);
 }
 
-TEST(VulkanProductionFailureTest, DescriptorPoolAndFenceFailureDoNotPublishOwners)
+TEST(VulkanProductionFailureTest, DescriptorPoolFailureHandsOutAndPublishesNoSet)
 {
     test::VulkanSession session;
+
+    RHIShaderResourceDescriptor descriptor{};
+    descriptor.type               = RHIShaderResourceType::eStorageBuffer;
+    descriptor.arraySize          = 1;
+    descriptor.stageFlags         = RHIShaderStageFlagBits::eCompute;
+    const VulkanSetLayout* layout = session.rhi.GetSetLayoutCache()->GetOrCreate({&descriptor, 1});
+    ASSERT_NE(layout, nullptr);
+    const VulkanDescriptorAllocator::Key key{layout->id, {1}};
+    VulkanDescriptorAllocator            allocator(session.rhi.GetDevice());
     {
         test::ScopedVulkanCall<PFN_vkCreateDescriptorPool> fail(
             vkCreateDescriptorPool, [](VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*,
                                        VkDescriptorPool*) { return VK_ERROR_OUT_OF_DEVICE_MEMORY; });
 
-        VulkanDescriptorPool pool(session.rhi.GetDevice(), {}, 32);
+        const VulkanDescriptorAllocator::Set set = allocator.Insert(key, *layout, {});
 
-        EXPECT_FALSE(pool.IsValid());
+        EXPECT_EQ(set.handle, VK_NULL_HANDLE);
+
+        EXPECT_EQ(set.lifetimeId, 0u);
+
+        EXPECT_EQ(set.error.code, RHIErrorCode::eOutOfDeviceMemory);
     }
 
-    {
-        test::ScopedVulkanCall<PFN_vkCreateFence> fail(vkCreateFence,
-                                                       [](VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*,
-                                                          VkFence*) { return VK_ERROR_OUT_OF_HOST_MEMORY; });
+    EXPECT_EQ(allocator.Find(key).handle, VK_NULL_HANDLE);
 
-        EXPECT_EQ(session.rhi.GetDevice()->GetFenceManager()->CreateFence(), nullptr);
-    }
+    EXPECT_NE(allocator.Insert(key, *layout, {}).handle, VK_NULL_HANDLE);
+
+    EXPECT_NE(allocator.Find(key).handle, VK_NULL_HANDLE);
 }
 
 TEST(VulkanProductionFailureTest, FailedCommandPoolReturnsNoContextAndAllowsRetry)
@@ -472,11 +479,11 @@ TEST(VulkanProductionFailureTest, AbandonedRecordingRollsBackOnlyItsOwnBindlessR
 {
     test::VulkanSession session;
 
-    VulkanBindlessDescriptorPoolManager* manager = session.rhi.GetBindlessDescriptorPoolManager();
+    VulkanBindlessHeap* manager = session.rhi.GetBindlessHeap();
 
-    RHISampler* retained                         = session.rhi.CreateSampler({});
+    RHISampler* retained        = session.rhi.CreateSampler({});
 
-    RHISampler* abandoned                        = session.rhi.CreateSampler({});
+    RHISampler* abandoned       = session.rhi.CreateSampler({});
 
     ASSERT_NE(retained, nullptr);
 
@@ -486,8 +493,8 @@ TEST(VulkanProductionFailureTest, AbandonedRecordingRollsBackOnlyItsOwnBindlessR
 
     ASSERT_TRUE(manager->RegisterBindlessResource(retained, 0, &published));
 
-    FVulkanCommandListContext* context =
-        static_cast<FVulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    VulkanCommandListContext* context =
+        static_cast<VulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
     const uint64_t transaction = context->GetRecordingTransaction();
 
@@ -561,11 +568,9 @@ TEST(VulkanProductionFailureTest, DeviceMemoryLimitCapsHeapsBudgetsAndAllocation
     const bool          memoryBudget = session.rhi.GetDevice()->GetExtensionFlags().hasMemoryBudget != 0;
     const uint64_t      eightGB      = 8ull * 1024 * 1024 * 1024;
     {
-        RHIOptions::GetInstance().SetDeviceMemoryLimit(eightGB);
-        VulkanMemoryAllocator allocator;
+        VulkanMemoryAllocator allocator(&session.rhi);
         allocator.Init(session.rhi.GetInstance(), session.rhi.GetDevice()->GetPhysicalDeviceHandle(), session.rhi.GetVkDevice(),
-                       false, memoryBudget);
-        RHIOptions::GetInstance().SetDeviceMemoryLimit(0);
+                       {false, memoryBudget, eightGB});
         const RHIGPUMemoryStats stats = allocator.GetGPUMemoryStats();
         EXPECT_EQ(stats.budgetAvailable, memoryBudget);
         for (uint32_t i = 0; i < stats.heapCount; ++i)
@@ -580,15 +585,12 @@ TEST(VulkanProductionFailureTest, DeviceMemoryLimitCapsHeapsBudgetsAndAllocation
 
     // A small limit shows the cap is enforced: device-local commitments stop at it. Like a full card,
     // an allocation that prefers device memory may then fail or be placed in host memory.
-    const uint64_t limit = 256ull * 1024 * 1024;
-    RHIOptions::GetInstance().SetDeviceMemoryLimit(limit);
-    VulkanMemoryAllocator allocator;
+    const uint64_t        limit = 256ull * 1024 * 1024;
+    VulkanMemoryAllocator allocator(&session.rhi);
     allocator.Init(session.rhi.GetInstance(), session.rhi.GetDevice()->GetPhysicalDeviceHandle(), session.rhi.GetVkDevice(),
-                   false);
-    RHIOptions::GetInstance().SetDeviceMemoryLimit(0);
-    VulkanMemoryAllocator* original = GVkMemAllocator;
-    GVkMemAllocator                 = &allocator;
-    RHIBufferCreateInfo info{};
+                   {false, false, limit});
+    VulkanMemoryAllocator* original = VulkanRHITestAccess::ReplaceMemoryAllocator(session.rhi, &allocator);
+    RHIBufferCreateInfo    info{};
     info.size         = limit / 2;
     info.allocateType = RHIBufferAllocateType::eGPU;
     info.usageFlags.SetFlag(RHIBufferUsageFlagBits::eStorageBuffer);
@@ -616,14 +618,14 @@ TEST(VulkanProductionFailureTest, DeviceMemoryLimitCapsHeapsBudgetsAndAllocation
     {
         session.rhi.DestroyBuffer(second);
     }
-    GVkMemAllocator = original;
+    VulkanRHITestAccess::ReplaceMemoryAllocator(session.rhi, original);
 }
 
 TEST(VulkanProductionFailureTest, ShutdownRejectsOutstandingResourcesAndCommandContexts)
 {
     EXPECT_DEATH(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(true);
+            SetRHIStrictTeardownChecks(true);
 
             test::VulkanSession session;
 
@@ -635,7 +637,7 @@ TEST(VulkanProductionFailureTest, ShutdownRejectsOutstandingResourcesAndCommandC
 
     EXPECT_DEATH(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(true);
+            SetRHIStrictTeardownChecks(true);
 
             test::VulkanSession session;
 
@@ -654,25 +656,6 @@ TEST(VulkanProductionFailureTest, ShutdownRejectsOutstandingResourcesAndCommandC
         "All RHI resources must be released before backend teardown");
 }
 
-TEST(VulkanProductionFailureTest, BackendDestructionClearsGlobalPointers)
-{
-    VulkanRHI* rhi = ZEN_NEW() VulkanRHI();
-
-    GDynamicRHI    = rhi;
-
-    rhi->Init();
-
-    EXPECT_EQ(GVulkanRHI, rhi);
-
-    rhi->Destroy();
-
-    ZEN_DELETE(rhi);
-
-    EXPECT_EQ(GVulkanRHI, nullptr);
-
-    EXPECT_EQ(GDynamicRHI, nullptr);
-}
-
 #if defined(NDEBUG)
 // Debug VMA asserts on leaked allocations, so only Release can observe teardown continuing.
 // The deliberate leak would also be reported by validation at device destruction.
@@ -680,11 +663,13 @@ TEST(VulkanProductionFailureTest, NonStrictShutdownLogsOutstandingResourcesAndCo
 {
     EXPECT_EXIT(
         {
-            RHIOptions::GetInstance().SetStrictTeardownChecks(false);
+            SetRHIStrictTeardownChecks(false);
 
-            RHIOptions::GetInstance().SetValidationEnabled(false);
+            RHIDeviceDesc desc = test::MakeTestDeviceDesc();
 
-            test::VulkanSession session;
+            desc.SetValidationEnabled(false);
+
+            test::VulkanSession session(desc);
 
             RHIBufferCreateInfo info{};
 
@@ -713,27 +698,19 @@ class VulkanProductionDiagnosticsTest : public testing::TestWithParam<bool>
 
 TEST_P(VulkanProductionDiagnosticsTest, DeviceLossReportsCompletedGpuBreadcrumbAndDriverFault)
 {
-    struct DiagnosticsGuard
-    {
-        bool previous{RHIOptions::GetInstance().DeviceLossDiagnostics()};
+    RHIDeviceDesc desc = test::MakeTestDeviceDesc();
 
-        ~DiagnosticsGuard()
-        {
-            RHIOptions::GetInstance().SetDeviceLossDiagnostics(previous);
-        }
-    } guard;
+    desc.SetDeviceLossDiagnostics(true);
 
-    RHIOptions::GetInstance().SetDeviceLossDiagnostics(true);
-
-    test::VulkanSession session;
+    test::VulkanSession session(desc);
 
     if (GetParam())
     {
         session.rhi.GetDevice()->GetExtensionFlags().hasBufferMarker = 0;
     }
 
-    FVulkanCommandListContext* context =
-        static_cast<FVulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    VulkanCommandListContext* context =
+        static_cast<VulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
     context->RHIBeginDebugLabel("production_diagnostic_pass");
 
@@ -741,7 +718,7 @@ TEST_P(VulkanProductionDiagnosticsTest, DeviceLossReportsCompletedGpuBreadcrumbA
 
     ASSERT_EQ(context->SubmitRecordedWorkloads(), RHISubmissionResult::eSuccess);
 
-    context->WaitForLastSubmittedWork(UINT64_MAX);
+    session.rhi.WaitDeviceIdle();
 
     // Exercise device-fault reporting without deliberately losing the user's GPU.
     session.rhi.GetDevice()->GetExtensionFlags().hasDeviceFault = 1;
@@ -760,8 +737,8 @@ TEST_P(VulkanProductionDiagnosticsTest, DeviceLossReportsCompletedGpuBreadcrumbA
             return VK_SUCCESS;
         });
 
-    FVulkanCommandListContext* active =
-        static_cast<FVulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    VulkanCommandListContext* active =
+        static_cast<VulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
     const std::string label(180, 'x');
     for (uint32_t i = 0; i < 100; ++i)
     {
@@ -769,7 +746,7 @@ TEST_P(VulkanProductionDiagnosticsTest, DeviceLossReportsCompletedGpuBreadcrumbA
     }
     testing::internal::CaptureStderr();
 
-    ReportVulkanDeviceLoss(VK_ERROR_DEVICE_LOST, "injected submission");
+    session.rhi.CheckDeviceLoss(VK_ERROR_DEVICE_LOST, "injected submission");
 
     const std::string diagnostic = testing::internal::GetCapturedStderr();
 
@@ -797,8 +774,8 @@ TEST(VulkanProductionFailureTest, FailedCommandRecordingNeverReachesSubmissionAn
 
     for (uint32_t stage = 0; stage < 4; ++stage)
     {
-        FVulkanCommandListContext* context =
-            static_cast<FVulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        VulkanCommandListContext* context =
+            static_cast<VulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
         ASSERT_NE(context, nullptr);
 
@@ -867,7 +844,7 @@ TEST(VulkanProductionFailureTest, FailedCommandRecordingNeverReachesSubmissionAn
 
         EXPECT_EQ(context->SubmitRecordedWorkloads(), RHISubmissionResult::eSuccess);
 
-        context->WaitForLastSubmittedWork(UINT64_MAX);
+        session.rhi.WaitDeviceIdle();
 
         ZEN_DELETE(context);
     }
@@ -891,8 +868,8 @@ TEST(VulkanProductionFailureTest, FailedUniformOrDescriptorPreparationSuppresses
 
     for (bool undersized : {true, false})
     {
-        FVulkanCommandListContext* context =
-            static_cast<FVulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        VulkanCommandListContext* context =
+            static_cast<VulkanCommandListContext*>(session.rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
         RHIBufferCreateInfo bufferInfo{};
 
@@ -983,8 +960,8 @@ TEST(VulkanProductionFailureDeathTest, UnsupportedGlobalHeapLayoutStopsStartup)
             test::VulkanSession                                         session;
             test::ScopedVulkanCall<PFN_vkGetDescriptorSetLayoutSupport> query(vkGetDescriptorSetLayoutSupport,
                                                                               UnsupportedBindlessLayout::Query);
-            VulkanBindlessDescriptorPoolManager                         manager;
-            manager.Init();
+            VulkanBindlessHeap                                          manager(session.rhi.GetDevice());
+            zen::test::InitOrAbort(manager);
         },
         "does not support the global bindless layout");
 }
@@ -997,8 +974,8 @@ TEST(VulkanProductionFailureDeathTest, DeviceInitializationReportsImpossibleBind
             ImpossibleBindlessProfile::original = vkGetPhysicalDeviceProperties2;
             test::ScopedVulkanCall<PFN_vkGetPhysicalDeviceProperties2> properties(vkGetPhysicalDeviceProperties2,
                                                                                   ImpossibleBindlessProfile::Properties);
-            VulkanDevice                                               device(session.rhi.GetPhysicalDevice());
-            device.Init();
+            VulkanDevice                                               device(&session.rhi, session.rhi.GetPhysicalDevice());
+            zen::test::InitOrAbort(device);
         },
         "at least one slot per heap");
 }

@@ -2,13 +2,69 @@
 #include "ZenFoundation/Templates/HeapVector.h"
 #include "Vulkan/VulkanHeaders.h"
 #include "ZenRHI/RHIError.h"
+#include <utility>
 
 namespace zen
 {
 class VulkanRHI;
 class VulkanDevice;
 class VulkanSemaphore;
-struct VulkanTexture;
+
+// Owns a window surface and destroys it with its instance. It moves between the viewport, the recreation info and
+// the swapchain; a moved-from surface is empty.
+class VulkanSurface
+{
+public:
+    VulkanSurface() = default;
+
+    VulkanSurface(VkInstance instance, VkSurfaceKHR surface) : m_instance(instance), m_surface(surface) {}
+
+    VulkanSurface(VulkanSurface&& other) noexcept :
+        m_instance(other.m_instance), m_surface(std::exchange(other.m_surface, VK_NULL_HANDLE))
+    {}
+
+    VulkanSurface& operator=(VulkanSurface&& other) noexcept
+    {
+        if (this != &other)
+        {
+            Reset();
+
+            m_instance = other.m_instance;
+
+            m_surface  = std::exchange(other.m_surface, VK_NULL_HANDLE);
+        }
+
+        return *this;
+    }
+
+    VulkanSurface(const VulkanSurface&)            = delete;
+
+    VulkanSurface& operator=(const VulkanSurface&) = delete;
+
+    ~VulkanSurface()
+    {
+        Reset();
+    }
+
+    VkSurfaceKHR Get() const
+    {
+        return m_surface;
+    }
+
+    void Reset()
+    {
+        if (m_surface != VK_NULL_HANDLE)
+        {
+            vkDestroySurfaceKHR(m_instance, m_surface, nullptr);
+
+            m_surface = VK_NULL_HANDLE;
+        }
+    }
+
+private:
+    VkInstance   m_instance{VK_NULL_HANDLE};
+    VkSurfaceKHR m_surface{VK_NULL_HANDLE};
+};
 
 struct VulkanRetiredSwapchain
 {
@@ -19,8 +75,18 @@ struct VulkanRetiredSwapchain
 struct VulkanSwapchainRecreateInfo
 {
     VkSwapchainKHR                     swapchain{VK_NULL_HANDLE};
-    VkSurfaceKHR                       surface{VK_NULL_HANDLE};
+    VulkanSurface                      surface;
     HeapVector<VulkanRetiredSwapchain> retiredSwapchains;
+};
+
+struct VulkanSwapchainConfig
+{
+    uint32_t                      imageCount{0};
+    VkSurfaceFormatKHR            format{};
+    VkPresentModeKHR              presentMode{VK_PRESENT_MODE_FIFO_KHR};
+    VkSurfaceTransformFlagBitsKHR transform{VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR};
+    VkImageUsageFlags             usage{0};
+    VkCompositeAlphaFlagBitsKHR   compositeAlpha{VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR};
 };
 
 class VulkanSwapchain
@@ -28,7 +94,11 @@ class VulkanSwapchain
 public:
     // Consumes an already-created surface (and any predecessor) from recreateInfo.
     // Window/view APIs must not be called while creating GPU swapchain resources.
-    VulkanSwapchain(uint32_t width, uint32_t height, bool enableVSync, VulkanSwapchainRecreateInfo* pRecreateInfo);
+    VulkanSwapchain(VulkanDevice*                pDevice,
+                    uint32_t                     width,
+                    uint32_t                     height,
+                    bool                         enableVSync,
+                    VulkanSwapchainRecreateInfo* pRecreateInfo);
 
     VkSwapchainKHR GetVkHandle() const
     {
@@ -108,6 +178,18 @@ public:
 
     void MarkAcquireSemaphoreSubmitted(uint64_t submissionSerial);
 
+    // The image acquired and not yet presented, or -1. Present always releases it.
+    int32_t GetAcquiredImageIndex() const
+    {
+        return m_imageIndex;
+    }
+
+    // The semaphore the acquired image's first use waits on.
+    VulkanSemaphore* GetAcquireSemaphore() const
+    {
+        return m_imageIndex >= 0 ? m_acquireSync[m_semaphoreIndex].semaphore : nullptr;
+    }
+
     VulkanSemaphore* GetRenderingCompleteSemaphore(uint32_t imageIndex) const
     {
         return m_presentSync[imageIndex].semaphore;
@@ -135,6 +217,19 @@ private:
 
     void DestroyOldSwapchain(VkSwapchainKHR& oldSwapchain);
 
+    // After an unproven completion wait: device loss makes destruction legal, any other failure is fatal.
+    void WaitDeviceIdleForTeardown(const char* purpose) const;
+
+    // Waits until no acquisition or presentation still uses the images.
+    void WaitForImageWork(bool terminal);
+
+    // Destroys the image semaphores and fences. With keepPendingPresents, semaphores of presentations still in
+    // flight move into the returned record, which the successor swapchain retires.
+    VulkanRetiredSwapchain DestroyImageSync(bool keepPendingPresents);
+
+    // Creates the acquire and present semaphores and fences for every image; a failure lands in m_error.
+    void CreateImageSync();
+
     void CompleteAcquire(AcquireSync& sync, bool wait);
 
     void ReleaseRetiredSwapchains();
@@ -143,7 +238,7 @@ private:
 
     VulkanDevice*    m_pDevice{nullptr};
     VkSwapchainKHR   m_swapchain{VK_NULL_HANDLE};
-    VkSurfaceKHR     m_surface{VK_NULL_HANDLE};
+    VulkanSurface    m_surface;
     uint32_t         m_internalWidth{0};
     uint32_t         m_internalHeight{0};
     VkFormat         m_format{VK_FORMAT_UNDEFINED};

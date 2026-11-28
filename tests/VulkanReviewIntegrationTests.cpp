@@ -3,8 +3,8 @@
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanBuffer.h"
 #include "Vulkan/VulkanCommandList.h"
-#include "Vulkan/VulkanDebug.h"
 #include "Vulkan/VulkanDevice.h"
+#include "Vulkan/VulkanTexture.h"
 #include <gtest/gtest.h>
 
 namespace
@@ -20,16 +20,12 @@ VKAPI_ATTR VkBool32 VKAPI_CALL ReviewValidation(VkDebugUtilsMessageSeverityFlagB
     return VK_FALSE;
 }
 
-class VulkanReviewIntegrationTest : public testing::TestWithParam<bool>
+class VulkanReviewIntegrationTest : public testing::Test
 {
 protected:
     void SetUp() override
     {
         session = MakeUnique<test::VulkanSession>();
-        if (GetParam())
-        {
-            session->rhi.GetDevice()->GetExtensionFlags().hasTimelineSemaphore = 0;
-        }
         VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
         info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
         info.messageType     = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
@@ -48,7 +44,7 @@ protected:
     VkDebugUtilsMessengerEXT       messenger{VK_NULL_HANDLE};
 };
 
-TEST_P(VulkanReviewIntegrationTest, InvalidImageAndBufferDescriptionsNeverReachInvalidNativeUsage)
+TEST_F(VulkanReviewIntegrationTest, InvalidImageAndBufferDescriptionsNeverReachInvalidNativeUsage)
 {
     RHITextureCreateInfo valid{};
     valid.type   = RHITextureType::e2D;
@@ -107,7 +103,7 @@ TEST_P(VulkanReviewIntegrationTest, InvalidImageAndBufferDescriptionsNeverReachI
     }
 }
 
-TEST_P(VulkanReviewIntegrationTest, InvalidSamplersAreRejectedAndOptionalCapabilitiesMatchDevice)
+TEST_F(VulkanReviewIntegrationTest, InvalidSamplersAreRejectedAndOptionalCapabilitiesMatchDevice)
 {
     RHISamplerCreateInfo info{};
     info.unnormalizedUVW = true;
@@ -139,7 +135,7 @@ TEST_P(VulkanReviewIntegrationTest, InvalidSamplersAreRejectedAndOptionalCapabil
     EXPECT_EQ(rejected.Get(), nullptr);
 }
 
-TEST_P(VulkanReviewIntegrationTest, InvalidShaderLayoutsReturnNull)
+TEST_F(VulkanReviewIntegrationTest, InvalidShaderLayoutsReturnNull)
 {
     for (const char* file : {"review_runtime_array.comp.spv", "review_reserved_set.comp.spv"})
     {
@@ -155,16 +151,13 @@ TEST_P(VulkanReviewIntegrationTest, InvalidShaderLayoutsReturnNull)
     EXPECT_EQ(shader.Get(), nullptr);
 }
 
-TEST_P(VulkanReviewIntegrationTest, DebugNamesWithoutExtensionDoNotCallNativeFunction)
+TEST_F(VulkanReviewIntegrationTest, DebugNamesWithoutExtensionDoNotCallNativeFunction)
 {
     InstanceExtensionFlags& flags   = session->rhi.GetInstanceExtensionFlags();
     const bool              enabled = flags.hasDebugUtils != 0;
     flags.hasDebugUtils             = 0;
     test::ScopedVulkanCall<PFN_vkSetDebugUtilsObjectNameEXT> unavailable(vkSetDebugUtilsObjectNameEXT, nullptr);
     session->rhi.GetDevice()->SetObjectName(VK_OBJECT_TYPE_IMAGE, 0, "no_extension");
-    VulkanDebug debug;
-    debug.SetTextureDebugName(nullptr, "null_texture");
-    debug.SetPipelineDebugName(nullptr, "null_pipeline");
     flags.hasDebugUtils = enabled;
 }
 
@@ -177,7 +170,7 @@ struct ImmediateSubmitFailure
     }
 };
 
-TEST_P(VulkanReviewIntegrationTest, ViewportRejectionAllowsRetryAndResizePreservesTheCause)
+TEST_F(VulkanReviewIntegrationTest, ViewportRejectionAllowsRetryAndResizePreservesTheCause)
 {
     test::NativeTestWindow window(96, 96);
     ASSERT_NE(window.GetHandle().window, nullptr);
@@ -199,7 +192,7 @@ TEST_P(VulkanReviewIntegrationTest, ViewportRejectionAllowsRetryAndResizePreserv
     EXPECT_STREQ(session->rhi.GetTerminalError().operation, "vkQueueSubmit");
 }
 
-TEST_P(VulkanReviewIntegrationTest, ViewportDeviceLossBlocksWithNativeCause)
+TEST_F(VulkanReviewIntegrationTest, ViewportDeviceLossBlocksWithNativeCause)
 {
     test::NativeTestWindow window(96, 96);
     ASSERT_NE(window.GetHandle().window, nullptr);
@@ -225,7 +218,7 @@ struct ImageViewFailure
     }
 };
 
-TEST_P(VulkanReviewIntegrationTest, CreationFailuresStayOutOfSubmissionErrorsAndReachViewportCause)
+TEST_F(VulkanReviewIntegrationTest, CreationFailuresStayOutOfSubmissionErrorsAndReachViewportCause)
 {
     RHITextureCreateInfo info{};
     info.type   = RHITextureType::e2D;
@@ -234,12 +227,13 @@ TEST_P(VulkanReviewIntegrationTest, CreationFailuresStayOutOfSubmissionErrorsAnd
     info.usageFlags.SetFlag(RHITextureUsageFlagBits::eSampled);
     {
         test::ScopedVulkanCall<PFN_vkCreateImageView> failure(vkCreateImageView, ImageViewFailure::Create);
-        EXPECT_EQ(session->rhi.CreateTexture(info), nullptr);
+        const RHIResult<VulkanTexture*>               texture = VulkanTexture::CreateObject(&session->rhi, info);
+        EXPECT_FALSE(texture);
+        EXPECT_EQ(texture.GetError().code, RHIErrorCode::eOutOfDeviceMemory);
+        EXPECT_STREQ(texture.GetError().operation, "vkCreateImageView");
     }
     EXPECT_FALSE(session->rhi.AreSubmissionsBlocked());
     EXPECT_FALSE(session->rhi.GetLastSubmissionError().IsFailure());
-    EXPECT_EQ(session->rhi.GetLastCreationError().code, RHIErrorCode::eOutOfDeviceMemory);
-    EXPECT_STREQ(session->rhi.GetLastCreationError().operation, "vkCreateImageView");
 
     test::NativeTestWindow window(96, 96);
     ASSERT_NE(window.GetHandle().window, nullptr);
@@ -297,5 +291,4 @@ TEST(VulkanAllocationIntegrationTest, BufferAllocationQueryMatchesNativePaddingW
     EXPECT_EQ(session.rhi.GetBufferAllocationSize(invalid), 0u);
 }
 
-INSTANTIATE_TEST_SUITE_P(TimelineAndFences, VulkanReviewIntegrationTest, testing::Bool());
 } // namespace

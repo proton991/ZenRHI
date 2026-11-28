@@ -84,8 +84,6 @@ public:
     std::vector<uint8_t> bytes;
 
 private:
-    void Init() override {}
-
     void Destroy() override
     {
         destroyed.insert(GetStableId());
@@ -105,7 +103,6 @@ public:
     }
 
 private:
-    void Init() override {}
     void Destroy() override
     {
         destroyed.insert(GetStableId());
@@ -123,8 +120,6 @@ public:
 private:
     uint64_t m_textureIdentity;
 
-    void Init() override {}
-
     void Destroy() override
     {
         EXPECT_FALSE(destroyed.contains(m_textureIdentity));
@@ -141,8 +136,6 @@ public:
     explicit TestSampler(const RHISamplerCreateInfo& info) : RHISampler(info) {}
 
 private:
-    void Init() override {}
-
     void Destroy() override
     {
         destroyed.insert(GetStableId());
@@ -186,14 +179,14 @@ public:
     {
         TestTextureView* view = ZEN_NEW() TestTextureView(this, info);
 
+        view->BindRuntime(GetRuntime());
+
         RegisterOwnedView(view);
 
         return view;
     }
 
 private:
-    void Init() override {}
-
     void Destroy() override
     {
         DestroyOwnedViews();
@@ -219,7 +212,14 @@ public:
         // Stack storage can outlive the backend, but its owning reference cannot.
         if (!m_released)
         {
-            GetRHIThread().Invoke([this] { ReleaseReference(); });
+            if (RHIDeviceRuntime* runtime = GetRuntime())
+            {
+                runtime->thread.Invoke([this] { ReleaseReference(); });
+            }
+            else
+            {
+                ReleaseReference();
+            }
 
             m_released = true;
         }
@@ -235,7 +235,7 @@ public:
     bool        recreationPossible{true};
     uint32_t    resizes{0};
 
-    void PrepareForPresent(RHICommandList* commands) override
+    RHIStatus PrepareForPresent(RHICommandList* commands) override
     {
         ++preparePresents;
 
@@ -243,13 +243,20 @@ public:
         {
             commands->Dispatch(1, 1, 1);
         }
+
+        return {};
     }
 
-    bool Present() override
+    RHIPresentResult Present() override
     {
         ++presents;
 
-        return presentResult;
+        return {NeedsRecreation() ? RHISurfaceOutcome::eRecreate
+                : presentResult   ? RHISurfaceOutcome::eReady
+                                  : RHISurfaceOutcome::eIncomplete,
+                presentResult ? RHIPresentAcceptance::eEnqueued : RHIPresentAcceptance::eNotAttempted,
+                {},
+                presentResult};
     }
 
     bool NeedsRecreation() const override
@@ -292,12 +299,12 @@ public:
         return depth;
     }
 
-    RHITextureSubResourceRange GetColorBackBufferRange() override
+    RHITextureSubresourceRange GetColorBackBufferRange() override
     {
         return color->GetSubResourceRange();
     }
 
-    RHITextureSubResourceRange GetDepthStencilBackBufferRange() override
+    RHITextureSubresourceRange GetDepthStencilBackBufferRange() override
     {
         return depth->GetSubResourceRange();
     }
@@ -314,8 +321,6 @@ public:
     }
 
 private:
-    void Init() override {}
-
     void Destroy() override {}
 
     bool m_released{false};
@@ -449,8 +454,6 @@ public:
     }
 
 private:
-    void Init() override {}
-
     void Destroy() override
     {
         destroyed.insert(GetStableId());
@@ -479,8 +482,6 @@ public:
     }
 
 private:
-    void Init() override {}
-
     void Destroy() override
     {
         destroyed.insert(GetStableId());
@@ -498,7 +499,6 @@ public:
     explicit TestContext(RHICommandContextType type) : type(type) {}
 
     RHICommandContextType type;
-    std::function<void()> wait;
     uint32_t              proxyDestructions{0};
     std::thread::id       lastProxyDestroyThread;
     struct BarrierBatch
@@ -513,7 +513,7 @@ public:
     {
         RHITexture*                texture;
         Color                      color;
-        RHITextureSubResourceRange range;
+        RHITextureSubresourceRange range;
     };
     std::vector<TextureClear>                       textureClears;
     std::vector<size_t>                             clearsBeforeDraw;
@@ -770,7 +770,7 @@ public:
         bufferCopyDestinations.push_back(pDstBuffer);
     }
 
-    void RHIClearTexture(RHITexture* pTex, const Color& color, const RHITextureSubResourceRange& range) override
+    void RHIClearTexture(RHITexture* pTex, const Color& color, const RHITextureSubresourceRange& range) override
     {
         textureClears.push_back({pTex, color, range});
     }
@@ -809,11 +809,6 @@ public:
                            uint32_t    dstLayer,
                            uint32_t    dstMipmap) override
     {}
-
-    void RHIWaitUntilCompleted() override
-    {
-        wait();
-    }
 };
 // Command lists own their contexts; proxies delegate to shared observation logs.
 class TestContextProxy : public IRHICommandContext
@@ -969,7 +964,7 @@ public:
         return log.RHICopyBuffer(pSrcBuffer, pDstBuffer, region);
     }
 
-    void RHIClearTexture(RHITexture* pTex, const Color& color, const RHITextureSubResourceRange& range) override
+    void RHIClearTexture(RHITexture* pTex, const Color& color, const RHITextureSubresourceRange& range) override
     {
         return log.RHIClearTexture(pTex, color, range);
     }
@@ -1010,21 +1005,12 @@ public:
     {
         return log.RHIResolveTexture(pSrcTexture, pDstTexture, srcLayer, srcMipmap, dstLayer, dstMipmap);
     }
-
-    void RHIWaitUntilCompleted() override
-    {
-        return log.RHIWaitUntilCompleted();
-    }
 };
 class TestRHI : public DynamicRHI
 {
 public:
     TestRHI()
     {
-        graphics.wait = compute.wait = transfer.wait = [this] {
-            completed = submitted;
-        };
-
         info.uniformBufferAlignment = 16;
 
         info.storageBufferAlignment = 16;
@@ -1039,6 +1025,7 @@ public:
     std::array<uint64_t, 3>                                    submitted{};
     std::array<uint64_t, 3>                                    completed{};
     RHIGPUInfo                                                 info{};
+    RHIDeviceDesc                                              deviceDesc{};
     RHIGPUMemoryStats                                          memoryStats{};
     RHIQueueCopyCapabilities                                   graphicsCopy{true, true, true, {1, 1, 1}};
     RHIQueueCopyCapabilities                                   computeCopy{false, true, true, {1, 1, 1}};
@@ -1091,8 +1078,6 @@ public:
     const RHIRenderingLayout*                               lastPipelineLayout{nullptr};
     std::vector<RHIPipeline*>                               createdPipelines;
 
-    void Init() override {}
-
     void Destroy() override
     {
         // Recorded layouts retain attachment references; release them inside the finalizer.
@@ -1120,15 +1105,10 @@ public:
 
         if (!failContextCreation)
         {
-            result = ZEN_NEW() TestContextProxy(context);
+            result = Bind(ZEN_NEW() TestContextProxy(context));
         }
 
         return result;
-    }
-
-    IRHICommandContext* GetTransferCommandContext() override
-    {
-        return GetCommandContext(RHICommandContextType::eTransfer);
     }
 
     RHIAPIType GetAPIType() override
@@ -1172,20 +1152,15 @@ public:
 
                 reflectedInfo.specializationConstants = info.specializationConstants;
 
-                result                                = ZEN_NEW() TestShader(reflectedInfo, this->info.maxBoundDescriptorSets);
+                result = Bind(ZEN_NEW() TestShader(reflectedInfo, this->info.maxBoundDescriptorSets));
             }
             else
             {
-                result = ZEN_NEW() TestShader(info, this->info.maxBoundDescriptorSets);
+                result = Bind(ZEN_NEW() TestShader(info, this->info.maxBoundDescriptorSets));
             }
         }
 
         return result;
-    }
-
-    void DestroyShader(RHIShader* shader) override
-    {
-        shader->ReleaseReference();
     }
 
     RHIPipeline* CreatePipeline(const RHIGfxPipelineCreateInfo& info) override
@@ -1204,7 +1179,7 @@ public:
 
         if (valid)
         {
-            TestPipeline* pipeline = ZEN_NEW() TestPipeline(info);
+            TestPipeline* pipeline = Bind(ZEN_NEW() TestPipeline(info));
 
             createdPipelines.push_back(pipeline);
 
@@ -1222,7 +1197,7 @@ public:
 
         if (pipelineCount != failPipelineCreationAt)
         {
-            TestPipeline* pipeline = ZEN_NEW() TestPipeline(info);
+            TestPipeline* pipeline = Bind(ZEN_NEW() TestPipeline(info));
 
             createdPipelines.push_back(pipeline);
 
@@ -1240,26 +1215,16 @@ public:
         if (pipelineCount != failPipelineCreationAt && info.pShader != nullptr
             && ValidateRayTracingShaderGroups(info.pShader->GetModules(), info.groups, counts))
         {
-            TestPipeline* pipeline = ZEN_NEW() TestPipeline(info);
+            TestPipeline* pipeline = Bind(ZEN_NEW() TestPipeline(info));
             createdPipelines.push_back(pipeline);
             result = pipeline;
         }
         return result;
     }
 
-    void DestroyPipeline(RHIPipeline* pipeline) override
-    {
-        pipeline->ReleaseReference();
-    }
-
     RHISampler* CreateSampler(const RHISamplerCreateInfo& info) override
     {
-        return ZEN_NEW() TestSampler(info);
-    }
-
-    void DestroySampler(RHISampler* sampler) override
-    {
-        sampler->ReleaseReference();
+        return Bind(ZEN_NEW() TestSampler(info));
     }
 
     RHITexture* CreateTexture(const RHITextureCreateInfo& info) override
@@ -1272,7 +1237,7 @@ public:
 
         if (textureCreations != failTextureCreationAt)
         {
-            result             = ZEN_NEW() TestTexture(info);
+            result             = Bind(ZEN_NEW() TestTexture(info));
 
             lastCreatedTexture = result;
 
@@ -1294,11 +1259,6 @@ public:
         }
 
         return view;
-    }
-
-    void DestroyTexture(RHITexture* texture) override
-    {
-        texture->ReleaseReference();
     }
 
     uint64_t GetBufferAllocationSize(const RHIBufferCreateInfo& info) override
@@ -1323,7 +1283,7 @@ public:
 
         if (bufferCreations != failBufferCreationAt && !declined)
         {
-            TestBuffer* buffer = ZEN_NEW() TestBuffer(info);
+            TestBuffer* buffer = Bind(ZEN_NEW() TestBuffer(info));
             buffer->reportedAllocationBytes =
                 bufferAllocationPadding == UINT64_MAX && bufferAllocationAlignment == 1 ? 0 : GetBufferAllocationSize(info);
             result         = buffer;
@@ -1349,16 +1309,13 @@ public:
 
     RHIAccelerationStructure* CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info) override
     {
-        return ZEN_NEW() TestAccelerationStructure(info);
+        return Bind(ZEN_NEW() TestAccelerationStructure(info));
     }
 
-    void DestroyBuffer(RHIBuffer* buffer) override
+    RHISubmissionResult SubmitCommandLists(std::span<RHICommandList*> lists) override
     {
-        buffer->ReleaseReference();
-    }
+        translationError = {};
 
-    RHIStatus FinalizeCommandLists(std::span<RHICommandList*> lists, std::vector<RHIPlatformCommandList*>&) override
-    {
         // Recorded GPU waits are order-independent here, so all lists are prepared before any is queued.
         bool prepared = true;
 
@@ -1385,12 +1342,29 @@ public:
             }
         }
 
-        return submissionsBlocked ? RHIStatus{{RHIErrorCode::eBackendFailure, 0, "FinalizeCommandLists"}} : RHIStatus{};
+        RHISubmissionResult result{};
+
+        if (submissionsBlocked)
+        {
+            translationError = {RHIErrorCode::eBackendFailure, 0, "SubmitCommandLists"};
+
+            result           = RHISubmissionResult::eRejected;
+        }
+        else
+        {
+            result = FlushPending();
+        }
+
+        return result;
     }
 
-    void SubmitPlatformCommandLists(std::span<RHIPlatformCommandList*>) override {}
+    RHIError GetLastSubmissionError() const override
+    {
+        return translationError.IsFailure() ? translationError : DynamicRHI::GetLastSubmissionError();
+    }
 
-    RHISubmissionResult FlushAllGPUCommands() override
+    // Executes the queued lists, as a native backend would submit them.
+    RHISubmissionResult FlushPending()
     {
         RHISubmissionResult result{};
 
@@ -1512,7 +1486,7 @@ public:
         return completed[Index(type)];
     }
 
-    bool WaitForCompletion(RHICommandContextType type, uint64_t serial, uint64_t timeoutNS = UINT64_MAX) override
+    RHIWaitResult WaitForCompletion(RHICommandContextType type, uint64_t serial, uint64_t timeoutNS = UINT64_MAX) override
     {
         bool result{};
 
@@ -1536,7 +1510,7 @@ public:
             }
         }
 
-        return result;
+        return MakeWaitResult(result);
     }
 
     void WaitDeviceIdle() override
@@ -1550,6 +1524,26 @@ public:
     {
         return info;
     }
+
+    const RHIDeviceDesc& GetDeviceDesc() const override
+    {
+        return deviceDesc;
+    }
+
+    RHIDeviceRuntime& GetRuntime() override
+    {
+        return *runtime;
+    }
+
+    template <typename T> T* Bind(T* object)
+    {
+        object->BindRuntime(runtime.Get());
+        return object;
+    }
+
+    RHIDeviceRuntimePtr runtime{MakeRefCountPtr<RHIDeviceRuntime>()};
+
+    RHIError translationError{};
 
     RHIGPUMemoryStats GetGPUMemoryStats() const override
     {
@@ -1594,7 +1588,7 @@ struct ArenaDataCommand : RHICommand
         ++destructions;
     }
 
-    void Execute(RHICommandListBase&) override
+    void Execute(RHICommandList&) override
     {
         for (uint32_t i = 0; i < size; ++i)
         {
@@ -1637,7 +1631,7 @@ public:
         {
             m_used              = true;
             executionThread     = std::this_thread::get_id();
-            executionFrameState = GRHIFrameState;
+            executionFrameState = frameState != nullptr ? *frameState : RHIFrameState{};
             m_entered.set_value();
             releasedInTime = m_release.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
         }
@@ -1651,10 +1645,11 @@ public:
         }
     }
 
-    std::future<void> entered;
-    std::thread::id   executionThread;
-    RHIFrameState     executionFrameState;
-    std::atomic<bool> releasedInTime{false};
+    std::future<void>    entered;
+    std::thread::id      executionThread;
+    RHIFrameState        executionFrameState;
+    const RHIFrameState* frameState{nullptr};
+    std::atomic<bool>    releasedInTime{false};
 
 private:
     std::promise<void>       m_entered;
@@ -1670,10 +1665,8 @@ protected:
     void SetUp() override
     {
         destroyed.clear();
-        GRHIFrameState.Init(3);
-        rhi         = ZEN_NEW() TestRHI();
-        executor    = ZEN_NEW() RHICommandListExecutor(rhi, RHIExecutionMode::eThreaded);
-        GDynamicRHI = executor;
+        rhi      = ZEN_NEW() TestRHI();
+        executor = ZEN_NEW() RHICommandListExecutor(rhi, RHIExecutionMode::eThreaded);
     }
 
     void TearDown() override
@@ -1681,12 +1674,12 @@ protected:
         gate.Open();
         executor->Destroy();
         ZEN_DELETE(executor);
-        GDynamicRHI = nullptr;
     }
 
     void ArmGate()
     {
         executor->FlushRHIThread();
+        gate.frameState       = &rhi->GetRuntime().frameState;
         rhi->beforeSubmission = std::bind_front(&RHISubmissionGate::OnSubmission, &gate);
     }
 

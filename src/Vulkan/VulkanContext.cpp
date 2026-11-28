@@ -1,21 +1,21 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include "Vulkan/VulkanRHI.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanBuffer.h"
-#include "Vulkan/VulkanDescriptorPool.h"
+#include "Vulkan/VulkanUniformRing.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "Vulkan/VulkanBindlessHeap.h"
+#include "Vulkan/VulkanSetLayout.h"
 #include "Vulkan/VulkanExtension.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanMemory.h"
 #include "Vulkan/VulkanPipeline.h"
-#include "Vulkan/Platform/VulkanMacOSPlatform.h"
 #include <cstdlib>
 
 namespace zen
 {
-VulkanMemoryAllocator* GVkMemAllocator = nullptr;
-VulkanRHI*             GVulkanRHI      = nullptr;
 
 namespace
 {
@@ -166,7 +166,9 @@ static uint64_t GetDeviceLocalMemoryBytes(VkPhysicalDevice physicalDevice)
     return deviceLocalMemoryBytes;
 }
 
-static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysicalDevice physicalDevice, RHIError& error)
+static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysicalDevice     physicalDevice,
+                                                                         const RHIDeviceDesc& desc,
+                                                                         RHIError&            error)
 {
     VulkanPhysicalDeviceCandidateInfo result{};
 
@@ -178,7 +180,7 @@ static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysi
 
     candidateInfo.queueSummary      = GetQueueFamilySummary(physicalDevice);
 
-    candidateInfo.unsupportedReason = VulkanDevice::GetUnsupportedReason(physicalDevice, &error);
+    candidateInfo.unsupportedReason = VulkanDevice::GetUnsupportedReason(physicalDevice, desc, &error);
 
     if (!candidateInfo.unsupportedReason.empty())
     {
@@ -333,90 +335,23 @@ static VulkanPhysicalDeviceCandidateInfo EvaluatePhysicalDeviceCandidate(VkPhysi
 }
 } // namespace
 
-namespace
-{
-std::atomic<uint64_t> processValidationErrors{};
-}
-
-void VulkanRHI::CountValidationMessage(RHIMessageSeverity severity, std::string_view id)
-{
-    std::lock_guard<std::mutex> lock(m_validationMutex);
-    const auto                  entry =
-        std::find_if(m_validationCounts.begin(), m_validationCounts.end(),
-                     [severity, id](const ValidationMessageCount& item) { return severity == item.severity && id == item.id; });
-    if (entry == m_validationCounts.end())
-    {
-        m_validationCounts.push_back({severity, std::string(id), 1});
-    }
-    else
-    {
-        ++entry->count;
-    }
-    if (severity == RHIMessageSeverity::eError)
-    {
-        processValidationErrors.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-uint64_t VulkanRHI::GetValidationCount(RHIMessageSeverity severity, std::string_view id) const
-{
-    std::lock_guard<std::mutex> lock(m_validationMutex);
-    uint64_t                    total = 0;
-    for (const ValidationMessageCount& item : m_validationCounts)
-    {
-        if (severity == item.severity && (id.empty() || id == item.id))
-        {
-            total += item.count;
-        }
-    }
-    return total;
-}
-
-namespace test
-{
-uint64_t GetValidationCount(RHIMessageSeverity severity, std::string_view id)
-{
-    return GVulkanRHI ? GVulkanRHI->GetValidationCount(severity, id) : 0;
-}
-
-uint64_t GetProcessValidationErrors()
-{
-    return processValidationErrors.load(std::memory_order_relaxed);
-}
-} // namespace test
-
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT      messageSeverity,
                                                            VkDebugUtilsMessageTypeFlagsEXT             messageType,
                                                            const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-                                                           void*                                       pUserData)
+                                                           void*)
 {
     const RHIMessageSeverity severity =
         (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)     ? RHIMessageSeverity::eError
         : (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) ? RHIMessageSeverity::eWarning
                                                                               : RHIMessageSeverity::eInfo;
-    if (pUserData)
-    {
-        static_cast<VulkanRHI*>(pUserData)->CountValidationMessage(severity,
-                                                                   RHIErrorText(pCallbackData->pMessageIdName, "unknown"));
-    }
-    if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
-    {
-        ZEN_RHI_LOG_WARN("{} - {}: {}", pCallbackData->messageIdNumber,
-                         RHIErrorText(pCallbackData->pMessageIdName, "unknown message"),
-                         RHIErrorText(pCallbackData->pMessage, ""));
-    }
-    else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-    {
-        ZEN_RHI_LOG_ERROR("Vulkan validation error {} - {}: {}", pCallbackData->messageIdNumber,
-                          RHIErrorText(pCallbackData->pMessageIdName, "unknown message"),
-                          RHIErrorText(pCallbackData->pMessage, ""))
-    }
-    else if ((messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) && RHIOptions::GetInstance().DebugPrintfEnabled())
-    {
-        ZEN_RHI_LOG_INFO("{} - {}: {}", pCallbackData->messageIdNumber,
-                         RHIErrorText(pCallbackData->pMessageIdName, "unknown message"),
-                         RHIErrorText(pCallbackData->pMessage, ""));
-    }
+
+    // Info arrives only with debug printf. The id lets hosts and tests count validation messages by kind.
+    const std::string_view id = RHIErrorText(pCallbackData->pMessageIdName, "unknown");
+    const std::string      text =
+        fmt::format("{}{} - {}: {}", severity == RHIMessageSeverity::eError ? "Vulkan validation error " : "",
+                    pCallbackData->messageIdNumber, id, RHIErrorText(pCallbackData->pMessage, ""));
+
+    ReportRHIMessage(RHIMessage{severity, id, text});
 
     return VK_FALSE;
 }
@@ -430,7 +365,7 @@ void VulkanRHI::PopulateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfo
                                                           | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
                                                           | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
 
-    if (RHIOptions::GetInstance().DebugPrintfEnabled())
+    if (m_desc.DebugPrintfEnabled())
     {
         messageSeverity |= VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
     }
@@ -446,8 +381,6 @@ void VulkanRHI::PopulateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfo
     dbgMessengerCI.messageType     = messageType;
 
     dbgMessengerCI.pfnUserCallback = DebugUtilsMessengerCallback;
-
-    dbgMessengerCI.pUserData       = this;
 }
 
 static void FlagInstanceExtensionSupported(VulkanInstanceExtensionArray& instanceExtensions, NameID extensionName)
@@ -464,7 +397,7 @@ static void FlagInstanceExtensionSupported(VulkanInstanceExtensionArray& instanc
 RHIError VulkanRHI::SetupInstanceLayers(VulkanInstanceExtensionArray& instanceExtensions)
 {
     RHIError error;
-    if (RHIOptions::GetInstance().ValidationEnabled())
+    if (m_desc.ValidationEnabled())
     {
         HeapVector<VkLayerProperties> layers;
         const VkResult                result = EnumerateVulkanProperties(layers, vkEnumerateInstanceLayerProperties);
@@ -488,7 +421,7 @@ RHIError VulkanRHI::SetupInstanceLayers(VulkanInstanceExtensionArray& instanceEx
         if (!error.IsFailure() && m_instanceLayers.empty())
         {
             ZEN_RHI_LOG_WARN("Requested {} layer not supported!", name);
-            if (RHIOptions::GetInstance().ValidationMode() == RHIValidationMode::eRequired)
+            if (m_desc.ValidationMode() == RHIValidationMode::eRequired)
             {
                 error = MakeVulkanError(VK_ERROR_LAYER_NOT_PRESENT, "VK_LAYER_KHRONOS_validation");
             }
@@ -502,7 +435,7 @@ RHIError VulkanRHI::SetupInstanceExtensions(VulkanInstanceExtensionArray& instan
     RHIError error;
     for (UniquePtr<VulkanInstanceExtension>& extension : instanceExtensions)
     {
-        if (extension->IsEnabledAndSupported())
+        if (extension->IsSupported())
         {
             m_instanceExtensions.emplace_back(extension->GetName());
             if (extension->GetName() == NameID(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME))
@@ -528,19 +461,19 @@ RHIError VulkanRHI::CreateInstance()
 
     InitVkStruct(appInfo, VK_STRUCTURE_TYPE_APPLICATION_INFO);
 
-    appInfo.apiVersion         = ZEN_VK_API_VERSION;
+    appInfo.apiVersion         = kVulkanApiVersion;
 
     appInfo.applicationVersion = ZEN_VK_APP_VERSION;
 
-    appInfo.engineVersion      = ZEN_ENGINE_VERSION;
+    appInfo.engineVersion      = VK_MAKE_API_VERSION(0, ZENRHI_VERSION_MAJOR, ZENRHI_VERSION_MINOR, ZENRHI_VERSION_PATCH);
 
-    appInfo.pApplicationName   = "ZenEngineRHI";
+    appInfo.pApplicationName   = "ZenRHI application";
 
-    appInfo.pEngineName        = "ZenEngine";
+    appInfo.pEngineName        = "ZenRHI";
 
     RHIError                     error;
     VulkanInstanceExtensionArray instanceExtensions =
-        VulkanInstanceExtension::GetEnabledInstanceExtensions(m_instanceExtensionFlags, &error);
+        VulkanInstanceExtension::GetEnabledInstanceExtensions(m_instanceExtensionFlags, m_desc.surfaceExtensions, &error);
 
     if (!error.IsFailure())
     {
@@ -560,7 +493,7 @@ RHIError VulkanRHI::CreateInstance()
 
     VkValidationFeaturesEXT validationFeatures{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
 
-    validationFeatures.enabledValidationFeatureCount = RHIOptions::GetInstance().DebugPrintfEnabled() ? 1 : 0;
+    validationFeatures.enabledValidationFeatureCount = m_desc.DebugPrintfEnabled() ? 1 : 0;
 
     validationFeatures.pEnabledValidationFeatures    = validationFeatureEnables.data();
 
@@ -605,10 +538,9 @@ RHIError VulkanRHI::CreateInstance()
 
     const bool validationEnabled         = HasExtensionEnabled(m_instanceLayers, NameID("VK_LAYER_KHRONOS_validation"));
 
-    instanceInfo.pNext =
-        validationEnabled && RHIOptions::GetInstance().DebugPrintfEnabled() && m_instanceExtensionFlags.hasValidationFeatures
-            ? static_cast<const void*>(&validationFeatures)
-            : (m_instanceExtensionFlags.hasDebugUtils ? &debugMessengerCI : nullptr);
+    instanceInfo.pNext = validationEnabled && m_desc.DebugPrintfEnabled() && m_instanceExtensionFlags.hasValidationFeatures
+                           ? static_cast<const void*>(&validationFeatures)
+                           : (m_instanceExtensionFlags.hasDebugUtils ? &debugMessengerCI : nullptr);
 
     const bool layerSettings =
         validationEnabled && HasExtensionEnabled(m_instanceExtensions, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
@@ -625,7 +557,7 @@ RHIError VulkanRHI::CreateInstance()
         settingsInfo.pSettings    = settings;
         instanceInfo.pNext        = &settingsInfo;
     }
-    if (!error.IsFailure() && RHIOptions::GetInstance().ValidationMode() == RHIValidationMode::eRequired
+    if (!error.IsFailure() && m_desc.ValidationMode() == RHIValidationMode::eRequired
         && (!layerSettings || !m_instanceExtensionFlags.hasDebugUtils))
     {
         error = MakeVulkanError(VK_ERROR_EXTENSION_NOT_PRESENT, "Required Vulkan validation settings and messenger");
@@ -666,19 +598,15 @@ RHIError VulkanRHI::SelectGPU(std::vector<RHIAdapterInfo>* adapters)
 
     std::string rejectionReasons;
 
-    // Diagnostic override for cross-vendor runs; executables without options use the environment.
-    std::string preferredDevice = RHIOptions::GetInstance().PreferredDevice();
+    // Diagnostic override for cross-vendor runs.
+    const std::string& preferredDevice = m_desc.PreferredDevice();
 
-    if (const char* environment = std::getenv("ZEN_VULKAN_DEVICE"); preferredDevice.empty() && environment != nullptr)
-    {
-        preferredDevice = environment;
-    }
-
-    bool selectedPreferred = false;
+    bool selectedPreferred             = false;
 
     for (uint32_t i = 0; i < physicalDevices.size(); i++)
     {
-        const VulkanPhysicalDeviceCandidateInfo candidateInfo = EvaluatePhysicalDeviceCandidate(physicalDevices[i], error);
+        const VulkanPhysicalDeviceCandidateInfo candidateInfo =
+            EvaluatePhysicalDeviceCandidate(physicalDevices[i], m_desc, error);
         if (error.IsFailure())
         {
             break;
@@ -748,7 +676,7 @@ RHIError VulkanRHI::SelectGPU(std::vector<RHIAdapterInfo>* adapters)
                              selectedCandidateInfo.score, selectedCandidateInfo.deviceLocalMemoryBytes / (1024ull * 1024ull),
                              selectedCandidateInfo.properties.vendorID, selectedCandidateInfo.properties.driverVersion,
                              selectedCandidateInfo.properties.apiVersion);
-            m_pDevice = ZEN_NEW() VulkanDevice(physicalDevices[selectedIndex]);
+            m_pDevice = ZEN_NEW() VulkanDevice(this, physicalDevices[selectedIndex]);
             if (!m_pDevice)
             {
                 error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanDevice");
@@ -763,12 +691,10 @@ RHIError VulkanRHI::SelectGPU(std::vector<RHIAdapterInfo>* adapters)
     return error;
 }
 
-VulkanRHI::VulkanRHI() : m_resourceAllocator(ZEN_DEFAULT_PAGESIZE, false)
+VulkanRHI::VulkanRHI(const RHIDeviceDesc& desc) : m_desc(desc), m_resourceAllocator(ZEN_DEFAULT_PAGESIZE, false)
 {
-#if defined(ZEN_MACOS)
-    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "1", 1);
-#endif
-    m_loaderResult = volkInitialize();
+    m_executionCounters.enabled = desc.ExecutionCountersEnabled();
+    m_loaderResult              = volkInitialize();
 }
 
 VulkanRHI::~VulkanRHI()
@@ -776,14 +702,6 @@ VulkanRHI::~VulkanRHI()
     if (m_loaderResult == VK_SUCCESS)
     {
         volkFinalize();
-    }
-    if (GVulkanRHI == this)
-    {
-        GVulkanRHI = nullptr;
-    }
-    if (GDynamicRHI == this)
-    {
-        GDynamicRHI = nullptr;
     }
 }
 
@@ -797,9 +715,26 @@ VkDevice VulkanRHI::GetVkDevice() const
     return m_pDevice->GetVkHandle();
 }
 
+uint64_t VulkanRHI::GetNativeObject(RHINativeObject object) const
+{
+    uint64_t handle = 0;
+
+    if (IsInitialized())
+    {
+        switch (object)
+        {
+            case RHINativeObject::eInstance: handle = reinterpret_cast<uint64_t>(m_instance); break;
+            case RHINativeObject::ePhysicalDevice: handle = reinterpret_cast<uint64_t>(GetPhysicalDevice()); break;
+            case RHINativeObject::eDevice: handle = reinterpret_cast<uint64_t>(GetVkDevice()); break;
+        }
+    }
+
+    return handle;
+}
+
 IRHICommandContext* VulkanRHI::GetCommandContext(RHICommandContextType contextType)
 {
-    FVulkanCommandListContext* context = ZEN_NEW() FVulkanCommandListContext(contextType, m_pDevice);
+    VulkanCommandListContext* context = ZEN_NEW() VulkanCommandListContext(contextType, m_pDevice);
 
     if (!context->IsValid())
     {
@@ -811,21 +746,9 @@ IRHICommandContext* VulkanRHI::GetCommandContext(RHICommandContextType contextTy
     return context;
 }
 
-IRHICommandContext* VulkanRHI::GetTransferCommandContext()
-{
-    return GetCommandContext(RHICommandContextType::eTransfer);
-}
-
-void VulkanRHI::Init()
-{
-    const RHIError error = InitChecked();
-    ZEN_RHI_VERIFY_MSG_F(!error.IsFailure(), "{} failed ({})", error.operation, error.nativeCode);
-}
-
 RHIError VulkanRHI::InitChecked(std::vector<RHIAdapterInfo>* adapters)
 {
     RHIError error = MakeVulkanError(m_loaderResult, "volkInitialize");
-    GVulkanRHI     = this;
     if (!error.IsFailure())
     {
         error = CreateInstance();
@@ -837,40 +760,40 @@ RHIError VulkanRHI::InitChecked(std::vector<RHIAdapterInfo>* adapters)
     if (!error.IsFailure() && !adapters)
     {
         m_resourceAllocator.Init();
-        m_pResourceFactory = ZEN_NEW() VulkanResourceFactory();
-        error = m_pResourceFactory ? m_pDevice->InitChecked()
-                                   : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanResourceFactory");
+        error = m_pDevice->InitChecked();
         if (!error.IsFailure())
         {
             PopulateGPUInfo();
-            GVkMemAllocator = ZEN_NEW() VulkanMemoryAllocator();
-            error = GVkMemAllocator
-                      ? MakeVulkanError(GVkMemAllocator->Init(m_instance, GetPhysicalDevice(), GetVkDevice(),
-                                                              m_pDevice->GetExtensionFlags().hasBufferDeviceAddress != 0,
-                                                              m_pDevice->GetExtensionFlags().hasMemoryBudget != 0),
+            m_pMemoryAllocator = ZEN_NEW() VulkanMemoryAllocator(this);
+            error = m_pMemoryAllocator
+                      ? MakeVulkanError(m_pMemoryAllocator->Init(m_instance, GetPhysicalDevice(), GetVkDevice(),
+                                                                 {m_pDevice->GetExtensionFlags().hasBufferDeviceAddress != 0,
+                                                                  m_pDevice->GetExtensionFlags().hasMemoryBudget != 0,
+                                                                  m_desc.DeviceMemoryLimit(), m_desc.GPUMemoryStats()}),
                                         "vmaCreateAllocator")
                       : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanMemoryAllocator");
         }
         if (!error.IsFailure())
         {
-            m_pDescriptorPoolManager2        = ZEN_NEW() VulkanDescriptorPoolManager2(m_pDevice);
-            m_pBindlessDescriptorPoolManager = ZEN_NEW() VulkanBindlessDescriptorPoolManager();
-            error = m_pDescriptorPoolManager2 && m_pBindlessDescriptorPoolManager
-                      ? m_pBindlessDescriptorPoolManager->InitChecked()
+            m_pDescriptorAllocator = ZEN_NEW() VulkanDescriptorAllocator(m_pDevice);
+            m_pBindlessHeap        = ZEN_NEW() VulkanBindlessHeap(m_pDevice);
+            m_pSetLayoutCache      = ZEN_NEW() VulkanSetLayoutCache(m_pDevice);
+            error = m_pDescriptorAllocator && m_pBindlessHeap && m_pSetLayoutCache
+                      ? m_pBindlessHeap->InitChecked()
                       : MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate Vulkan descriptor pool managers");
         }
         if (!error.IsFailure())
         {
-            m_gpuInfo.bindlessHeapCapacities = m_pBindlessDescriptorPoolManager->GetCapacities();
-            m_pUniformBufferAllocator        = ZEN_NEW() VulkanUniformBufferAllocator();
-            if (!m_pUniformBufferAllocator)
+            m_gpuInfo.bindlessHeapCapacities = m_pBindlessHeap->GetCapacities();
+            m_pUniformRing                   = ZEN_NEW() VulkanUniformRing(this);
+            if (!m_pUniformRing)
             {
-                error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanUniformBufferAllocator");
+                error = MakeVulkanError(VK_ERROR_OUT_OF_HOST_MEMORY, "Allocate VulkanUniformRing");
             }
         }
         if (!error.IsFailure())
         {
-            m_pUniformBufferAllocator->Init(RHIFrameState::kMaxFramesInFlight, 4 * 1024 * 1024, 8);
+            m_pUniformRing->Init(RHIFrameState::kMaxFramesInFlight, 4 * 1024 * 1024, 8);
             m_initialized = true;
         }
     }
@@ -1036,9 +959,9 @@ RHIBindlessHandle VulkanRHI::RegisterBindlessResource(RHIResource* pResource, ui
 {
     RHIBindlessHandle handle;
 
-    if (m_pBindlessDescriptorPoolManager != nullptr)
+    if (m_pBindlessHeap != nullptr)
     {
-        m_pBindlessDescriptorPoolManager->RegisterBindlessResource(pResource, slotIndex, &handle);
+        m_pBindlessHeap->RegisterBindlessResource(pResource, slotIndex, &handle);
     }
 
     return handle;
@@ -1046,18 +969,17 @@ RHIBindlessHandle VulkanRHI::RegisterBindlessResource(RHIResource* pResource, ui
 
 bool VulkanRHI::UnregisterBindlessResource(RHIBindlessHandle handle)
 {
-    return m_pBindlessDescriptorPoolManager != nullptr && m_pBindlessDescriptorPoolManager->UnregisterBindlessResource(handle);
+    return m_pBindlessHeap != nullptr && m_pBindlessHeap->UnregisterBindlessResource(handle);
 }
 
 bool VulkanRHI::IsBindlessResourceRegistered(RHIBindlessHandle handle)
 {
-    return m_pBindlessDescriptorPoolManager != nullptr && m_pBindlessDescriptorPoolManager->IsRegistered(handle);
+    return m_pBindlessHeap != nullptr && m_pBindlessHeap->IsRegistered(handle);
 }
 
 bool VulkanRHI::ResetBindlessResources()
 {
-    const bool reset = !AreSubmissionsBlocked()
-                    && (m_pBindlessDescriptorPoolManager == nullptr || m_pBindlessDescriptorPoolManager->ResetRegistrations());
+    const bool reset = !AreSubmissionsBlocked() && (m_pBindlessHeap == nullptr || m_pBindlessHeap->ResetRegistrations());
 
     return reset;
 }
@@ -1073,9 +995,9 @@ void VulkanRHI::CollectRetiredBindlessResources()
         QueryLastCompletedSerial(RHICommandContextType::eTransfer);
     }
 
-    if (m_pBindlessDescriptorPoolManager != nullptr)
+    if (m_pBindlessHeap != nullptr)
     {
-        m_pBindlessDescriptorPoolManager->CollectRetiredResources();
+        m_pBindlessHeap->CollectRetiredResources();
     }
 
     m_lifetimeTracker.Collect();
@@ -1083,25 +1005,25 @@ void VulkanRHI::CollectRetiredBindlessResources()
 
 void VulkanRHI::BeginFrame()
 {
-    GetRHIThread().CheckOwnership();
+    m_runtime->thread.CheckOwnership();
 
-    GVkMemAllocator->BeginFrame(static_cast<uint32_t>(ToValue(GRHIFrameState.GetFrameNumber())));
+    m_pMemoryAllocator->BeginFrame(static_cast<uint32_t>(ToValue(m_runtime->frameState.GetFrameNumber())));
 
     CollectRetiredBindlessResources();
 
-    ZEN_RHI_VERIFY(m_pDescriptorPoolManager2 != nullptr);
+    ZEN_RHI_VERIFY(m_pDescriptorAllocator != nullptr);
 
-    ZEN_RHI_VERIFY(m_pUniformBufferAllocator != nullptr);
+    ZEN_RHI_VERIFY(m_pUniformRing != nullptr);
 
-    m_pDescriptorPoolManager2->BeginFrame(static_cast<uint32_t>(ToValue(GRHIFrameState.GetFrameNumber())));
+    m_pDescriptorAllocator->BeginFrame();
 
-    // RenderDevice has waited for this frame slot before reusing its uniform storage.
-    m_pUniformBufferAllocator->BeginFrame(ToIndex(GRHIFrameState.GetFrameSlot()));
+    // The host has waited for this frame slot before reusing its uniform storage.
+    m_pUniformRing->BeginFrame(ToIndex(m_runtime->frameState.GetFrameSlot()));
 }
 
 void VulkanRHI::BeginGPUFrameTiming(const RHIGPUFrameTimingPtr& timing)
 {
-    GetRHIThread().CheckOwnership();
+    m_runtime->thread.CheckOwnership();
 
     const bool overlapping = m_gpuFrameTiming != nullptr;
 
@@ -1127,7 +1049,7 @@ void VulkanRHI::BeginGPUFrameTiming(const RHIGPUFrameTimingPtr& timing)
 
 void VulkanRHI::EndGPUFrameTiming(const RHIGPUFrameTimingPtr& timing, bool succeeded)
 {
-    GetRHIThread().CheckOwnership();
+    m_runtime->thread.CheckOwnership();
 
     const bool valid = timing != nullptr && timing == m_gpuFrameTiming && succeeded && m_pendingNativeRecordings == 0
                     && !AreSubmissionsBlocked();
@@ -1194,48 +1116,47 @@ void VulkanRHI::Destroy()
         WaitDeviceIdle();
     }
 
-    DestroyPlatformCommandListPool();
 
     if (m_pDevice != nullptr)
     {
         m_pDevice->DestroyQueues();
     }
 
-    if (m_pUniformBufferAllocator != nullptr)
+    if (m_pUniformRing != nullptr)
     {
-        m_pUniformBufferAllocator->Destroy();
+        m_pUniformRing->Destroy();
 
-        ZEN_DELETE(m_pUniformBufferAllocator);
+        ZEN_DELETE(m_pUniformRing);
 
-        m_pUniformBufferAllocator = nullptr;
+        m_pUniformRing = nullptr;
     }
 
-    if (m_pDescriptorPoolManager2 != nullptr)
+    ZEN_DELETE(m_pDescriptorAllocator);
+
+    m_pDescriptorAllocator = nullptr;
+
+    if (m_pBindlessHeap != nullptr)
     {
-        m_pDescriptorPoolManager2->Destroy();
+        m_pBindlessHeap->Destroy();
 
-        ZEN_DELETE(m_pDescriptorPoolManager2);
+        ZEN_DELETE(m_pBindlessHeap);
 
-        m_pDescriptorPoolManager2 = nullptr;
-    }
-
-    if (m_pBindlessDescriptorPoolManager != nullptr)
-    {
-        m_pBindlessDescriptorPoolManager->Destroy();
-
-        ZEN_DELETE(m_pBindlessDescriptorPoolManager);
-
-        m_pBindlessDescriptorPoolManager = nullptr;
+        m_pBindlessHeap = nullptr;
     }
 
     m_lifetimeTracker.Destroy();
 
+    // Shader destruction leaves the shared layouts alone, so they go after every deferred release.
+    ZEN_DELETE(m_pSetLayoutCache);
+
+    m_pSetLayoutCache = nullptr;
+
     VerifyTeardownOwnership(m_resourceAllocator.GetAllocationCount() == 0,
                             "All RHI resources must be released before backend teardown", __FILE__, __LINE__);
 
-    ZEN_DELETE(GVkMemAllocator);
+    ZEN_DELETE(m_pMemoryAllocator);
 
-    GVkMemAllocator = nullptr;
+    m_pMemoryAllocator = nullptr;
 
     if (m_pDevice != nullptr)
     {
@@ -1245,10 +1166,6 @@ void VulkanRHI::Destroy()
 
         m_pDevice = nullptr;
     }
-
-    ZEN_DELETE(m_pResourceFactory);
-
-    m_pResourceFactory = nullptr;
 
     // destroy debug utils messenger
     if (m_messenger != VK_NULL_HANDLE)

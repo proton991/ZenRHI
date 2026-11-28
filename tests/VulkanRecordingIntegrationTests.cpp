@@ -1,6 +1,7 @@
 #include "VulkanIntegrationFixture.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanBuffer.h"
+#include "Vulkan/VulkanUniformRing.h"
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanPipeline.h"
@@ -16,7 +17,7 @@ namespace
 {
 using namespace zen;
 
-void DispatchUniformValue(FVulkanCommandListContext* context, VulkanShader* shader, VulkanBuffer* output, uint32_t value)
+void DispatchUniformValue(VulkanCommandListContext* context, VulkanShader* shader, VulkanBuffer* output, uint32_t value)
 {
     const uint32_t values[4]{value, 0, 0, 0};
 
@@ -31,12 +32,12 @@ void DispatchUniformValue(FVulkanCommandListContext* context, VulkanShader* shad
     context->RHIDispatch(1, 1, 1);
 }
 
-void DestroyCommandContext(FVulkanCommandListContext* context)
+void DestroyCommandContext(VulkanCommandListContext* context)
 {
     ZEN_DELETE(context);
 }
 
-using CommandContextOwner = std::unique_ptr<FVulkanCommandListContext, void (*)(FVulkanCommandListContext*)>;
+using CommandContextOwner = std::unique_ptr<VulkanCommandListContext, void (*)(VulkanCommandListContext*)>;
 
 using Clock               = std::chrono::steady_clock;
 
@@ -76,7 +77,7 @@ class VulkanRecordingIntegrationTest : public testing::Test
 {
 protected:
     std::unique_ptr<test::VulkanSession>                            session;
-    FVulkanCommandListContext*                                      context{};
+    VulkanCommandListContext*                                       context{};
     VkDebugUtilsMessengerEXT                                        messenger{};
     HeapVector<RHITexture*>                                         textures;
     HeapVector<RHIBuffer*>                                          buffers;
@@ -117,9 +118,9 @@ protected:
 
         ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(session->rhi.GetInstance(), &info, nullptr, &messenger), VK_SUCCESS);
 
-        context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+        context      = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
-        bindPipeline      = CountedVulkanCall<PFN_vkCmdBindPipeline>::Create(vkCmdBindPipeline);
+        bindPipeline = CountedVulkanCall<PFN_vkCmdBindPipeline>::Create(vkCmdBindPipeline);
 
         bindDescriptors   = CountedVulkanCall<PFN_vkCmdBindDescriptorSets>::Create(vkCmdBindDescriptorSets);
 
@@ -272,7 +273,7 @@ protected:
 
         if (dynamic)
         {
-            info.states.dynamicStates.Enable(RHIDynamicState::eViewPort, RHIDynamicState::eScissor, RHIDynamicState::eDepthBias,
+            info.states.dynamicStates.Enable(RHIDynamicState::eViewport, RHIDynamicState::eScissor, RHIDynamicState::eDepthBias,
                                              RHIDynamicState::eLineWidth);
 
             info.states.rasterizationState.enableDepthBias = true;
@@ -428,11 +429,11 @@ TEST_F(VulkanRecordingIntegrationTest, PackedUniformGrowthPreservesEarlierValues
 
     pipelines.push_back(pipeline);
 
-    VulkanBuffer* first                     = Buffer();
+    VulkanBuffer* first          = Buffer();
 
-    VulkanBuffer* second                    = Buffer();
+    VulkanBuffer* second         = Buffer();
 
-    VulkanUniformBufferAllocator* allocator = session->rhi.GetUniformBufferAllocator();
+    VulkanUniformRing* allocator = session->rhi.GetUniformRing();
 
     HeapVector<RHIBuffer*> previousBlocks;
 
@@ -449,7 +450,7 @@ TEST_F(VulkanRecordingIntegrationTest, PackedUniformGrowthPreservesEarlierValues
 
         HeapVector<RHIBuffer*> blocks;
 
-        VulkanUniformBufferBlock allocation = allocator->Alloc(16);
+        VulkanUniformBlock allocation = allocator->Alloc(16).GetValueOr({});
 
         ASSERT_TRUE(allocation.IsValid());
 
@@ -459,7 +460,7 @@ TEST_F(VulkanRecordingIntegrationTest, PackedUniformGrowthPreservesEarlierValues
         // The next packed update must grow past the former eight-block limit.
         for (uint32_t block = 0; block < 7; ++block)
         {
-            allocation = allocator->Alloc(4 * 1024 * 1024);
+            allocation = allocator->Alloc(4 * 1024 * 1024).GetValueOr({});
 
             ASSERT_TRUE(allocation.IsValid());
 
@@ -468,7 +469,7 @@ TEST_F(VulkanRecordingIntegrationTest, PackedUniformGrowthPreservesEarlierValues
 
         DispatchUniformValue(context, shader, second, 29 + round);
 
-        allocation = allocator->Alloc(16);
+        allocation = allocator->Alloc(16).GetValueOr({});
 
         ASSERT_TRUE(allocation.IsValid());
 
@@ -506,14 +507,14 @@ TEST_F(VulkanRecordingIntegrationTest, PackedUniformGrowthPreservesEarlierValues
 class VulkanUniformTrimIntegrationTest : public VulkanRecordingIntegrationTest
 {
 protected:
-    static constexpr uint32_t     blockSize = 1024;
-    VulkanUniformBufferAllocator* allocator{};
+    static constexpr uint32_t blockSize = 1024;
+    VulkanUniformRing*        allocator{};
 
     void SetUp() override
     {
         VulkanRecordingIntegrationTest::SetUp();
 
-        allocator = session->rhi.GetUniformBufferAllocator();
+        allocator = session->rhi.GetUniformRing();
 
         allocator->Destroy();
 
@@ -524,7 +525,7 @@ protected:
     {
         for (uint32_t i = 0; i < count; ++i)
         {
-            VulkanUniformBufferBlock allocation = allocator->Alloc(blockSize);
+            VulkanUniformBlock allocation = allocator->Alloc(blockSize).GetValueOr({});
 
             ASSERT_TRUE(allocation.IsValid());
 
@@ -588,7 +589,7 @@ protected:
         output->Unmap();
     }
 
-    void Enqueue(FVulkanCommandListContext* source)
+    void Enqueue(VulkanCommandListContext* source)
     {
         HeapVector<VulkanWorkload*> workloads;
 
@@ -649,7 +650,7 @@ TEST_F(VulkanUniformTrimIntegrationTest, UnsubmittedRecordingPreventsTrimmingAnd
 {
     Fill(3);
 
-    VulkanUniformBufferBlock retained = allocator->Alloc(blockSize);
+    VulkanUniformBlock retained = allocator->Alloc(blockSize).GetValueOr({});
 
     ASSERT_TRUE(retained.IsValid());
 
@@ -675,7 +676,7 @@ TEST_F(VulkanUniformTrimIntegrationTest, UnsubmittedRecordingPreventsTrimmingAnd
 
     ZEN_DELETE(context); // Abandon recording without ever assigning a queue serial.
 
-    context = static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
+    context = static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eGraphics));
 
     allocator->BeginFrame(0);
 
@@ -755,7 +756,7 @@ TEST_F(VulkanUniformTrimIntegrationTest, RecycledBlockRefreshesCleanPackedValues
 
     allocator->BeginFrame(0);
 
-    VulkanUniformBufferBlock overwrite = allocator->Alloc(16);
+    VulkanUniformBlock overwrite = allocator->Alloc(16).GetValueOr({});
 
     ASSERT_TRUE(overwrite.IsValid());
 
@@ -848,19 +849,10 @@ private:
     bool          opened{false};
 };
 
-class VulkanUniformQueueTrimTest : public VulkanUniformTrimIntegrationTest, public testing::WithParamInterface<bool>
-{
-    void SetUp() override
-    {
-        VulkanUniformTrimIntegrationTest::SetUp();
+class VulkanUniformQueueTrimTest : public VulkanUniformTrimIntegrationTest
+{};
 
-        ASSERT_TRUE(session->rhi.GetDevice()->SupportsTimelineSemaphore());
-
-        session->rhi.GetDevice()->GetExtensionFlags().hasTimelineSemaphore = GetParam();
-    }
-};
-
-TEST_P(VulkanUniformQueueTrimTest, PendingGPUReadPinsStorageUntilCompletion)
+TEST_F(VulkanUniformQueueTrimTest, PendingGPUReadPinsStorageUntilCompletion)
 {
     VulkanShader* shader = BindCompute();
 
@@ -905,11 +897,11 @@ TEST_P(VulkanUniformQueueTrimTest, PendingGPUReadPinsStorageUntilCompletion)
     EXPECT_EQ(allocator->GetAllocatedBlockCount(0), 2u);
 }
 
-TEST_P(VulkanUniformQueueTrimTest, MergedRejectedWorkloadsPinStorageUntilDiscard)
+TEST_F(VulkanUniformQueueTrimTest, MergedRejectedWorkloadsPinStorageUntilDiscard)
 {
     Fill(3);
 
-    VulkanUniformBufferBlock allocation = allocator->Alloc(blockSize);
+    VulkanUniformBlock allocation = allocator->Alloc(blockSize).GetValueOr({});
 
     ASSERT_TRUE(allocation.IsValid());
 
@@ -951,7 +943,7 @@ TEST_P(VulkanUniformQueueTrimTest, MergedRejectedWorkloadsPinStorageUntilDiscard
     EXPECT_EQ(allocator->GetAllocatedBlockCount(0), 2u);
 }
 
-TEST_P(VulkanUniformQueueTrimTest, AcceptedRecordingsReleaseDuplicateBlockCounts)
+TEST_F(VulkanUniformQueueTrimTest, AcceptedRecordingsReleaseDuplicateBlockCounts)
 {
     VulkanShader* shader = BindCompute();
 
@@ -1008,10 +1000,10 @@ TEST_P(VulkanUniformQueueTrimTest, AcceptedRecordingsReleaseDuplicateBlockCounts
     EXPECT_EQ(allocator->GetAllocatedBlockCount(0), 2u);
 }
 
-TEST_P(VulkanUniformQueueTrimTest, EveryQueueMustCompleteItsOwnSerial)
+TEST_F(VulkanUniformQueueTrimTest, EveryQueueMustCompleteItsOwnSerial)
 {
     CommandContextOwner compute(
-        static_cast<FVulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eAsyncCompute)),
+        static_cast<VulkanCommandListContext*>(session->rhi.GetCommandContext(RHICommandContextType::eAsyncCompute)),
         &DestroyCommandContext);
 
     VulkanQueue* graphicsQueue = context->GetQueue();
@@ -1025,7 +1017,7 @@ TEST_P(VulkanUniformQueueTrimTest, EveryQueueMustCompleteItsOwnSerial)
 
     Fill(3);
 
-    VulkanUniformBufferBlock allocation = allocator->Alloc(blockSize);
+    VulkanUniformBlock allocation = allocator->Alloc(blockSize).GetValueOr({});
 
     ASSERT_TRUE(allocation.IsValid());
 
@@ -1076,7 +1068,7 @@ TEST_P(VulkanUniformQueueTrimTest, EveryQueueMustCompleteItsOwnSerial)
     EXPECT_EQ(allocator->GetAllocatedBlockCount(0), 2u);
 }
 
-TEST_P(VulkanUniformQueueTrimTest, RejectedSubmissionTransfersCountsOnlyOnSuccessfulRetry)
+TEST_F(VulkanUniformQueueTrimTest, RejectedSubmissionTransfersCountsOnlyOnSuccessfulRetry)
 {
     VulkanShader* shader = BindCompute();
 
@@ -1133,11 +1125,11 @@ TEST_P(VulkanUniformQueueTrimTest, RejectedSubmissionTransfersCountsOnlyOnSucces
     EXPECT_EQ(allocator->GetAllocatedBlockCount(0), 2u);
 }
 
-TEST_P(VulkanUniformQueueTrimTest, UncertainSubmissionRemainsProtectedAfterUnrelatedCompletion)
+TEST_F(VulkanUniformQueueTrimTest, UncertainSubmissionRemainsProtectedAfterUnrelatedCompletion)
 {
     Fill(3);
 
-    const VulkanUniformBufferBlock allocation = allocator->Alloc(blockSize);
+    const VulkanUniformBlock allocation = allocator->Alloc(blockSize).GetValueOr({});
 
     ASSERT_TRUE(allocation.IsValid());
 
@@ -1177,8 +1169,6 @@ TEST_P(VulkanUniformQueueTrimTest, UncertainSubmissionRemainsProtectedAfterUnrel
     EXPECT_EQ(allocator->GetAllocatedBlockCount(0), 4u);
     // Teardown must destroy abandoned workloads before the uniform allocator.
 }
-
-INSTANTIATE_TEST_SUITE_P(TimelineAndFence, VulkanUniformQueueTrimTest, testing::Bool());
 
 TEST_F(VulkanRecordingIntegrationTest, MeasureRepeatedDrawRecording)
 {
@@ -1811,6 +1801,7 @@ struct PipelineCacheProbe
     static inline PFN_vkCreateGraphicsPipelines original;
     static inline PFN_vkCreateComputePipelines  originalCompute;
     static inline VkPipelineCache               cache;
+    static inline VkPipelineCache               deviceCache;
     static VKAPI_ATTR VkResult VKAPI_CALL       Create(VkDevice                            device,
                                                        VkPipelineCache                     suppliedCache,
                                                        uint32_t                            count,
@@ -1818,7 +1809,7 @@ struct PipelineCacheProbe
                                                        const VkAllocationCallbacks*        allocator,
                                                        VkPipeline*                         pipelines)
     {
-        EXPECT_EQ(suppliedCache, GVulkanRHI->GetDevice()->GetPipelineCache());
+        EXPECT_EQ(suppliedCache, deviceCache);
 
         return original(device, cache, count, infos, allocator, pipelines);
     }
@@ -1829,7 +1820,7 @@ struct PipelineCacheProbe
                                                   const VkAllocationCallbacks*       allocator,
                                                   VkPipeline*                        pipelines)
     {
-        EXPECT_EQ(suppliedCache, GVulkanRHI->GetDevice()->GetPipelineCache());
+        EXPECT_EQ(suppliedCache, deviceCache);
 
         return originalCompute(device, suppliedCache, count, infos, allocator, pipelines);
     }
@@ -1842,6 +1833,8 @@ TEST_F(VulkanRecordingIntegrationTest, DeviceCacheIsSharedByGraphicsAndComputeCr
     ASSERT_NE(cache, VK_NULL_HANDLE);
 
     PipelineCacheProbe::cache           = cache;
+
+    PipelineCacheProbe::deviceCache     = cache;
 
     PipelineCacheProbe::original        = vkCreateGraphicsPipelines;
 
@@ -1875,13 +1868,15 @@ TEST_F(VulkanRecordingIntegrationTest, DeviceCacheIsSharedByGraphicsAndComputeCr
 
 TEST_F(VulkanRecordingIntegrationTest, MeasureNativePipelineCacheBenefit)
 {
-    RHIRenderingLayout layout    = Layout(Texture());
+    RHIRenderingLayout layout       = Layout(Texture());
 
-    VulkanShader* shader         = Shader();
+    VulkanShader* shader            = Shader();
 
-    PipelineCacheProbe::original = vkCreateGraphicsPipelines;
+    PipelineCacheProbe::original    = vkCreateGraphicsPipelines;
 
-    PipelineCacheProbe::cache    = VK_NULL_HANDLE;
+    PipelineCacheProbe::deviceCache = session->rhi.GetDevice()->GetPipelineCache();
+
+    PipelineCacheProbe::cache       = VK_NULL_HANDLE;
 
     test::ScopedVulkanCall<PFN_vkCreateGraphicsPipelines> probe(vkCreateGraphicsPipelines, PipelineCacheProbe::Create);
 

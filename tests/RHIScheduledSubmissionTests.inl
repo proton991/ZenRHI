@@ -26,12 +26,12 @@ struct TestQueueFlushOrder
 class RejectedPresentViewport : public TestViewport
 {
 public:
-    RHIStatus PrepareForPresentChecked(RHICommandList* commands) override
+    RHIStatus PrepareForPresent(RHICommandList* commands) override
     {
-        return rejectPreparation ? RHIStatus{error} : TestViewport::PrepareForPresentChecked(commands);
+        return rejectPreparation ? RHIStatus{error} : TestViewport::PrepareForPresent(commands);
     }
 
-    RHIPresentResult PresentChecked() override
+    RHIPresentResult Present() override
     {
         return {RHISurfaceOutcome::eFailed, RHIPresentAcceptance::eRejected, error, false};
     }
@@ -46,13 +46,11 @@ protected:
     void SetUp() override
     {
         destroyed.clear();
-        GRHIFrameState.Init(3);
         rhi                                                          = ZEN_NEW() TestRHI();
         rhi->submissionQueueCapabilities.asyncSubmissionDependencies = true;
         rhi->submissionQueueCapabilities                             = DistinctComputeQueues();
         rhi->submissionQueueCapabilities.queueIds[2]                 = std::get<1>(GetParam()) ? 1 : 2;
-        executor    = ZEN_NEW() RHICommandListExecutor(rhi, std::get<0>(GetParam()));
-        GDynamicRHI = executor;
+        executor = ZEN_NEW() RHICommandListExecutor(rhi, std::get<0>(GetParam()));
     }
 
     void TearDown() override
@@ -64,7 +62,6 @@ protected:
         viewport.ReleaseForTeardown();
         executor->Destroy();
         ZEN_DELETE(executor);
-        GDynamicRHI = nullptr;
     }
 
     RHIResourcePtr<RHIBuffer> Buffer()
@@ -156,7 +153,8 @@ TEST_P(RHIScheduledSubmissionTest, ReadyGroupsSubmitInOrderAndRetainExactLogical
     EXPECT_EQ(result.groups[2].accepted.serial, 2u);
     EXPECT_EQ(result.groups[3].accepted.serial, 1u);
     EXPECT_EQ(result.groups[3].accepted.queue, RHICommandContextType::eTransfer);
-    EXPECT_EQ(ToValue(GetRHIThread().Invoke(&RHIFrameState::GetFrameNumber, &GRHIFrameState)), 1u);
+    EXPECT_EQ(ToValue(executor->GetRuntime().thread.Invoke(&RHIFrameState::GetFrameNumber, &executor->GetRuntime().frameState)),
+              1u);
     EXPECT_EQ(viewport.presents, 1u);
     ASSERT_EQ(rhi->gpuDependencies.size(), std::get<1>(GetParam()) ? 1u : 2u);
     EXPECT_EQ(rhi->gpuDependencies[0].consumer, RHICommandContextType::eGraphics);
@@ -447,7 +445,8 @@ TEST_P(RHIScheduledSubmissionTest, StandaloneRejectionCanRetryWithoutAdvancingFr
     retry.lists[1]->Dispatch(1, 1, 1);
     retry.Depends(1, 0);
     EXPECT_EQ(executor->SubmitGroups(retry.groups, retry.state).submission, RHISubmissionResult::eSuccess);
-    EXPECT_EQ(ToValue(GetRHIThread().Invoke(&RHIFrameState::GetFrameNumber, &GRHIFrameState)), 0u);
+    EXPECT_EQ(ToValue(executor->GetRuntime().thread.Invoke(&RHIFrameState::GetFrameNumber, &executor->GetRuntime().frameState)),
+              0u);
 }
 
 TEST_P(RHIScheduledSubmissionTest, ComputeWithoutGraphicsJoinProtectsRetirementAndRecycling)
@@ -461,11 +460,11 @@ TEST_P(RHIScheduledSubmissionTest, ComputeWithoutGraphicsJoinProtectsRetirementA
     const RHIBatchResult submitted = executor->SubmitFrame(first.groups, nullptr, first.state).Wait();
     ASSERT_EQ(submitted.submission, RHISubmissionResult::eSuccess);
     resource.Reset();
-    GetRHIThread().Invoke([this] { rhi->completed[0] = rhi->submitted[0]; });
+    executor->GetRuntime().thread.Invoke([this] { rhi->completed[0] = rhi->submitted[0]; });
     executor->FlushRHIThread();
     EXPECT_FALSE(destroyed.contains(id));
     EXPECT_TRUE(rhi->gpuDependencies.empty());
-    GetRHIThread().Invoke([this] { rhi->completed[1] = rhi->submitted[1]; });
+    executor->GetRuntime().thread.Invoke([this] { rhi->completed[1] = rhi->submitted[1]; });
     executor->FlushRHIThread();
     EXPECT_TRUE(destroyed.contains(id));
     const SmallVector<RHICommandContextType, 3> reordered{
@@ -498,17 +497,17 @@ TEST_P(RHIScheduledSubmissionTest, PresentRejectionPreservesAcceptedRendering)
     schedule.lists[0]->Draw(3, 1, 0, 0);
     const RHIBatchResult result = executor->SubmitFrame(schedule.groups, &surface, schedule.state).Wait();
     EXPECT_EQ(result.presentation.error.code, surface.error.code);
-    EXPECT_FALSE(result.presented);
+    EXPECT_FALSE(result.presentation.presented);
     EXPECT_EQ(result.submission, RHISubmissionResult::eSuccess);
     RHISubmissionDependency point;
     EXPECT_EQ(schedule.state->Resolve(0, point), RHISubmissionPointStatus::eAccepted);
     EXPECT_FALSE(executor->AreSubmissionsBlocked());
-    EXPECT_EQ(ToValue(GRHIFrameState.GetFrameNumber()), 1u);
+    EXPECT_EQ(ToValue(executor->GetRuntime().frameState.GetFrameNumber()), 1u);
     RHISubmissionTicket next = executor->SubmitFrame(schedule.groups, &viewport);
     EXPECT_TRUE(next.IsValid());
     if (next.IsValid())
     {
-        EXPECT_TRUE(next.Wait().presented);
+        EXPECT_TRUE(next.Wait().presentation.presented);
     }
 }
 
@@ -583,7 +582,7 @@ TEST_P(RHIScheduledSubmissionTest, CompletionQueryFailurePreservesAcceptedComput
         rhi->failProgressQuery = true;
     };
     const RHIBatchResult result = executor->SubmitFrame(schedule.groups, &viewport, schedule.state).Wait();
-    GetRHIThread().Invoke([this] { rhi->failProgressQuery = false; });
+    executor->GetRuntime().thread.Invoke([this] { rhi->failProgressQuery = false; });
     EXPECT_EQ(result.submission, RHISubmissionResult::eFatal);
     EXPECT_EQ(result.requiredSerials.Get(queues[0]), 1u);
     EXPECT_EQ(result.groups[0].submission, RHISubmissionResult::eFatal);

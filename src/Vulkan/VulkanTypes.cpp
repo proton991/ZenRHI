@@ -4,54 +4,6 @@
 
 namespace zen
 {
-VkDescriptorType ShaderResourceTypeToVkDescriptorType(RHIShaderResourceType shaderResourceType)
-{
-    VkDescriptorType type = VK_DESCRIPTOR_TYPE_MAX_ENUM;
-
-    switch (shaderResourceType)
-    {
-        case RHIShaderResourceType::eSampler:
-            //
-            type = VK_DESCRIPTOR_TYPE_SAMPLER;
-            break;
-
-        case RHIShaderResourceType::eTexture:
-            //
-            type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            break;
-
-        case RHIShaderResourceType::eSamplerWithTexture: type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; break;
-        case RHIShaderResourceType::eImage:
-            //
-            type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            break;
-
-        case RHIShaderResourceType::eTextureBuffer:
-        case RHIShaderResourceType::eSamplerWithTextureBuffer: type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; break;
-        case RHIShaderResourceType::eImageBuffer: type = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER; break;
-        case RHIShaderResourceType::eUniformBuffer:
-            // use dynamic uniform buffer by default
-            type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-            break;
-
-        case RHIShaderResourceType::eAccelerationStructure: type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; break;
-
-        case RHIShaderResourceType::eStorageBuffer:
-            //
-            type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            break;
-
-        case RHIShaderResourceType::eInputAttachment:
-            //
-            type = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
-            break;
-
-        default: ZEN_RHI_LOG_ERROR("Invalid ShaderResource Type"); break;
-    }
-
-    return type;
-}
-
 VkShaderStageFlagBits ShaderStageToVkShaderStageFlagBits(RHIShaderStage stage)
 {
     VkShaderStageFlagBits result{};
@@ -181,7 +133,7 @@ VkImageViewType ToVkImageViewType(RHITextureType type)
 VkImageViewCreateInfo MakeVkImageViewCreateInfo(RHITextureType                    type,
                                                 DataFormat                        format,
                                                 VkImage                           image,
-                                                const RHITextureSubResourceRange& range,
+                                                const RHITextureSubresourceRange& range,
                                                 bool                              arrayView)
 {
     VkImageViewCreateInfo info{};
@@ -350,7 +302,7 @@ VkClearDepthStencilValue ToVkClearDepthStencil(const RHIRenderTargetClearValue& 
     return depthStencilValue;
 }
 
-void ToVkImageSubresourceRange(const RHITextureSubResourceRange& range, VkImageSubresourceRange* pVkRange)
+void ToVkImageSubresourceRange(const RHITextureSubresourceRange& range, VkImageSubresourceRange* pVkRange)
 {
     *pVkRange                = {};
 
@@ -458,4 +410,52 @@ void ToVkBufferImageCopy(const RHIBufferTextureCopyRegion& region, VkBufferImage
 
     pCopy->imageExtent.depth  = region.textureSize.z;
 }
+
+VkPipelineRasterizationStateCreateInfo ToVkRasterizationState(const RHIGfxPipelineRasterizationState& state)
+{
+    VkPipelineRasterizationStateCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+
+    info.cullMode                = ToVkCullModeFlags(state.cullMode);
+    info.frontFace               = ToVkFrontFace(state.frontFace);
+    info.depthClampEnable        = state.enableDepthClamp;
+    info.rasterizerDiscardEnable = state.discardPrimitives;
+    info.polygonMode             = state.wireframe ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    info.depthBiasEnable         = state.enableDepthBias;
+    info.depthBiasClamp          = state.depthBiasClamp;
+    info.depthBiasConstantFactor = state.depthBiasConstantFactor;
+    info.depthBiasSlopeFactor    = state.depthBiasSlopeFactor;
+    info.lineWidth               = state.lineWidth;
+
+    return info;
+}
+
+VkPipelineDepthStencilStateCreateInfo ToVkDepthStencilState(const RHIGfxPipelineDepthStencilState& state)
+{
+    VkPipelineDepthStencilStateCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+    info.depthTestEnable                   = state.enableDepthTest;
+    info.depthWriteEnable                  = state.enableDepthWrite;
+    info.depthCompareOp                    = ToVkCompareOp(state.depthCompareOp);
+    info.depthBoundsTestEnable             = state.enableDepthBoundsTest;
+    info.stencilTestEnable                 = state.enableStencilTest;
+    info.minDepthBounds                    = state.minDepthBounds;
+    info.maxDepthBounds                    = state.maxDepthBounds;
+
+    const RHIStencilOpState* faces[]       = {&state.frontOp, &state.backOp};
+    VkStencilOpState*        nativeFaces[] = {&info.front, &info.back};
+
+    for (uint32_t face = 0; face < 2; ++face)
+    {
+        nativeFaces[face]->failOp      = ToVkStencilOp(faces[face]->fail);
+        nativeFaces[face]->passOp      = ToVkStencilOp(faces[face]->pass);
+        nativeFaces[face]->depthFailOp = ToVkStencilOp(faces[face]->depthFail);
+        nativeFaces[face]->compareOp   = ToVkCompareOp(faces[face]->compare);
+        nativeFaces[face]->compareMask = faces[face]->compareMask;
+        nativeFaces[face]->writeMask   = faces[face]->writeMask;
+        nativeFaces[face]->reference   = faces[face]->reference;
+    }
+
+    return info;
+}
+
 } // namespace zen

@@ -45,7 +45,7 @@ TEST(VulkanVerificationTest, TerminalFailureIsPublishedAsACompleteRecord)
     std::thread              observer(&TerminalPublicationProbe::Observe, &probe);
     for (uint32_t index = 0; index < probe.rounds; ++index)
     {
-        zen::VulkanRHI backend;
+        zen::VulkanRHI backend{RHIDeviceDesc{}};
         probe.backend = &backend;
         probe.finished.store(false, std::memory_order_relaxed);
         probe.gate.arrive_and_wait();

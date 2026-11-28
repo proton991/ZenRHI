@@ -6,16 +6,12 @@
 
 namespace zen
 {
-void ReportVulkanDeviceLoss(VkResult result, const char* operation);
-
-// Records a failed native object creation as the backend's creation error and reports device loss.
-void ReportVulkanCreationFailure(VkResult result, const char* operation, const char* source, uint32_t line);
+// Minimum Vulkan version for the instance, device selection and the memory allocator.
+inline constexpr uint32_t kVulkanApiVersion = VK_API_VERSION_1_2;
 
 inline RHIError MakeVulkanError(VkResult result, const char* operation, const char* source = nullptr, uint32_t line = 0)
 {
     RHIError error{};
-
-    ReportVulkanDeviceLoss(result, operation);
 
     if (result < VK_SUCCESS)
     {
@@ -97,31 +93,8 @@ inline const char* GetResultString(VkResult result)
     return pResultString;
 }
 
-template <typename T> inline std::string VkToString(T value)
-{
-    return "";
-}
-
-template <>
-// clang-tidy: disable-next-line
-inline std::string VkToString<VkImageUsageFlagBits>(VkImageUsageFlagBits image_usage)
-{
-    std::string returnValue{};
-    switch (image_usage)
-    {
-        case VK_IMAGE_USAGE_TRANSFER_SRC_BIT: returnValue = "VK_IMAGE_USAGE_TRANSFER_SRC_BIT"; break;
-        case VK_IMAGE_USAGE_TRANSFER_DST_BIT: returnValue = "VK_IMAGE_USAGE_TRANSFER_DST_BIT"; break;
-        case VK_IMAGE_USAGE_SAMPLED_BIT: returnValue = "VK_IMAGE_USAGE_SAMPLED_BIT"; break;
-        case VK_IMAGE_USAGE_STORAGE_BIT: returnValue = "VK_IMAGE_USAGE_STORAGE_BIT"; break;
-        case VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT: returnValue = "VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT"; break;
-        case VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT: returnValue = "VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT"; break;
-        case VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT: returnValue = "VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT"; break;
-        case VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT: returnValue = "VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT"; break;
-        case VK_IMAGE_USAGE_FLAG_BITS_MAX_ENUM: returnValue = "VK_IMAGE_USAGE_FLAG_BITS_MAX_ENUM"; break;
-        default: returnValue = "UNKNOWN IMAGE USAGE FLAG"; break;
-    }
-    return returnValue;
-}
+// Only the specializations below exist, so a type without one fails at link time.
+template <typename T> std::string VkToString(T value);
 
 template <>
 // clang-tidy: disable-next-line
@@ -307,22 +280,6 @@ template <> inline std::string VkToString<VkPresentModeKHR>(VkPresentModeKHR pre
             break;
         case VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR: returnValue = "VK_PRESENT_MODE_SHARED_DEMAND_REFRESH_KHR"; break;
         default: returnValue = "UNKNOWN_PRESENT_MODE"; break;
-    }
-    return returnValue;
-}
-
-template <> inline std::string VkToString<VkShaderStageFlagBits>(VkShaderStageFlagBits stage)
-{
-    std::string returnValue{};
-    switch (stage)
-    {
-        case VK_SHADER_STAGE_VERTEX_BIT: returnValue = "VK_SHADER_STAGE_VERTEX_BIT"; break;
-        case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: returnValue = "VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT"; break;
-        case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: returnValue = "VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT"; break;
-        case VK_SHADER_STAGE_GEOMETRY_BIT: returnValue = "VK_SHADER_STAGE_GEOMETRY_BIT"; break;
-        case VK_SHADER_STAGE_FRAGMENT_BIT: returnValue = "VK_SHADER_STAGE_FRAGMENT_BIT"; break;
-        case VK_SHADER_STAGE_COMPUTE_BIT: returnValue = "VK_SHADER_STAGE_COMPUTE_BIT"; break;
-        default: returnValue = "UNKNOWN_SHADER_STAGE"; break;
     }
     return returnValue;
 }

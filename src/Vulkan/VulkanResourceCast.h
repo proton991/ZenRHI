@@ -1,5 +1,6 @@
 #pragma once
 
+#include "VulkanAccelerationStructure.h"
 #include "VulkanBuffer.h"
 #include "VulkanTexture.h"
 #include "VulkanPipeline.h"
@@ -118,4 +119,44 @@ inline const VulkanSampler* TryVulkanSampler(const RHIResource* resource)
     return result;
 }
 
+inline VulkanAccelerationStructure* TryVulkanAccelerationStructure(RHIResource* resource)
+{
+    VulkanAccelerationStructure* result = nullptr;
+
+    if (resource != nullptr && resource->GetResourceType() == RHIResourceType::eAccelerationStructure)
+    {
+        result = static_cast<VulkanAccelerationStructure*>(resource);
+    }
+
+    return result;
+}
+
+inline const VulkanAccelerationStructure* TryVulkanAccelerationStructure(const RHIResource* resource)
+{
+    const VulkanAccelerationStructure* result = nullptr;
+
+    if (resource != nullptr && resource->GetResourceType() == RHIResourceType::eAccelerationStructure)
+    {
+        result = static_cast<const VulkanAccelerationStructure*>(resource);
+    }
+
+    return result;
+}
+
+// A texture view, or a texture's default view; null for any other resource.
+inline const VulkanTextureView* TryVulkanTextureView(const RHIResource* resource)
+{
+    const VulkanTextureView* result = nullptr;
+
+    if (resource != nullptr && resource->GetResourceType() == RHIResourceType::eTextureView)
+    {
+        result = TO_VK_TEXTURE_VIEW(resource);
+    }
+    else if (resource != nullptr && resource->GetResourceType() == RHIResourceType::eTexture)
+    {
+        result = TO_VK_TEXTURE_VIEW(TO_CVK_TEXTURE(resource)->GetDefaultView());
+    }
+
+    return result;
+}
 } // namespace zen

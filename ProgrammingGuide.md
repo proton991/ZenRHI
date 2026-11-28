@@ -8,7 +8,7 @@ Call `EnumerateRHIAdapters(desc)` before device creation. Check the result befor
 
 Call `CreateRHIChecked(desc)`. On failure, surface `GetError().operation` and `nativeCode`. The application can continue and retry after its environment changes. On success, pass the backend pointer to one `RHICommandListExecutor` on the render owner thread. The executor takes ownership. Threaded mode sends native work to an ordered worker. Inline mode executes on the owner. Device creation, enumeration and shutdown require external serialization.
 
-To reuse Vulkan compilation data across launches, supply a previous successful snapshot through `RHIDeviceDesc::SetPipelineCacheSeed`. After compilation and before shutdown, call `SnapshotPipelineCache(byteLimit, bytes)` on the executor. Replace the host's file atomically when the snapshot and write both succeed. Choose a size bound before reading the seed. ZenApp uses 64 MiB with its optional `--pipeline-cache=<file>` argument. An incompatible device, changed driver cache UUID or corrupt payload starts an empty cache.
+To reuse Vulkan compilation data across launches, supply a previous successful snapshot through `RHIDeviceDesc::SetPipelineCacheSeed`. After compilation and before shutdown, call `SnapshotPipelineCache(byteLimit, bytes)` on the executor. Replace the host's file atomically when the snapshot and write both succeed. Choose a size bound before reading the seed. An incompatible device, changed driver cache UUID or corrupt payload starts an empty cache.
 
 ## Create and record
 
@@ -20,7 +20,7 @@ Begin the frame on the executor. Obtain a context for the required queue, then t
 
 For a window, create a viewport on its owner and pass it to `SubmitFrame`. For offscreen work, pass a null viewport. Keep the returned ticket alive while reading its result. A successful ticket establishes native submission. Inspect the accepted queue serials and use checked completion waits before reading back GPU output. Grouped submissions express dependencies with a queue and an earlier submission point. The executor reports accepted prefixes if a later group fails.
 
-Transfer an owning reference to `ReleaseWhenComplete` after issuing the final work. Call `CollectGarbage` to retire eligible references. Stop producers before destroying the executor. Finish or discard recordings, wait for accepted GPU uses, release resources and destroy viewports on the window owner. A terminal device loss ends rendering and delivers the device report through the callback.
+Transfer an owning reference to `ReleaseWhenComplete` after issuing the final work. Call `FlushRHIThread` to retire eligible references. Stop producers before destroying the executor. Finish or discard recordings, wait for accepted GPU uses, release resources and destroy viewports on the window owner. A terminal device loss ends rendering and delivers the device report through the callback.
 
 ## Calling threads
 
@@ -28,22 +28,22 @@ The table gives the supported caller for each operation family. Overloads share 
 
 | Entry points | Caller and ordering |
 | --- | --- |
-| `EnumerateRHIAdapters`, `CreateRHIChecked`, `CreateRHI`, Vulkan factory equivalents, `DynamicRHI::Create`, executor constructor and destructor | Startup and shutdown owner, externally serialized across the process. Stop producers before teardown. |
-| `RHIDeviceDesc::Set*`, device-wide `RHIOptions::Set*`, callback installation | Startup owner. Finish configuration before publishing the device. |
-| Executor `BeginFrame`, `EndFrame`, `BeginGPUFrameTiming`, `EndGPUFrameTiming`, `GetCommandContext`, `GetTransferCommandContext` | Render owner. Hand each context to a single recording owner. |
+| `EnumerateRHIAdapters`, `CreateRHIChecked`, `CreateRHI`, executor constructor and destructor | Startup and shutdown owner, externally serialized across the process. Stop producers before teardown. |
+| `RHIDeviceDesc::Set*`, `SetRHIMessageCallback`, `SetRHIStrictTeardownChecks` | Startup owner. Finish configuration before creating the device; the device keeps its own copy of the description. |
+| Executor `BeginFrame`, `EndFrame`, `BeginGPUFrameTiming`, `EndGPUFrameTiming`, `GetCommandContext` | Render owner. Hand each context to a single recording owner. |
 | Executor `SubmitFrame` (both overloads), `SubmitBatch`, `SubmitGroups`, `SubmitQueuedGroups`, `FlushAllGPUCommands`, `FlushRHIThread` | Render owner, ordered with frame boundaries and presentation. Finish recording before handoff. |
-| Executor `CreateBuffer`, `CreateTexture`, `CreateTextureView`, `CreateSampler`, `CreateShader`, `CreatePipeline` (all overloads), `CreateAccelerationStructure`, matching `Destroy*`, `SnapshotPipelineCache` | Render owner in either mode. Factories and snapshots may wait for the worker. |
+| Executor `CreateBuffer`, `CreateTexture`, `CreateTextureView`, `CreateSampler`, `CreateShader`, `CreatePipeline` (all overloads), `CreateAccelerationStructure`, `SnapshotPipelineCache` | Render owner in either mode. Factories and snapshots may wait for the worker. |
 | `GetBufferAllocationSize`, `GetAccelerationStructureBuildSizes`, `GetTextureCopyCapabilities`, `GetSupportedDepthFormat` | Render owner through the executor. |
 | `RegisterBindlessResource`, `UnregisterBindlessResource`, `IsBindlessResourceRegistered`, `CollectRetiredBindlessResources`, `ResetBindlessResources` | Render owner through the executor. Stop publishing a slot before unregistering. A heap reset requires a drained boundary. |
-| `PollGPUProgress`, `QueryLastCompletedSerial`, `QueryCompletedSerials`, `QueryProgressChecked`, `WaitForCompletion[Checked]`, `WaitDeviceIdle[Checked]`, `ReleaseWhenComplete`, `CollectGarbage` | Render owner. Queries on an inline executor can call the driver. |
+| `PollGPUProgress`, `QueryLastCompletedSerial`, `QueryCompletedSerials`, `WaitForCompletion`, `WaitDeviceIdle`, `ReleaseWhenComplete` | Render owner. Queries on an inline executor can call the driver. |
 | `GetAPIType`, `GetName`, `QueryGPUInfo`, `GetQueueCapabilities`, `GetQueueCopyCapabilities`, `GetGPUMemoryStats`; executor cached submitted and completed serials | Any reader holding the initialized device alive. Serialize raw-backend progress queries with its owner. |
 | `GetVulkanDeviceHandles` | Device owner between successful creation and teardown. Borrowed handles require the caller to observe Vulkan's host synchronization rules. |
 | `CreateViewport`, viewport resize, surface callbacks, `DestroyViewport` | Window owner, coordinated with the render owner and pending frames. Keep the native window alive through destruction. |
 | `RHICommandList::Create`, recording methods, rollback, detach and reset | One recording owner per list. Hand off ownership before submission or reuse. |
 | `IRHICommandContext::RHI*`, raw `FinalizeCommandLists`, `PrepareSubmissionDependencies`, `SubmitPlatformCommandLists` and native resource-factory operations | RHI worker in threaded mode. The render owner assumes this role in inline mode. |
-| `RHIResourcePtr` copies and releases, immutable resource descriptions, submission ticket `IsReady` and `Wait` | Any thread holding a live reference. Serialize mutation of the same handle or ticket. A waiter must allow its producer to progress. |
+| `RHIResourcePtr` copies and releases, `Destroy*` (a reference release), immutable resource descriptions, submission ticket `IsReady` and `Wait` | Any thread holding a live reference. Serialize mutation of the same handle or ticket. A waiter must allow its producer to progress. |
 | Buffer `Map`, host writes and reads, `Unmap` | Exclusive host owner after the required GPU uses complete. |
-| `RHIThread::Start`, `OpenAdmission`, `Stop`; executor `Init` and `Destroy` | Lifecycle owner. Serialize mode changes and retire the backend after ordinary producers stop. |
+| `RHIThread::Start`, `OpenAdmission`, `Stop`; executor `Destroy` | Lifecycle owner. Serialize mode changes and retire the backend after ordinary producers stop. |
 | `RHIThread::Dispatch*`, `TryDispatch`, `Invoke`, `InvokeChecked`, `Flush` | Any producer while the threaded worker accepts work. Native work dispatched in inline mode requires the render owner. Captured data must survive execution or cancellation. |
 | `RHIThreadEvent::Signal`, `Reset`, `Wait`; submission-state and GPU-frame-timing result queries | Any thread holding a live object. The producer owns event reset and reuse. |
 | Executor `AreSubmissionsBlocked`, `GetTerminalError`, `HasDeviceLoss`; `RHIThread::GetFailure`, `IsThreaded`, `IsCurrentThread` | Any thread holding the live executor or worker. These queries read published state. |

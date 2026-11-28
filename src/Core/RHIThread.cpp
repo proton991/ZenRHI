@@ -17,8 +17,8 @@ public:
     StallMonitor(const char* operation, const RHIThreadActivity& activity) :
         m_operation(operation),
         m_activity(activity),
-        m_interval(operation ? RHIOptions::GetInstance().StallReportThreshold() : std::chrono::milliseconds(0)),
-        m_fatal(operation ? RHIOptions::GetInstance().StallFatalThreshold() : std::chrono::milliseconds(0))
+        m_interval(operation ? activity.stallReportMS.load(std::memory_order_relaxed) : 0),
+        m_fatal(operation ? activity.stallFatalMS.load(std::memory_order_relaxed) : 0)
     {
 #if defined(ZEN_WIN32)
         if (IsDebuggerPresent())
@@ -63,7 +63,7 @@ public:
                                  : started ? "executing"
                                            : "idle",
                                  completed, m_activity.queued.load(), started ? std::max<int64_t>(0, nowMS - started) : 0);
-                if (!m_reported && RHIOptions::GetInstance().StallStackCapture())
+                if (!m_reported && m_activity.stallStackCapture.load(std::memory_order_relaxed))
                 {
                     ReportWorkerStack(m_activity.threadID.load(std::memory_order_relaxed));
                 }
@@ -215,11 +215,11 @@ void RHIThreadEvent::Wait(const char* operation, const RHIThreadActivity& activi
 
 thread_local RHIThread* RHIThread::s_current = nullptr;
 
-RHIThread& GetRHIThread()
+void RHIThread::SetStallReports(std::chrono::milliseconds report, std::chrono::milliseconds fatal, bool captureStack)
 {
-    static RHIThread thread;
-
-    return thread;
+    m_activity.stallReportMS.store(report.count(), std::memory_order_relaxed);
+    m_activity.stallFatalMS.store(fatal.count(), std::memory_order_relaxed);
+    m_activity.stallStackCapture.store(captureStack, std::memory_order_relaxed);
 }
 
 RHIThread::~RHIThread()
@@ -297,25 +297,6 @@ void RHIThread::Stop(std::function<void()> finalizer)
     // A standalone inline backend can follow an executor once it reopens admission.
     // The finalizer must destroy every native resource before returning.
     m_threaded.store(false, std::memory_order_release);
-}
-
-void RHIThread::OpenAdmission()
-{
-    // A running worker keeps admission open until its own Stop.
-    if (!m_worker.joinable())
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-
-        m_stopping = false;
-
-        m_failure  = {};
-
-        m_taskFailed.store(false, std::memory_order_release);
-
-        m_deviceLost.store(false, std::memory_order_release);
-
-        m_cleanupClosed.store(false, std::memory_order_release);
-    }
 }
 
 void RHIThread::ExecuteFinalizer(std::function<void()> finalizer)

@@ -1,6 +1,7 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include <span>
 #include "ZenRHI/RHICommandList.h"
+#include "RHICommands.h"
 #include "ZenFoundation/Utils/Errors.h"
 
 namespace zen
@@ -78,7 +79,7 @@ void RHIResourceReferences::Swap(RHIResourceReferences& other)
 void IRHICommandContext::OnFinalRelease()
 {
     // A rejected release never reaches the destroyed backend; non-strict checks leak the context.
-    const bool accepted = GetRHIThread().DispatchCleanup([this] { ZEN_DELETE(this); });
+    const bool accepted = DispatchCleanup([this] { ZEN_DELETE(this); });
 
     VerifyTeardownOwnership(accepted, "Context released after RHI cleanup admission closed", __FILE__, __LINE__);
 }
@@ -99,11 +100,7 @@ RHICommandListPtr RHICommandList::DetachCommands(RHICommandListPtr reusable)
 
     ZEN_RHI_VERIFY(result->GetCommandCount() == 0);
 
-    result->m_contextOwner     = m_contextOwner;
-
-    result->m_pGraphicsContext = m_pGraphicsContext;
-
-    result->m_pComputeContext  = m_pComputeContext;
+    result->m_contextOwner = m_contextOwner;
 
     result->m_cmdAllocator.Swap(m_cmdAllocator);
 
@@ -130,18 +127,18 @@ RHICommandListPtr RHICommandList::DetachCommands(RHICommandListPtr reusable)
 
 void RHICommandList::ResetForReuse()
 {
-    GetRHIThread().CheckOwnership();
+    // A list without a context belongs to no device, so it has no RHI thread to check.
+    if (const RHIDeviceRuntime* runtime = GetContext() != nullptr ? GetContext()->GetRuntime() : nullptr)
+    {
+        runtime->thread.CheckOwnership();
+    }
 
     Reset();
 
     m_contextOwner.Reset();
-
-    m_pGraphicsContext = nullptr;
-
-    m_pComputeContext  = nullptr;
 }
 
-uint64_t RHICommandListBase::CaptureBindlessEpoch()
+uint64_t RHICommandList::CaptureBindlessEpoch()
 {
     IRHICommandContext* context = GetContext();
 
@@ -164,7 +161,7 @@ uint64_t RHICommandListBase::CaptureBindlessEpoch()
     return epoch;
 }
 
-void RHICommandListBase::ReleaseBindlessEpochs(size_t count)
+void RHICommandList::ReleaseBindlessEpochs(size_t count)
 {
     ZEN_RHI_VERIFY(count <= m_bindlessEpochs.size());
 
@@ -176,82 +173,51 @@ void RHICommandListBase::ReleaseBindlessEpochs(size_t count)
     m_bindlessEpochs.resize(count);
 }
 
-void RHICommandListBase::Execute()
+void RHICommandList::Execute()
 {
-    GetRHIThread().CheckOwnership();
+    // A list without a context belongs to no device, so it has no RHI thread to check.
+    if (const RHIDeviceRuntime* runtime = GetContext() != nullptr ? GetContext()->GetRuntime() : nullptr)
+    {
+        runtime->thread.CheckOwnership();
+    }
 
-    RHICommandBase* pCmd              = m_pCmdHead;
+    RHICommand* pCmd                  = m_pCmdHead;
 
     const IRHICommandContext* context = GetContext();
 
     while (pCmd)
     {
-        RHICommandBase* pNext = pCmd->pNextCmd; // Save next before freeing
+        RHICommand* pNext = pCmd->pNextCmd;
 
         if (context == nullptr || !context->HasRecordingError())
         {
-            static_cast<RHICommand*>(pCmd)->Execute(*this);
+            pCmd->Execute(*this);
         }
 
         pCmd = pNext;
     }
 }
 
-void RHICommandListBase::Reset()
+void RHICommandList::Reset()
 {
-    RHICommandBase* pCmd = m_pCmdHead;
-
-    while (pCmd)
-    {
-        RHICommandBase* pNext = pCmd->pNextCmd;
-
-        if (pCmd->pDestroy)
-        {
-            pCmd->pDestroy(pCmd);
-        }
-        else
-        {
-            pCmd->~RHICommandBase();
-        }
-
-        pCmd = pNext;
-    }
-
-    m_pCmdHead    = nullptr;
-
-    m_ppCmdPtr    = &m_pCmdHead;
-
-    m_numCommands = 0;
+    RollbackCommands({&m_pCmdHead, 0, 0, 0, 0});
 
     m_cmdAllocator.Reset();
-
-    ReleaseBindlessEpochs(0);
-
-    m_resources.Reset();
-
-    m_submissionDependencies.clear();
 
     m_submittedSerial    = 0;
 
     m_submissionBoundary = false;
 }
 
-void RHICommandListBase::RollbackCommands(CommandCheckpoint checkpoint)
+void RHICommandList::RollbackCommands(CommandCheckpoint checkpoint)
 {
-    RHICommandBase* command = *checkpoint.tail;
+    RHICommand* command = *checkpoint.tail;
 
     while (command != nullptr)
     {
-        RHICommandBase* next = command->pNextCmd;
+        RHICommand* next = command->pNextCmd;
 
-        if (command->pDestroy != nullptr)
-        {
-            command->pDestroy(command);
-        }
-        else
-        {
-            command->~RHICommandBase();
-        }
+        command->~RHICommand();
 
         command = next;
     }
@@ -275,24 +241,9 @@ RHICommandList* RHICommandList::Create(IRHICommandContext* pContext)
 
     if (pContext != nullptr)
     {
-        pCmdList                          = ZEN_NEW() RHICommandList();
+        pCmdList                 = ZEN_NEW() RHICommandList();
 
-        pCmdList->m_contextOwner          = RefCountPtr<IRHICommandContext>(pContext);
-
-        RHICommandContextType contextType = pContext->GetContextType();
-
-        if (contextType == RHICommandContextType::eGraphics || contextType == RHICommandContextType::eTransfer)
-        {
-            pCmdList->m_pGraphicsContext = pContext;
-
-            pCmdList->m_pComputeContext  = pContext;
-        }
-        else if (contextType == RHICommandContextType::eAsyncCompute)
-        {
-            pCmdList->m_pGraphicsContext = nullptr;
-
-            pCmdList->m_pComputeContext  = pContext;
-        }
+        pCmdList->m_contextOwner = RefCountPtr<IRHICommandContext>(pContext);
     }
 
     return pCmdList;
@@ -350,7 +301,7 @@ void RHICommandList::CopyBuffer(RHIBuffer* pSrcBuffer, RHIBuffer* pDstBuffer, co
     ALLOC_CMD(RHICommandCopyBuffer)(pSrcBuffer, pDstBuffer, region);
 }
 
-void RHICommandList::ClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubResourceRange& range)
+void RHICommandList::ClearTexture(RHITexture* pTexture, const Color& color, const RHITextureSubresourceRange& range)
 {
     RetainResource(pTexture);
 
@@ -495,11 +446,11 @@ void RHICommandList::EndRendering()
     ALLOC_CMD(RHICommandEndRendering)();
 }
 
-void RHICommandList::BindPipeline(RHIPipelineType pipelineType, RHIPipeline* pPipeline)
+void RHICommandList::BindPipeline(RHIPipeline* pPipeline)
 {
     RetainResource(pPipeline);
 
-    ALLOC_CMD(RHICommandBindPipeline)(pipelineType, pPipeline);
+    ALLOC_CMD(RHICommandBindPipeline)(pPipeline);
 }
 
 void RHICommandList::SetShaderParameters(const RHIBatchedShaderParameters& parameters)
@@ -549,20 +500,20 @@ void RHICommandList::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t
     ALLOC_CMD(RHICommandDraw)(vertexCount, instanceCount, firstVertex, firstInstance, CaptureBindlessEpoch());
 }
 
-void RHICommandList::DrawIndexed(const RHICommandDrawIndexed::Param& param)
+void RHICommandList::DrawIndexed(const RHIDrawIndexedArgs& args)
 {
-    RetainResource(param.pIndexBuffer);
+    RetainResource(args.pIndexBuffer);
 
-    ALLOC_CMD(RHICommandDrawIndexed)(param, CaptureBindlessEpoch());
+    ALLOC_CMD(RHICommandDrawIndexed)(args, CaptureBindlessEpoch());
 }
 
-void RHICommandList::DrawIndexedIndirect(const RHICommandDrawIndexedIndirect::Param& param)
+void RHICommandList::DrawIndexedIndirect(const RHIDrawIndexedIndirectArgs& args)
 {
-    RetainResource(param.pIndexBuffer);
+    RetainResource(args.pIndexBuffer);
 
-    RetainResource(param.pIndirectBuffer);
+    RetainResource(args.pIndirectBuffer);
 
-    ALLOC_CMD(RHICommandDrawIndexedIndirect)(param, CaptureBindlessEpoch());
+    ALLOC_CMD(RHICommandDrawIndexedIndirect)(args, CaptureBindlessEpoch());
 }
 
 void RHICommandList::Dispatch(uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)

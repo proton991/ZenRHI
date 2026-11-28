@@ -6,6 +6,7 @@
 #include "Vulkan/VulkanCommandList.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanResourceAllocator.h"
+#include "Vulkan/VulkanResourceCast.h"
 #include <cstring>
 #include <functional>
 
@@ -116,23 +117,21 @@ struct NativeBuild
 
 RHIAccelerationStructureBuildSizes VulkanRHI::GetAccelerationStructureBuildSizes(const RHIAccelerationStructureBuildDesc& desc)
 {
-    return AreSubmissionsBlocked() ? RHIAccelerationStructureBuildSizes{} : VulkanAccelerationStructure::GetBuildSizes(desc);
+    return AreSubmissionsBlocked() ? RHIAccelerationStructureBuildSizes{}
+                                   : VulkanAccelerationStructure::GetBuildSizes(*this, desc);
 }
 
 RHIAccelerationStructure* VulkanRHI::CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info)
 {
     RHIWorkerTimer timer(RHIWorkerTime::eResource);
-    return GetResourceFactory()->CreateAccelerationStructure(info);
+    return AreSubmissionsBlocked() ? nullptr : VulkanAccelerationStructure::CreateObject(this, info).GetValueOr(nullptr);
 }
 
-RHIAccelerationStructure* VulkanResourceFactory::CreateAccelerationStructure(const RHIAccelerationStructureCreateInfo& info)
+bool VulkanAccelerationStructure::ValidateDescription(VulkanRHI&                               rhi,
+                                                      const RHIAccelerationStructureBuildDesc& desc,
+                                                      bool                                     requireBuffers)
 {
-    return GVulkanRHI->AreSubmissionsBlocked() ? nullptr : VulkanAccelerationStructure::CreateObject(info);
-}
-
-bool VulkanAccelerationStructure::ValidateDescription(const RHIAccelerationStructureBuildDesc& desc, bool requireBuffers)
-{
-    const RHIRayQueryCapabilities& capabilities = GVulkanRHI->QueryGPUInfo().rayQuery;
+    const RHIRayQueryCapabilities& capabilities = rhi.QueryGPUInfo().rayQuery;
     bool                           valid        = capabilities.IsUsable() && capabilities.bufferDeviceAddress;
     if (desc.type == RHIAccelerationStructureType::eTopLevel)
     {
@@ -142,8 +141,7 @@ bool VulkanAccelerationStructure::ValidateDescription(const RHIAccelerationStruc
         {
             for (const RHIAccelerationStructureInstance& instance : desc.instances)
             {
-                const VulkanAccelerationStructure* structure =
-                    dynamic_cast<const VulkanAccelerationStructure*>(instance.pStructure);
+                const VulkanAccelerationStructure* structure = TryVulkanAccelerationStructure(instance.pStructure);
                 valid &= instance.IsValid() && structure != nullptr && structure->GetDeviceAddress() != 0;
             }
         }
@@ -179,10 +177,9 @@ bool VulkanAccelerationStructure::ValidateDescription(const RHIAccelerationStruc
             primitives += geometry.indexCount / 3;
             if (geometry.pOpacityMicromap != nullptr)
             {
-                const VulkanAccelerationStructure* micromap =
-                    dynamic_cast<const VulkanAccelerationStructure*>(geometry.pOpacityMicromap);
-                valid &= capabilities.opacityMicromap && micromap != nullptr
-                      && micromap->GetType() == RHIAccelerationStructureType::eOpacityMicromap;
+                const VulkanAccelerationStructure* micromap  = TryVulkanAccelerationStructure(geometry.pOpacityMicromap);
+                valid                                       &= capabilities.opacityMicromap && micromap != nullptr
+                                                            && micromap->GetType() == RHIAccelerationStructureType::eOpacityMicromap;
                 if (requireBuffers && valid)
                 {
                     valid = ValidInput(geometry.pOpacityIndexBuffer, geometry.opacityIndexOffset,
@@ -207,15 +204,16 @@ bool VulkanAccelerationStructure::ValidateDescription(const RHIAccelerationStruc
     return valid;
 }
 
-RHIAccelerationStructureBuildSizes VulkanAccelerationStructure::GetBuildSizes(const RHIAccelerationStructureBuildDesc& desc)
+RHIAccelerationStructureBuildSizes VulkanAccelerationStructure::GetBuildSizes(VulkanRHI&                               rhi,
+                                                                              const RHIAccelerationStructureBuildDesc& desc)
 {
     RHIAccelerationStructureBuildSizes result;
-    if (ValidateDescription(desc, false))
+    if (ValidateDescription(rhi, desc, false))
     {
         NativeBuild                              build(desc, false);
         VkAccelerationStructureBuildSizesInfoKHR sizes{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
         vkGetAccelerationStructureBuildSizesKHR(
-            GVulkanRHI->GetVkDevice(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build.info,
+            rhi.GetVkDevice(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build.info,
             desc.type == RHIAccelerationStructureType::eOpacityMicromap ? nullptr : build.counts.data(), &sizes);
         result = {sizes.accelerationStructureSize, sizes.buildScratchSize, sizes.updateScratchSize};
         if (desc.type == RHIAccelerationStructureType::eTopLevel)
@@ -226,51 +224,47 @@ RHIAccelerationStructureBuildSizes VulkanAccelerationStructure::GetBuildSizes(co
     return result;
 }
 
-VulkanAccelerationStructure* VulkanAccelerationStructure::CreateObject(const RHIAccelerationStructureCreateInfo& info)
+RHIResult<VulkanAccelerationStructure*> VulkanAccelerationStructure::CreateObject(
+    VulkanRHI*                                pRHI,
+    const RHIAccelerationStructureCreateInfo& info)
 {
-    VulkanAccelerationStructure* result = nullptr;
-    bool                         valid =
-        GVulkanRHI->QueryGPUInfo().rayQuery.IsUsable() && info.size > 0
+    bool valid =
+        pRHI->QueryGPUInfo().rayQuery.IsUsable() && info.size > 0
         && (info.type == RHIAccelerationStructureType::eBottomLevel || info.type == RHIAccelerationStructureType::eTopLevel
-            || (info.type == RHIAccelerationStructureType::eOpacityMicromap
-                && GVulkanRHI->QueryGPUInfo().rayQuery.opacityMicromap));
+            || (info.type == RHIAccelerationStructureType::eOpacityMicromap && pRHI->QueryGPUInfo().rayQuery.opacityMicromap));
     for (RHIAccelerationStructure* dependency : info.referencedStructures)
     {
-        const VulkanAccelerationStructure* native  = dynamic_cast<const VulkanAccelerationStructure*>(dependency);
+        const VulkanAccelerationStructure* native  = TryVulkanAccelerationStructure(dependency);
         valid                                     &= dependency != nullptr && native != nullptr
                                                   && ((info.type == RHIAccelerationStructureType::eTopLevel
                                                        && dependency->GetType() == RHIAccelerationStructureType::eBottomLevel && native->GetDeviceAddress() != 0)
                                                       || (info.type == RHIAccelerationStructureType::eBottomLevel
                                                           && dependency->GetType() == RHIAccelerationStructureType::eOpacityMicromap));
     }
-    if (valid)
-    {
-        result = VersatileResource::AllocMem<VulkanAccelerationStructure>(GVulkanRHI->GetResourceAllocator());
-        new (result) VulkanAccelerationStructure(info);
-        result->Init();
-        if (result->m_vkHandle == VK_NULL_HANDLE || result->m_deviceAddress == 0)
-        {
-            result->ReleaseReference();
-            result = nullptr;
-        }
-    }
-    return result;
+    VulkanAccelerationStructure* structure = valid ? NewVulkanResource<VulkanAccelerationStructure>(pRHI, pRHI, info) : nullptr;
+    return structure != nullptr
+             ? KeepIfInitialized(structure, structure->Init())
+             : RejectDescription<VulkanAccelerationStructure>("Acceleration structure description", __FILE__, __LINE__);
 }
 
-VulkanAccelerationStructure::VulkanAccelerationStructure(const RHIAccelerationStructureCreateInfo& info) :
-    RHIAccelerationStructure(info), m_sortedReferences(GetReferencedStructures().data(), GetReferencedStructures().size())
+VulkanAccelerationStructure::VulkanAccelerationStructure(VulkanRHI* pRHI, const RHIAccelerationStructureCreateInfo& info) :
+    RHIAccelerationStructure(info),
+    m_pRHI(pRHI),
+    m_sortedReferences(GetReferencedStructures().data(), GetReferencedStructures().size())
 {
     std::sort(m_sortedReferences.begin(), m_sortedReferences.end(), std::less<RHIAccelerationStructure*>());
 }
 
-void VulkanAccelerationStructure::Init()
+RHIError VulkanAccelerationStructure::Init()
 {
+    RHIError error =
+        MakeRHIError(RHIErrorCode::eOutOfDeviceMemory, "Create acceleration structure storage", __FILE__, __LINE__);
     RHIBufferCreateInfo storage;
     storage.size         = GetSize();
     storage.allocateType = RHIBufferAllocateType::eGPU;
     storage.usageFlags.SetFlags(RHIBufferUsageFlagBits::eAccelerationStructureStorage, RHIBufferUsageFlagBits::eDeviceAddress);
     storage.tag      = m_resourceTag;
-    m_pStorageBuffer = GVulkanRHI->CreateBuffer(storage);
+    m_pStorageBuffer = m_pRHI->CreateBuffer(storage);
     if (m_pStorageBuffer != nullptr)
     {
         VkAccelerationStructureCreateInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
@@ -283,11 +277,11 @@ void VulkanAccelerationStructure::Init()
             VkAccelerationStructureCreateInfo2KHR micromap{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_2_KHR};
             micromap.type         = VK_ACCELERATION_STRUCTURE_TYPE_OPACITY_MICROMAP_KHR;
             micromap.addressRange = {m_pStorageBuffer->GetDeviceAddress(), GetSize()};
-            result = vkCreateAccelerationStructure2KHR(GVulkanRHI->GetVkDevice(), &micromap, nullptr, &m_vkHandle);
+            result                = vkCreateAccelerationStructure2KHR(m_pRHI->GetVkDevice(), &micromap, nullptr, &m_vkHandle);
         }
         else
         {
-            result = vkCreateAccelerationStructureKHR(GVulkanRHI->GetVkDevice(), &info, nullptr, &m_vkHandle);
+            result = vkCreateAccelerationStructureKHR(m_pRHI->GetVkDevice(), &info, nullptr, &m_vkHandle);
         }
         if (result == VK_SUCCESS)
         {
@@ -296,7 +290,10 @@ void VulkanAccelerationStructure::Init()
             address.accelerationStructure = m_vkHandle;
             m_deviceAddress               = GetType() == RHIAccelerationStructureType::eOpacityMicromap
                                               ? m_pStorageBuffer->GetDeviceAddress()
-                                              : vkGetAccelerationStructureDeviceAddressKHR(GVulkanRHI->GetVkDevice(), &address);
+                                              : vkGetAccelerationStructureDeviceAddressKHR(m_pRHI->GetVkDevice(), &address);
+            error = m_deviceAddress != 0
+                      ? RHIError{}
+                      : MakeRHIError(RHIErrorCode::eBackendFailure, "Acceleration structure address", __FILE__, __LINE__);
         }
         else
         {
@@ -304,24 +301,26 @@ void VulkanAccelerationStructure::Init()
             const char* operation = GetType() == RHIAccelerationStructureType::eOpacityMicromap
                                       ? "vkCreateAccelerationStructure2KHR"
                                       : "vkCreateAccelerationStructureKHR";
-            ReportVulkanDeviceLoss(result, operation);
+            error                 = m_pRHI->ReportCreationFailure(result, operation, __FILE__, __LINE__);
             ZEN_RHI_LOG_ERROR("{} failed: {}", operation, GetResultString(result));
         }
     }
+
+    return error;
 }
 
 void VulkanAccelerationStructure::Destroy()
 {
     if (m_vkHandle != VK_NULL_HANDLE)
     {
-        vkDestroyAccelerationStructureKHR(GVulkanRHI->GetVkDevice(), m_vkHandle, nullptr);
+        vkDestroyAccelerationStructureKHR(m_pRHI->GetVkDevice(), m_vkHandle, nullptr);
     }
     if (m_pStorageBuffer != nullptr)
     {
         m_pStorageBuffer->ReleaseReference();
     }
     this->~VulkanAccelerationStructure();
-    VersatileResource::Free(GVulkanRHI->GetResourceAllocator(), this);
+    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
 }
 
 bool VulkanAccelerationStructure::IsUpdateCompatible(const RHIAccelerationStructureBuildDesc& desc) const
@@ -347,7 +346,7 @@ bool VulkanAccelerationStructure::ValidateBuild(const RHIAccelerationStructureBu
 {
     const bool topLevel = GetType() == RHIAccelerationStructureType::eTopLevel;
     bool       valid    = info.pDestination == this && info.description.type == GetType()
-                       && ValidateDescription(info.description, !topLevel) && info.pScratchBuffer != nullptr
+                       && ValidateDescription(*m_pRHI, info.description, !topLevel) && info.pScratchBuffer != nullptr
                        && info.pScratchBuffer->GetUsageFlags().HasFlag(RHIBufferUsageFlagBits::eStorageBuffer);
     if (valid)
     {
@@ -359,7 +358,7 @@ bool VulkanAccelerationStructure::ValidateBuild(const RHIAccelerationStructureBu
         }
         else
         {
-            sizes = GetBuildSizes(info.description);
+            sizes = GetBuildSizes(*m_pRHI, info.description);
             if (topLevel)
             {
                 // Native TLAS size queries depend on instance count and build flags, not instance contents.
@@ -373,10 +372,10 @@ bool VulkanAccelerationStructure::ValidateBuild(const RHIAccelerationStructureBu
         valid                      = sizes.IsValid() && sizes.storageSize <= GetSize() && address != 0
                                   && info.scratchOffset <= info.pScratchBuffer->GetRequiredSize()
                                   && scratchSize <= info.pScratchBuffer->GetRequiredSize() - info.scratchOffset
-                                  && (address + info.scratchOffset) % GVulkanRHI->QueryGPUInfo().rayQuery.scratchAlignment == 0;
+                                  && (address + info.scratchOffset) % m_pRHI->QueryGPUInfo().rayQuery.scratchAlignment == 0;
         if (info.pSource != nullptr)
         {
-            const VulkanAccelerationStructure* source  = dynamic_cast<const VulkanAccelerationStructure*>(info.pSource);
+            const VulkanAccelerationStructure* source  = TryVulkanAccelerationStructure(info.pSource);
             valid                                     &= source != nullptr && source->IsUpdateCompatible(info.description);
         }
         for (const RHIAccelerationStructureInstance& instance : info.description.instances)
@@ -441,9 +440,9 @@ void VulkanAccelerationStructure::RecordBuild(VkCommandBuffer                   
     }
 }
 
-void FVulkanCommandListContext::RHIBuildAccelerationStructure(const RHIAccelerationStructureBuildInfo& info)
+void VulkanCommandListContext::RHIBuildAccelerationStructure(const RHIAccelerationStructureBuildInfo& info)
 {
-    VulkanAccelerationStructure* destination = dynamic_cast<VulkanAccelerationStructure*>(info.pDestination);
+    VulkanAccelerationStructure* destination = TryVulkanAccelerationStructure(info.pDestination);
     if (destination == nullptr || GetContextType() != RHICommandContextType::eGraphics || !destination->ValidateBuild(info))
     {
         LatchError(MakeRHIError(RHIErrorCode::eInvalidArgument, "BuildAccelerationStructure", __FILE__, __LINE__));
@@ -459,7 +458,7 @@ void FVulkanCommandListContext::RHIBuildAccelerationStructure(const RHIAccelerat
             upload.usageFlags.SetFlags(RHIBufferUsageFlagBits::eAccelerationStructureInput,
                                        RHIBufferUsageFlagBits::eDeviceAddress);
             upload.tag = "AS instance upload";
-            instances  = RHIResourcePtr<RHIBuffer>::Adopt(GVulkanRHI->CreateBuffer(upload));
+            instances  = RHIResourcePtr<RHIBuffer>::Adopt(m_pDevice->GetRHI()->CreateBuffer(upload));
             VkAccelerationStructureInstanceKHR* mapped =
                 instances ? reinterpret_cast<VkAccelerationStructureInstanceKHR*>(instances->Map()) : nullptr;
             if (mapped == nullptr || instances->GetDeviceAddress() == 0 || instances->GetDeviceAddress() % 16 != 0)

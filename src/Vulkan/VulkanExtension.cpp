@@ -1,659 +1,14 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include "ZenFoundation/Utils/UniquePtr.h"
-#include "ZenRHI/RHIOptions.h"
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanExtension.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanRHI.h"
-
-#if defined(ZEN_WIN32)
-#    include "Vulkan/Platform/VulkanWindowsPlatform.h"
-#endif
-
-#if defined(ZEN_MACOS)
-#    include "Vulkan/Platform/VulkanMacOSPlatform.h"
-#endif
+#include "Vulkan/Platform/VulkanWindowBridge.h"
 
 namespace zen
 {
-template <typename ExistingChainType, typename NewStructType>
-static void AddToPNext(ExistingChainType& Existing, NewStructType& Added)
-{
-    Added.pNext    = (void*)Existing.pNext;
-
-    Existing.pNext = (void*)&Added;
-}
-
-class VulkanBufferInt64AtomicsExtension : public VulkanDeviceExtension
-{
-public:
-    explicit VulkanBufferInt64AtomicsExtension(VulkanDevice* device) :
-        VulkanDeviceExtension(device, VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)
-    {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        AddToPNext(features, m_features);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        SetSupport(m_features.shaderBufferInt64Atomics == VK_TRUE
-                   && m_pDevice->GetPhysicalDeviceFeatures().shaderInt64 == VK_TRUE);
-        m_pDevice->GetExtensionFlags().hasBufferInt64Atomics = IsEnabledAndSupported();
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            m_features.shaderSharedInt64Atomics = VK_FALSE;
-            AddToPNext(info, m_features);
-        }
-    }
-
-private:
-    VkPhysicalDeviceShaderAtomicInt64Features m_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
-};
-
-class VulkanPipelineExecutableExtension : public VulkanDeviceExtension
-{
-public:
-    explicit VulkanPipelineExecutableExtension(VulkanDevice* device) :
-        VulkanDeviceExtension(device, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)
-    {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        AddToPNext(features, m_features);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        SetSupport(m_features.pipelineExecutableInfo == VK_TRUE);
-        m_pDevice->GetExtensionFlags().hasPipelineExecutableInfo = IsEnabledAndSupported();
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(info, m_features);
-        }
-    }
-
-private:
-    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR m_features{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
-};
-
-class VulkanDeviceFaultExtension : public VulkanDeviceExtension
-{
-public:
-    explicit VulkanDeviceFaultExtension(VulkanDevice* device) :
-        VulkanDeviceExtension(device, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
-    {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        AddToPNext(features, m_features);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        SetSupport(m_features.deviceFault == VK_TRUE);
-
-        m_features.deviceFaultVendorBinary            = VK_FALSE;
-
-        m_pDevice->GetExtensionFlags().hasDeviceFault = IsEnabledAndSupported();
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(info, m_features);
-        }
-    }
-
-private:
-    VkPhysicalDeviceFaultFeaturesEXT m_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
-};
-
-class VulkanSwapchainMaintenanceExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanSwapchainMaintenanceExtension(VulkanDevice* device, NameID name) : VulkanDeviceExtension(device, name) {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        AddToPNext(features, m_features);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        SetSupport(m_features.swapchainMaintenance1 == VK_TRUE);
-
-        m_pDevice->GetExtensionFlags().hasSwapchainMaintenance1 = IsEnabledAndSupported();
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(info, m_features);
-        }
-    }
-
-private:
-    // The EXT and KHR feature/fence structures are aliases.
-    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT m_features{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
-};
-
-const char* MissingDescriptorIndexingFeature(const VkPhysicalDeviceDescriptorIndexingFeatures& features)
-{
-    const char* missing = nullptr;
-    if (!features.runtimeDescriptorArray)
-    {
-        missing = "runtimeDescriptorArray";
-    }
-    else if (!features.descriptorBindingPartiallyBound)
-    {
-        missing = "descriptorBindingPartiallyBound";
-    }
-    else if (!features.descriptorBindingUpdateUnusedWhilePending)
-    {
-        missing = "descriptorBindingUpdateUnusedWhilePending";
-    }
-    else if (!features.descriptorBindingSampledImageUpdateAfterBind)
-    {
-        missing = "descriptorBindingSampledImageUpdateAfterBind";
-    }
-    else if (!features.shaderSampledImageArrayNonUniformIndexing)
-    {
-        missing = "shaderSampledImageArrayNonUniformIndexing";
-    }
-    return missing;
-}
-
-// Advanced extensions
-/**
- * VK_EXT_descriptor_indexing
- */
-class VulkanDescriptorIndexingExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanDescriptorIndexingExtension(VulkanDevice* pDevice) :
-        VulkanDeviceExtension(pDevice, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)
-    {
-        InitVkStruct(m_descriptorIndexingFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_descriptorIndexingFeatures);
-    }
-
-    virtual void AfterPhysicalDeviceFeatures() final
-    {
-        const bool supported = MissingDescriptorIndexingFeature(m_descriptorIndexingFeatures) == nullptr;
-
-        SetSupport(supported);
-
-        if (supported)
-        {
-            m_pDevice->GetExtensionFlags().hasDescriptorIndexing = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            VkPhysicalDeviceDescriptorIndexingFeatures enabled{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES};
-
-            enabled.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
-
-            enabled.runtimeDescriptorArray                       = VK_TRUE;
-
-            enabled.descriptorBindingPartiallyBound              = VK_TRUE;
-
-            enabled.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
-
-            enabled.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
-
-
-
-            m_descriptorIndexingFeatures                         = enabled;
-
-            AddToPNext(DeviceCI, m_descriptorIndexingFeatures);
-        }
-    }
-
-private:
-    VkPhysicalDeviceDescriptorIndexingFeatures m_descriptorIndexingFeatures;
-};
-
-/**
- * VK_KHR_dynamic_rendering
- */
-class VulkanDynamicRenderingExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanDynamicRenderingExtension(VulkanDevice* pDevice) :
-        VulkanDeviceExtension(pDevice, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)
-    {
-        InitVkStruct(m_dynamicRenderingFeaturesKHR, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_dynamicRenderingFeaturesKHR);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        bool supported = (m_dynamicRenderingFeaturesKHR.dynamicRendering == VK_TRUE);
-
-        SetSupport(supported);
-
-        if (supported)
-        {
-            m_pDevice->GetExtensionFlags().hasDynamicRendering = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(DeviceCI, m_dynamicRenderingFeaturesKHR);
-        }
-    }
-
-private:
-    VkPhysicalDeviceDynamicRenderingFeaturesKHR m_dynamicRenderingFeaturesKHR;
-};
-
-/**
- * VK_EXT_host_query_reset / Vulkan 1.2 host query reset
- */
-class VulkanHostQueryResetExtension : public VulkanDeviceExtension
-{
-public:
-    explicit VulkanHostQueryResetExtension(VulkanDevice* device) :
-        VulkanDeviceExtension(device, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME)
-    {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        AddToPNext(features, m_features);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        SetSupport(m_features.hostQueryReset == VK_TRUE);
-        m_pDevice->GetExtensionFlags().hasHostQueryReset = IsEnabledAndSupported();
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(info, m_features);
-        }
-    }
-
-private:
-    VkPhysicalDeviceHostQueryResetFeatures m_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES};
-};
-
-/**
- * VK_KHR_timeline_semaphore / Vulkan 1.2 timeline semaphore
- */
-class VulkanTimelineSemaphoreExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanTimelineSemaphoreExtension(VulkanDevice* pDevice) :
-        VulkanDeviceExtension(pDevice, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)
-    {
-        InitVkStruct(m_timelineSemaphoreFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_timelineSemaphoreFeatures);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        SetSupport(m_timelineSemaphoreFeatures.timelineSemaphore == VK_TRUE);
-
-        if (m_timelineSemaphoreFeatures.timelineSemaphore == VK_TRUE)
-        {
-            SetSupport();
-
-            m_pDevice->GetExtensionFlags().hasTimelineSemaphore = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(DeviceCI, m_timelineSemaphoreFeatures);
-        }
-    }
-
-private:
-    VkPhysicalDeviceTimelineSemaphoreFeatures m_timelineSemaphoreFeatures{};
-};
-
-/**
- * VK_KHR_buffer_device_address
- */
-class VulkanBufferDeviceAddressExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanBufferDeviceAddressExtension(VulkanDevice* pDevice) :
-        VulkanDeviceExtension(pDevice, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)
-    {
-        InitVkStruct(m_bufferDeviceAddressFeature, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_bufferDeviceAddressFeature);
-    }
-
-    virtual void AfterPhysicalDeviceFeatures() final
-    {
-        bool supported = (m_bufferDeviceAddressFeature.bufferDeviceAddress == VK_TRUE);
-
-        SetSupport(supported);
-
-        if (supported)
-        {
-            m_pDevice->GetExtensionFlags().hasBufferDeviceAddress = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            VkPhysicalDeviceBufferDeviceAddressFeatures enabled{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
-
-            enabled.bufferDeviceAddress  = VK_TRUE;
-
-            m_bufferDeviceAddressFeature = enabled;
-
-            AddToPNext(DeviceCI, m_bufferDeviceAddressFeature);
-        }
-    }
-
-private:
-    VkPhysicalDeviceBufferDeviceAddressFeatures m_bufferDeviceAddressFeature;
-};
-
-/**
- * VK_KHR_acceleration_structure
- */
-class VulkanAccelerationStructureExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanAccelerationStructureExtension(VulkanDevice* pDevice) :
-        VulkanDeviceExtension(pDevice, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
-    {
-        InitVkStruct(m_accelerationStructureFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_accelerationStructureFeatures);
-    }
-
-    virtual void AfterPhysicalDeviceFeatures() final
-    {
-        bool supported = (m_accelerationStructureFeatures.accelerationStructure == VK_TRUE);
-
-        SetSupport(supported);
-
-        if (supported)
-        {
-            m_pDevice->GetExtensionFlags().hasAccelerationStructure = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            VkPhysicalDeviceAccelerationStructureFeaturesKHR enabled{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
-
-            enabled.accelerationStructure   = VK_TRUE;
-
-            m_accelerationStructureFeatures = enabled;
-
-            AddToPNext(DeviceCI, m_accelerationStructureFeatures);
-        }
-    }
-
-private:
-    VkPhysicalDeviceAccelerationStructureFeaturesKHR m_accelerationStructureFeatures;
-};
-
-/**
- * VK_KHR_ray_tracing_pipeline
- */
-class VulkanRaytracingPipelineExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanRaytracingPipelineExtension(VulkanDevice* pDevice) :
-        VulkanDeviceExtension(pDevice, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)
-    {
-        InitVkStruct(m_rayTracingPipelineFeatures, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_rayTracingPipelineFeatures);
-    }
-
-    virtual void AfterPhysicalDeviceFeatures() final
-    {
-        bool supported = (m_rayTracingPipelineFeatures.rayTracingPipeline == VK_TRUE);
-
-        SetSupport(supported);
-
-        if (supported)
-        {
-            m_pDevice->GetExtensionFlags().hasRaytracingPipeline = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            VkPhysicalDeviceRayTracingPipelineFeaturesKHR enabled{
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
-
-            enabled.rayTracingPipeline                  = VK_TRUE;
-            enabled.rayTracingPipelineTraceRaysIndirect = m_rayTracingPipelineFeatures.rayTracingPipelineTraceRaysIndirect;
-            m_pDevice->GetExtensionFlags().hasTraceRaysIndirect = enabled.rayTracingPipelineTraceRaysIndirect != VK_FALSE;
-
-            m_rayTracingPipelineFeatures                        = enabled;
-
-            AddToPNext(DeviceCI, m_rayTracingPipelineFeatures);
-        }
-    }
-
-private:
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR m_rayTracingPipelineFeatures;
-};
-
-/**
- * VK_EXT/NV_ray_tracing_invocation_reorder
- */
-class VulkanInvocationReorderExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanInvocationReorderExtension(VulkanDevice* device, bool ext) :
-        VulkanDeviceExtension(device,
-                              ext ? VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME
-                                  : VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME),
-        m_ext(ext)
-    {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        if (m_ext)
-        {
-            AddToPNext(features, m_extFeatures);
-        }
-        else
-        {
-            AddToPNext(features, m_nvFeatures);
-        }
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT ext{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_EXT};
-        VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV nv{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV};
-        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-        properties.pNext = m_ext ? static_cast<void*>(&ext) : static_cast<void*>(&nv);
-        vkGetPhysicalDeviceProperties2(m_pDevice->GetPhysicalDeviceHandle(), &properties);
-        // Some implementations expose the language extension without active reordering.
-        const bool supported =
-            m_ext ? m_extFeatures.rayTracingInvocationReorder
-                        && ext.rayTracingInvocationReorderReorderingHint == VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT
-                  : m_nvFeatures.rayTracingInvocationReorder
-                        && nv.rayTracingInvocationReorderReorderingHint == VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV;
-        SetSupport(supported);
-        if (m_ext)
-        {
-            m_pDevice->GetExtensionFlags().hasInvocationReorderEXT = IsEnabledAndSupported();
-        }
-        else
-        {
-            m_pDevice->GetExtensionFlags().hasInvocationReorderNV = IsEnabledAndSupported();
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            if (m_ext)
-            {
-                AddToPNext(info, m_extFeatures);
-            }
-            else
-            {
-                AddToPNext(info, m_nvFeatures);
-            }
-        }
-    }
-
-private:
-    bool                                                   m_ext;
-    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT m_extFeatures{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT};
-    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV m_nvFeatures{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV};
-};
-
-// VK_KHR_ray_query remains available for forward shadows and calibration checks.
-class VulkanRayQueryExtension : public VulkanDeviceExtension
-{
-public:
-    VulkanRayQueryExtension(VulkanDevice* pDevice) : VulkanDeviceExtension(pDevice, VK_KHR_RAY_QUERY_EXTENSION_NAME)
-    {
-        InitVkStruct(m_rayQueryFeature, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR);
-    }
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& physicalDeviceFeatures2Khr) final
-    {
-        AddToPNext(physicalDeviceFeatures2Khr, m_rayQueryFeature);
-    }
-
-    virtual void AfterPhysicalDeviceFeatures() final
-    {
-        bool supported = (m_rayQueryFeature.rayQuery == VK_TRUE);
-
-        SetSupport(supported);
-
-        if (supported)
-        {
-            m_pDevice->GetExtensionFlags().hasRayQuery = 1;
-        }
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& DeviceCI) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(DeviceCI, m_rayQueryFeature);
-        }
-    }
-
-private:
-    VkPhysicalDeviceRayQueryFeaturesKHR m_rayQueryFeature;
-};
-
-// The KHR micromap API reuses acceleration-structure resources and build barriers.
-// Its device-address creation entry point requires the following feature chain.
-class VulkanOpacityMicromapExtension : public VulkanDeviceExtension
-{
-public:
-    explicit VulkanOpacityMicromapExtension(VulkanDevice* device) :
-        VulkanDeviceExtension(device, VK_KHR_OPACITY_MICROMAP_EXTENSION_NAME)
-    {}
-
-    void BeforePhysicalDeviceFeatures(VkPhysicalDeviceFeatures2KHR& features) final
-    {
-        AddToPNext(features, m_micromap);
-        AddToPNext(features, m_address);
-        AddToPNext(features, m_synchronization);
-        AddToPNext(features, m_dynamic);
-    }
-
-    void AfterPhysicalDeviceFeatures() final
-    {
-        const bool supported = m_micromap.micromap && m_address.deviceAddressCommands && m_synchronization.synchronization2
-                            && m_dynamic.extendedDynamicState;
-        SetSupport(supported);
-        m_pDevice->GetExtensionFlags().hasOpacityMicromap = supported;
-    }
-
-    void BeforeCreateDevice(VkDeviceCreateInfo& info) final
-    {
-        if (IsEnabledAndSupported())
-        {
-            AddToPNext(info, m_micromap);
-            AddToPNext(info, m_address);
-            AddToPNext(info, m_synchronization);
-            AddToPNext(info, m_dynamic);
-        }
-    }
-
-private:
-    VkPhysicalDeviceOpacityMicromapFeaturesKHR m_micromap{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_KHR};
-    VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR m_address{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_ADDRESS_COMMANDS_FEATURES_KHR};
-    VkPhysicalDeviceSynchronization2FeaturesKHR m_synchronization{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR};
-    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT m_dynamic{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
-};
-
 static int FindExtensionIndex(NameID extensionName, const HeapVector<VkExtensionProperties>& supported)
 {
     int index = -1;
@@ -720,7 +75,7 @@ static bool HasInstanceExtension(const VulkanInstanceExtensionArray& extensions,
     {
         if (extension->GetName() == name)
         {
-            supported = extension->IsEnabledAndSupported();
+            supported = extension->IsSupported();
 
             break;
         }
@@ -729,19 +84,15 @@ static bool HasInstanceExtension(const VulkanInstanceExtensionArray& extensions,
     return supported;
 }
 
-VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensions(InstanceExtensionFlags& extensionFlags,
-                                                                                   RHIError*               error)
+VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensions(
+    InstanceExtensionFlags&          extensionFlags,
+    RHIDeviceDesc::SurfaceExtensions surfaceExtensions,
+    RHIError*                        error)
 {
     VulkanInstanceExtensionArray enabledExtensions;
 
-#define SET_INSTANCE_EXTENSION_FLAG(FLAG_NAME) extensionFlags.FLAG_NAME = 1;
 #define ADD_INSTANCE_EXTENSION(EXTENSION_NAME) \
     enabledExtensions.emplace_back(MakeUnique<VulkanInstanceExtension>(EXTENSION_NAME));
-
-    // generic extensions
-    ADD_INSTANCE_EXTENSION(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-
-    SET_INSTANCE_EXTENSION_FLAG(hasGetPhysicalDeviceProperties);
 
     enabledExtensions.emplace_back(MakeUnique<VulkanInstanceExtension>(VK_KHR_SURFACE_EXTENSION_NAME, true));
 
@@ -758,7 +109,7 @@ VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensio
 #endif
     ADD_INSTANCE_EXTENSION(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME);
 
-    VulkanPlatform::AddInstanceExtensions(enabledExtensions);
+    AddWindowInstanceExtensions(enabledExtensions, surfaceExtensions);
 
     FlagExtensionSupported(enabledExtensions, VulkanInstanceExtension::GetSupportedInstanceExtensions({}, error));
 
@@ -771,31 +122,30 @@ VulkanInstanceExtensionArray VulkanInstanceExtension::GetEnabledInstanceExtensio
 #if defined(VK_KHR_surface_maintenance1)
         if (name == NameID(VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME))
         {
-            extension->SetSupport(extension->IsEnabledAndSupported() && hasSurfaceCapabilities2);
+            extension->SetSupport(extension->IsSupported() && hasSurfaceCapabilities2);
 
-            extensionFlags.hasSurfaceMaintenanceKHR = extension->IsEnabledAndSupported();
+            extensionFlags.hasSurfaceMaintenanceKHR = extension->IsSupported();
         }
 #endif
         if (name == NameID(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME))
         {
-            extension->SetSupport(extension->IsEnabledAndSupported() && hasSurfaceCapabilities2);
+            extension->SetSupport(extension->IsSupported() && hasSurfaceCapabilities2);
 
-            extensionFlags.hasSurfaceMaintenanceEXT = extension->IsEnabledAndSupported();
+            extensionFlags.hasSurfaceMaintenanceEXT = extension->IsSupported();
         }
 
         if (name == NameID(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
         {
-            extensionFlags.hasDebugUtils = extension->IsEnabledAndSupported();
+            extensionFlags.hasDebugUtils = extension->IsSupported();
         }
     }
 
-#undef SET_INSTANCE_EXTENSION_FLAG
 #undef ADD_INSTANCE_EXTENSION
 
     return enabledExtensions;
 }
 
-HeapVector<VkExtensionProperties> VulkanDeviceExtension::GetSupportedExtensions(VkPhysicalDevice gpu, RHIError* error)
+HeapVector<VkExtensionProperties> GetSupportedDeviceExtensions(VkPhysicalDevice gpu, RHIError* error)
 {
     HeapVector<VkExtensionProperties> extensions;
 
@@ -810,170 +160,273 @@ HeapVector<VkExtensionProperties> VulkanDeviceExtension::GetSupportedExtensions(
     return extensions;
 }
 
-VulkanDeviceExtensionArray VulkanDeviceExtension::GetEnabledExtensions(VulkanDevice* pDevice, RHIError* error)
+namespace
 {
-    VulkanDeviceExtensionArray enabledExtensions;
+using Extension = VulkanDeviceExtensionName;
 
-#define SET_SIMPLE_EXTENSION_FLAG(FLAG_NAME) pDevice->GetExtensionFlags().FLAG_NAME = 1;
-
-#define ADD_SIMPLE_DEVICE_EXTENSION(EXTENSION_NAME) \
-    enabledExtensions.emplace_back(MakeUnique<VulkanDeviceExtension>(pDevice, EXTENSION_NAME));
-
-#define ADD_ADVANCED_DEVICE_EXTENSION(EXTENSION_CLASS) enabledExtensions.emplace_back(MakeUnique<EXTENSION_CLASS>(pDevice));
-
-#if defined(ZEN_MACOS)
-    ADD_SIMPLE_DEVICE_EXTENSION("VK_KHR_portability_subset");
-#endif
-
-    ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
-
-    ADD_SIMPLE_DEVICE_EXTENSION(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-
-    if (RHIOptions::GetInstance().DeviceLossDiagnostics())
-    {
-        ADD_SIMPLE_DEVICE_EXTENSION(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
-    }
-
-    ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
-
-    ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_SPIRV_1_4_EXTENSION_NAME);
-
-    ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanDescriptorIndexingExtension)
-
-    // ray tracing extensions
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanBufferDeviceAddressExtension)
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanAccelerationStructureExtension)
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanRaytracingPipelineExtension)
-
-    enabledExtensions.emplace_back(MakeUnique<VulkanInvocationReorderExtension>(pDevice, true));
-    enabledExtensions.emplace_back(MakeUnique<VulkanInvocationReorderExtension>(pDevice, false));
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanRayQueryExtension)
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanDynamicRenderingExtension)
-
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanTimelineSemaphoreExtension)
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanHostQueryResetExtension)
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanBufferInt64AtomicsExtension)
-    ADD_ADVANCED_DEVICE_EXTENSION(VulkanDeviceFaultExtension)
-
-    if (RHIOptions::GetInstance().PipelineStatistics())
-    {
-        ADD_ADVANCED_DEVICE_EXTENSION(VulkanPipelineExecutableExtension)
-    }
-
-    const HeapVector<VkExtensionProperties> supported = GetSupportedExtensions(pDevice->GetPhysicalDeviceHandle(), error);
-
-    if (FindExtensionIndex(VK_KHR_OPACITY_MICROMAP_EXTENSION_NAME, supported) >= 0
-        && FindExtensionIndex(VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME, supported) >= 0
-        && FindExtensionIndex(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME, supported) >= 0
-        && FindExtensionIndex(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME, supported) >= 0)
-    {
-        ADD_ADVANCED_DEVICE_EXTENSION(VulkanOpacityMicromapExtension)
-        ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME)
-        ADD_SIMPLE_DEVICE_EXTENSION(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)
-        ADD_SIMPLE_DEVICE_EXTENSION(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME)
-    }
-
-    // Enabling either extension guarantees one timestamp domain across submissions and queues.
-    // Whole-frame timing needs this guarantee without querying any host-clock calibration.
-    NameID calibratedTimestamps;
-
+// Names in VulkanDeviceExtensionName order; an SDK without a name leaves its entry empty.
+constexpr const char* kDeviceExtensionNames[] = {
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
+    VK_AMD_BUFFER_MARKER_EXTENSION_NAME,
+    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+    VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME,
+    VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+    VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
+    VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
+    VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME,
+    VK_KHR_RAY_QUERY_EXTENSION_NAME,
+    VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
+    VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,
+    VK_KHR_OPACITY_MICROMAP_EXTENSION_NAME,
+    VK_KHR_DEVICE_ADDRESS_COMMANDS_EXTENSION_NAME,
+    VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+    VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
 #if defined(VK_KHR_calibrated_timestamps)
-    if (FindExtensionIndex(NameID(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME), supported) >= 0)
-    {
-        calibratedTimestamps = NameID(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
-    }
+    VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+#else
+    "",
 #endif
-
 #if defined(VK_EXT_calibrated_timestamps)
-    if (calibratedTimestamps == NameID()
-        && FindExtensionIndex(NameID(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME), supported) >= 0)
-    {
-        calibratedTimestamps = NameID(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
-    }
+    VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+#else
+    "",
 #endif
-
-    if (calibratedTimestamps != NameID())
-    {
-        enabledExtensions.emplace_back(MakeUnique<VulkanDeviceExtension>(pDevice, calibratedTimestamps));
-    }
-
-    const InstanceExtensionFlags& instanceFlags = GVulkanRHI->GetInstanceExtensionFlags();
-
-    bool hasSwapchainMaintenanceKHR             = false;
-
 #if defined(VK_KHR_swapchain_maintenance1)
-    hasSwapchainMaintenanceKHR = instanceFlags.hasSurfaceMaintenanceKHR
-                              && FindExtensionIndex(NameID(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME), supported) >= 0;
-
-    if (hasSwapchainMaintenanceKHR)
-    {
-        enabledExtensions.emplace_back(
-            MakeUnique<VulkanSwapchainMaintenanceExtension>(pDevice, NameID(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)));
-    }
+    VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+#else
+    "",
 #endif
-    if (!hasSwapchainMaintenanceKHR && instanceFlags.hasSurfaceMaintenanceEXT
-        && FindExtensionIndex(NameID(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME), supported) >= 0)
+    VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+};
+static_assert(std::size(kDeviceExtensionNames) == ToUnderlying(Extension::eMax));
+
+bool IsAdvertised(const HeapVector<VkExtensionProperties>& supported, const char* name)
+{
+    bool advertised = false;
+
+    for (uint32_t i = 0; !advertised && name[0] != '\0' && i < supported.size(); ++i)
     {
-        enabledExtensions.emplace_back(
-            MakeUnique<VulkanSwapchainMaintenanceExtension>(pDevice, NameID(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)));
+        advertised = strcmp(name, supported[i].extensionName) == 0;
     }
 
-    FlagExtensionSupported(enabledExtensions, supported);
+    return advertised;
+}
 
-    // These features are core in our minimum API version (1.2), even when the
-    // driver does not advertise their former extension names.
-    for (const UniquePtr<VulkanDeviceExtension>& extension : enabledExtensions)
+// The ray-tracing invocation reorder hint; reordering counts only when the device reorders.
+template <typename Properties> bool ReordersInvocations(VkPhysicalDevice gpu, Properties properties, int32_t reorderMode)
+{
+    VkPhysicalDeviceProperties2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+
+    query.pNext = &properties;
+
+    vkGetPhysicalDeviceProperties2(gpu, &query);
+
+    return static_cast<int32_t>(properties.rayTracingInvocationReorderReorderingHint) == reorderMode;
+}
+} // namespace
+
+void* VulkanDeviceFeatures::Link(const VulkanDeviceExtensionSet& extensions)
+{
+    struct Entry
     {
-        const NameID name = extension->GetName();
+        Extension extension;
+        void*     features;
+    };
 
-        if (name == NameID(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) || name == NameID(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME)
-            || name == NameID(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)
-            || name == NameID(VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME)
-            || name == NameID(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) || name == NameID(VK_KHR_SPIRV_1_4_EXTENSION_NAME))
-        {
-            extension->SetCoreSupport();
-        }
+    // The micromap's companion structs follow its own enablement, not their names'.
+    const Entry entries[]    = {{Extension::eDynamicRendering, &dynamicRendering},
+                                {Extension::eAccelerationStructure, &accelerationStructure},
+                                {Extension::eRayTracingPipeline, &rayTracingPipeline},
+                                {Extension::eInvocationReorderEXT, &invocationReorderEXT},
+                                {Extension::eInvocationReorderNV, &invocationReorderNV},
+                                {Extension::eRayQuery, &rayQuery},
+                                {Extension::eDeviceFault, &fault},
+                                {Extension::ePipelineExecutable, &pipelineExecutable},
+                                {Extension::eOpacityMicromap, &micromap},
+                                {Extension::eOpacityMicromap, &addressCommands},
+                                {Extension::eOpacityMicromap, &synchronization2},
+                                {Extension::eOpacityMicromap, &extendedDynamicState},
+                                {Extension::eSwapchainMaintenanceKHR, &swapchainMaintenance},
+                                {Extension::eSwapchainMaintenanceEXT, &swapchainMaintenance}};
 
-        if (name == NameID(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME))
-        {
-            pDevice->GetExtensionFlags().hasDeferredHostOperation = extension->IsEnabledAndSupported();
-        }
+    core.pNext               = &vulkan12;
 
-        if (name == calibratedTimestamps)
-        {
-            pDevice->GetExtensionFlags().hasCalibratedTimestamps = extension->IsEnabledAndSupported();
-        }
+    VkBaseOutStructure* tail = reinterpret_cast<VkBaseOutStructure*>(&vulkan12);
 
-        if (name == NameID(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME))
+    for (const Entry& entry : entries)
+    {
+        if (extensions.test(ToUnderlying(entry.extension)))
         {
-            pDevice->GetExtensionFlags().hasSamplerMirrorClampToEdge = extension->IsEnabledAndSupported();
-        }
-        if (name == NameID(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME))
-        {
-            pDevice->GetExtensionFlags().hasMemoryBudget = extension->IsEnabledAndSupported();
-        }
+            tail->pNext = static_cast<VkBaseOutStructure*>(entry.features);
 
-        if (name == NameID(VK_AMD_BUFFER_MARKER_EXTENSION_NAME))
-        {
-            pDevice->GetExtensionFlags().hasBufferMarker = extension->IsEnabledAndSupported();
+            tail        = tail->pNext;
         }
     }
 
-    pDevice->GetExtensionFlags().hasSPIRV_14 = 1;
+    tail->pNext = nullptr;
 
-#undef SET_EXTENSION_FLAG
-#undef ADD_SIMPLE_DEVICE_EXTENSION
-#undef ADD_ADVANCED_DEVICE_EXTENSION
+    return &vulkan12;
+}
 
-    return enabledExtensions;
+bool VulkanDeviceExtensionSelection::IsEnabled(const char* name) const
+{
+    bool found = false;
+
+    for (uint32_t i = 0; !found && i < names.size(); ++i)
+    {
+        found = strcmp(names[i].CStr(), name) == 0;
+    }
+
+    return found;
+}
+
+VulkanDeviceExtensionSelection SelectDeviceExtensions(VulkanDevice& device, RHIError* error)
+{
+    const VkPhysicalDevice                  gpu      = device.GetPhysicalDeviceHandle();
+    const RHIDeviceDesc&                    desc     = device.GetRHI()->GetDeviceDesc();
+    const InstanceExtensionFlags&           instance = device.GetRHI()->GetInstanceExtensionFlags();
+    const HeapVector<VkExtensionProperties> names    = GetSupportedDeviceExtensions(gpu, error);
+
+    VulkanDeviceExtensionSet advertised;
+
+    for (uint32_t i = 0; i < ToUnderlying(Extension::eMax); ++i)
+    {
+        advertised.set(i, IsAdvertised(names, kDeviceExtensionNames[i]));
+    }
+
+    // Requests that depend on the description, and alternatives where only one name is used.
+    const bool micromap =
+        advertised[ToUnderlying(Extension::eOpacityMicromap)] && advertised[ToUnderlying(Extension::eDeviceAddressCommands)]
+        && advertised[ToUnderlying(Extension::eSynchronization2)] && advertised[ToUnderlying(Extension::eExtendedDynamicState)];
+    for (Extension member : {Extension::eOpacityMicromap, Extension::eDeviceAddressCommands, Extension::eSynchronization2,
+                             Extension::eExtendedDynamicState})
+    {
+        advertised.set(ToUnderlying(member), micromap);
+    }
+    advertised.set(ToUnderlying(Extension::eBufferMarker),
+                   advertised[ToUnderlying(Extension::eBufferMarker)] && desc.DeviceLossDiagnostics());
+    advertised.set(ToUnderlying(Extension::ePipelineExecutable),
+                   advertised[ToUnderlying(Extension::ePipelineExecutable)] && desc.PipelineStatistics());
+    advertised.set(ToUnderlying(Extension::eCalibratedTimestampsEXT),
+                   advertised[ToUnderlying(Extension::eCalibratedTimestampsEXT)]
+                       && !advertised[ToUnderlying(Extension::eCalibratedTimestampsKHR)]);
+    advertised.set(ToUnderlying(Extension::eSwapchainMaintenanceKHR),
+                   advertised[ToUnderlying(Extension::eSwapchainMaintenanceKHR)] && instance.hasSurfaceMaintenanceKHR);
+    advertised.set(ToUnderlying(Extension::eSwapchainMaintenanceEXT),
+                   advertised[ToUnderlying(Extension::eSwapchainMaintenanceEXT)] && instance.hasSurfaceMaintenanceEXT
+                       && !advertised[ToUnderlying(Extension::eSwapchainMaintenanceKHR)]);
+
+    VulkanDeviceExtensionSelection selection;
+    VulkanDeviceFeatures&          supported = selection.supported;
+
+    supported.Link(advertised);
+
+    vkGetPhysicalDeviceFeatures2(gpu, &supported.core);
+
+    const VkPhysicalDeviceVulkan12Features& v12 = supported.vulkan12;
+    DeviceExtensionFlags&                   f   = selection.flags;
+
+    f.hasDeferredHostOperation                  = advertised[ToUnderlying(Extension::eDeferredHostOperations)];
+    f.hasCalibratedTimestamps                   = advertised[ToUnderlying(Extension::eCalibratedTimestampsKHR)]
+                                               || advertised[ToUnderlying(Extension::eCalibratedTimestampsEXT)];
+    // Promoted to Vulkan 1.2. With the 1.2 struct chained, enabling the old name would also require the bit.
+    f.hasSamplerMirrorClampToEdge = v12.samplerMirrorClampToEdge == VK_TRUE;
+    f.hasMemoryBudget             = advertised[ToUnderlying(Extension::eMemoryBudget)];
+    f.hasBufferMarker             = advertised[ToUnderlying(Extension::eBufferMarker)];
+    f.hasDescriptorIndexing       = MissingDescriptorIndexingFeature(v12) == nullptr;
+    f.hasHostQueryReset           = v12.hostQueryReset == VK_TRUE;
+    f.hasBufferDeviceAddress      = v12.bufferDeviceAddress == VK_TRUE;
+    f.hasBufferInt64Atomics       = v12.shaderBufferInt64Atomics == VK_TRUE && supported.core.features.shaderInt64 == VK_TRUE;
+    f.hasPipelineExecutableInfo =
+        advertised[ToUnderlying(Extension::ePipelineExecutable)] && supported.pipelineExecutable.pipelineExecutableInfo;
+    f.hasDeviceFault           = advertised[ToUnderlying(Extension::eDeviceFault)] && supported.fault.deviceFault;
+    f.hasSwapchainMaintenance1 = (advertised[ToUnderlying(Extension::eSwapchainMaintenanceKHR)]
+                                  || advertised[ToUnderlying(Extension::eSwapchainMaintenanceEXT)])
+                              && supported.swapchainMaintenance.swapchainMaintenance1;
+    f.hasAccelerationStructure = advertised[ToUnderlying(Extension::eAccelerationStructure)]
+                              && supported.accelerationStructure.accelerationStructure && !desc.RayTracingDisabled()
+                              && f.hasBufferDeviceAddress && f.hasDeferredHostOperation;
+    f.hasRaytracingPipeline    = advertised[ToUnderlying(Extension::eRayTracingPipeline)]
+                              && supported.rayTracingPipeline.rayTracingPipeline && f.hasAccelerationStructure;
+    f.hasTraceRaysIndirect     = f.hasRaytracingPipeline && supported.rayTracingPipeline.rayTracingPipelineTraceRaysIndirect;
+    f.hasInvocationReorderEXT =
+        advertised[ToUnderlying(Extension::eInvocationReorderEXT)] && supported.invocationReorderEXT.rayTracingInvocationReorder
+        && f.hasRaytracingPipeline
+        && ReordersInvocations(gpu,
+                               VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT{
+                                   VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_EXT},
+                               VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT);
+    f.hasInvocationReorderNV =
+        advertised[ToUnderlying(Extension::eInvocationReorderNV)] && supported.invocationReorderNV.rayTracingInvocationReorder
+        && f.hasRaytracingPipeline && !f.hasInvocationReorderEXT
+        && ReordersInvocations(gpu,
+                               VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV{
+                                   VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV},
+                               VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV);
+    f.hasRayQuery = advertised[ToUnderlying(Extension::eRayQuery)] && supported.rayQuery.rayQuery && f.hasAccelerationStructure;
+    f.hasOpacityMicromap = micromap && supported.micromap.micromap && supported.addressCommands.deviceAddressCommands
+                        && supported.synchronization2.synchronization2 && supported.extendedDynamicState.extendedDynamicState
+                        && f.hasRayQuery;
+
+    // Name-only extensions enable when advertised; the others only with their capability.
+    VulkanDeviceExtensionSet& enabled = selection.enabled;
+
+    enabled                           = advertised;
+    enabled.set(ToUnderlying(Extension::eDynamicRendering),
+                advertised[ToUnderlying(Extension::eDynamicRendering)] && supported.dynamicRendering.dynamicRendering);
+    enabled.set(ToUnderlying(Extension::eAccelerationStructure), f.hasAccelerationStructure);
+    enabled.set(ToUnderlying(Extension::eRayTracingPipeline), f.hasRaytracingPipeline);
+    enabled.set(ToUnderlying(Extension::eInvocationReorderEXT), f.hasInvocationReorderEXT);
+    enabled.set(ToUnderlying(Extension::eInvocationReorderNV), f.hasInvocationReorderNV);
+    enabled.set(ToUnderlying(Extension::eRayQuery), f.hasRayQuery);
+    enabled.set(ToUnderlying(Extension::eOpacityMicromap), f.hasOpacityMicromap);
+    enabled.set(ToUnderlying(Extension::eDeviceFault), f.hasDeviceFault);
+    enabled.set(ToUnderlying(Extension::ePipelineExecutable), f.hasPipelineExecutableInfo);
+    enabled.set(ToUnderlying(Extension::eSwapchainMaintenanceKHR),
+                advertised[ToUnderlying(Extension::eSwapchainMaintenanceKHR)] && f.hasSwapchainMaintenance1);
+    enabled.set(ToUnderlying(Extension::eSwapchainMaintenanceEXT),
+                advertised[ToUnderlying(Extension::eSwapchainMaintenanceEXT)] && f.hasSwapchainMaintenance1);
+
+    for (uint32_t i = 0; i < ToUnderlying(Extension::eMax); ++i)
+    {
+        if (enabled[i])
+        {
+            selection.names.push_back(NameID(kDeviceExtensionNames[i]));
+        }
+    }
+
+    // Only the features ZenRHI uses are enabled. Link sets every pNext again before use.
+    VulkanDeviceFeatures& on                                  = selection.enabledFeatures;
+
+    on.vulkan12.shaderSampledImageArrayNonUniformIndexing     = f.hasDescriptorIndexing;
+    on.vulkan12.runtimeDescriptorArray                        = f.hasDescriptorIndexing;
+    on.vulkan12.descriptorBindingPartiallyBound               = f.hasDescriptorIndexing;
+    on.vulkan12.descriptorBindingUpdateUnusedWhilePending     = f.hasDescriptorIndexing;
+    on.vulkan12.descriptorBindingSampledImageUpdateAfterBind  = f.hasDescriptorIndexing;
+    on.vulkan12.hostQueryReset                                = v12.hostQueryReset;
+    on.vulkan12.samplerMirrorClampToEdge                      = v12.samplerMirrorClampToEdge;
+    on.vulkan12.timelineSemaphore                             = v12.timelineSemaphore;
+    on.vulkan12.bufferDeviceAddress                           = v12.bufferDeviceAddress;
+    on.vulkan12.shaderBufferInt64Atomics                      = f.hasBufferInt64Atomics;
+    on.dynamicRendering                                       = supported.dynamicRendering;
+    on.accelerationStructure.accelerationStructure            = VK_TRUE;
+    on.rayTracingPipeline.rayTracingPipeline                  = VK_TRUE;
+    on.rayTracingPipeline.rayTracingPipelineTraceRaysIndirect = f.hasTraceRaysIndirect;
+    on.invocationReorderEXT                                   = supported.invocationReorderEXT;
+    on.invocationReorderNV                                    = supported.invocationReorderNV;
+    on.rayQuery                                               = supported.rayQuery;
+    on.fault                                                  = supported.fault;
+    on.fault.deviceFaultVendorBinary                          = VK_FALSE;
+    on.pipelineExecutable                                     = supported.pipelineExecutable;
+    on.micromap                                               = supported.micromap;
+    on.addressCommands                                        = supported.addressCommands;
+    on.synchronization2                                       = supported.synchronization2;
+    on.extendedDynamicState                                   = supported.extendedDynamicState;
+    on.swapchainMaintenance                                   = supported.swapchainMaintenance;
+
+    return selection;
 }
 
 } // namespace zen

@@ -1,6 +1,6 @@
 # ZenRHI
 
-ZenRHI supplies command recording, a threaded or inline executor and a Vulkan backend. The public CMake targets are ZenRHI::Core, ZenRHI::Vulkan and ZenRHI::ZenRHI. The combined target provides `CreateRHI`. Vulkan-only applications can link `ZenRHI::Vulkan`, call `CreateVulkanRHI`, and borrow the native instance and device with `GetVulkanDeviceHandles()`. The device must outlive every use of its borrowed handles.
+ZenRHI supplies command recording, a threaded or inline executor and a Vulkan backend. The public CMake targets are ZenRHI::Core, ZenRHI::Vulkan and ZenRHI::ZenRHI. `ZenRHI::Vulkan` provides `CreateRHI`, `CreateRHIChecked` and `EnumerateRHIAdapters`; `ZenRHI::ZenRHI` is an interface target that links it. Applications borrow the native instance and device with `GetVulkanDeviceHandles()`. The device must outlive every use of its borrowed handles.
 
 Configure a standalone build with CMake 3.24 or newer, a C++20 compiler and a Vulkan SDK with SPIRV-Tools. Point CMAKE_PREFIX_PATH at an installed ZenFoundation, or set ZEN_FOUNDATION_SOURCE_DIR to a source checkout. Build and run CTest from the configured directory. The native Vulkan suite uses validation and a compatible driver.
 

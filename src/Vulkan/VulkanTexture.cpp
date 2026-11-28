@@ -1,6 +1,7 @@
 #include "ZenRHI/RHIDiagnostics.h"
 #include "Vulkan/VulkanResourceSharing.h"
 #include "Vulkan/VulkanTexture.h"
+#include "Core/RHIValidation.h"
 #include "Vulkan/VulkanCommon.h"
 #include "Vulkan/VulkanDevice.h"
 #include "Vulkan/VulkanMemory.h"
@@ -11,24 +12,6 @@
 
 namespace zen
 {
-bool IsTextureShapeValid(const RHITextureCreateInfo& info)
-{
-    const bool extents = info.width > 0 && info.height > 0 && info.depth > 0 && info.arrayLayers > 0 && info.mipmaps > 0;
-    bool       shape   = false;
-    switch (info.type)
-    {
-        case RHITextureType::e1D: shape = info.height == 1 && info.depth == 1; break;
-        case RHITextureType::e2D: shape = info.depth == 1; break;
-        case RHITextureType::e3D: shape = info.arrayLayers == 1; break;
-        case RHITextureType::eCube: shape = info.width == info.height && info.depth == 1 && info.arrayLayers % 6 == 0; break;
-        default: break;
-    }
-    const bool samples = info.samples < SampleCount::eMax
-                      && (info.samples == SampleCount::e1 || (info.type == RHITextureType::e2D && info.mipmaps == 1));
-    return extents && shape && samples
-        && info.mipmaps <= RHITexture::CalculateTextureMipLevels(info.width, info.height, info.depth);
-}
-
 VkImageCreateInfo BuildImageCreateInfo(const RHITextureCreateInfo& info)
 {
     VkImageCreateInfo imageCI;
@@ -91,7 +74,7 @@ bool ImageUsageAllowsViews(VkImageUsageFlags usage)
     return (usage & viewUsage) != 0;
 }
 
-bool IsTextureViewFormatSupported(const RHITextureCreateInfo& image, DataFormat format)
+bool IsTextureViewFormatSupported(VulkanRHI& rhi, const RHITextureCreateInfo& image, DataFormat format)
 {
     // Compressed images require a compatible block class, not just equal bytes.
     // Depth/stencil formats are only compatible with themselves.
@@ -103,8 +86,7 @@ bool IsTextureViewFormatSupported(const RHITextureCreateInfo& image, DataFormat 
     if (supported && format != image.format)
     {
         VkFormatProperties properties{};
-        vkGetPhysicalDeviceFormatProperties(GVulkanRHI->GetDevice()->GetPhysicalDeviceHandle(), ToVkFormat(format),
-                                            &properties);
+        vkGetPhysicalDeviceFormatProperties(rhi.GetDevice()->GetPhysicalDeviceHandle(), ToVkFormat(format), &properties);
 
         VkFormatFeatureFlags required = 0;
         if (image.usageFlags.HasFlag(RHITextureUsageFlagBits::eSampled))
@@ -126,37 +108,20 @@ bool IsTextureViewFormatSupported(const RHITextureCreateInfo& image, DataFormat 
     return supported;
 }
 
-bool IsClampAddressMode(RHISamplerRepeatMode mode)
+const char* ValidateTextureDescription(VulkanRHI& rhi, const RHITextureCreateInfo& info)
 {
-    return mode == RHISamplerRepeatMode::eClampToEdge || mode == RHISamplerRepeatMode::eClampToBorder;
-}
-
-const char* ValidateTextureDescription(const RHITextureCreateInfo& info)
-{
-    const char* error = nullptr;
-    if (info.format == DataFormat::eUndefined || GetTextureFormatBlockInfo(info.format).bytes == 0 || info.usageFlags.IsEmpty())
-    {
-        error = "format and usage must be specified";
-    }
-    else if (!IsTextureShapeValid(info))
-    {
-        error = "invalid extent, type, sample count or mip count";
-    }
-    else if (info.type == RHITextureType::eCube && info.arrayLayers > 6 && !GVulkanRHI->QueryGPUInfo().supportImageCubeArray)
-    {
-        error = "cube arrays are unsupported";
-    }
-    else if (GetTextureFormatBlockInfo(info.format).width > 1
-             && GVulkanRHI->GetDevice()->GetPhysicalDeviceFeatures().textureCompressionBC != VK_TRUE)
+    const char* error = ValidateTextureCreateInfo(info, rhi.QueryGPUInfo());
+    if (error == nullptr && GetTextureFormatBlockInfo(info.format).width > 1
+        && rhi.GetDevice()->GetPhysicalDeviceFeatures().textureCompressionBC != VK_TRUE)
     {
         error = "BC texture compression is unsupported";
     }
-    else
+    if (error == nullptr)
     {
         const VkImageCreateInfo native = BuildImageCreateInfo(info);
         VkImageFormatProperties properties{};
         const VkResult          result =
-            vkGetPhysicalDeviceImageFormatProperties(GVulkanRHI->GetDevice()->GetPhysicalDeviceHandle(), native.format,
+            vkGetPhysicalDeviceImageFormatProperties(rhi.GetDevice()->GetPhysicalDeviceHandle(), native.format,
                                                      native.imageType, native.tiling, native.usage, native.flags, &properties);
         if (result != VK_SUCCESS)
         {
@@ -173,61 +138,37 @@ const char* ValidateTextureDescription(const RHITextureCreateInfo& info)
 }
 } // namespace
 
-RHISampler* VulkanResourceFactory::CreateSampler(const RHISamplerCreateInfo& createInfo)
-{
-    RHISampler* pSampler = GVulkanRHI->AreSubmissionsBlocked() ? nullptr : VulkanSampler::CreateObject(createInfo);
-
-    return pSampler;
-}
-
 RHISampler* VulkanRHI::CreateSampler(const RHISamplerCreateInfo& createInfo)
 {
     RHIWorkerTimer timer(RHIWorkerTime::eResource);
-    return GVulkanRHI->GetResourceFactory()->CreateSampler(createInfo);
+    return AreSubmissionsBlocked() ? nullptr : VulkanSampler::CreateObject(this, createInfo).GetValueOr(nullptr);
 }
 
-void VulkanRHI::DestroySampler(RHISampler* pSampler)
+RHIResult<VulkanSampler*> VulkanSampler::CreateObject(VulkanRHI* pRHI, const RHISamplerCreateInfo& createInfo)
 {
-    pSampler->ReleaseReference();
-}
+    const char* rule = ValidateSamplerCreateInfo(createInfo, pRHI->QueryGPUInfo());
 
-VulkanSampler* VulkanSampler::CreateObject(const RHISamplerCreateInfo& createInfo)
-{
-    VulkanSampler* pSampler = nullptr;
-    const bool     mirror   = createInfo.repeatU == RHISamplerRepeatMode::eMirrorClampToEdge
-                           || createInfo.repeatV == RHISamplerRepeatMode::eMirrorClampToEdge
-                           || createInfo.repeatW == RHISamplerRepeatMode::eMirrorClampToEdge;
-    const bool     unnormalized =
-        !createInfo.unnormalizedUVW
-        || (createInfo.minFilter == createInfo.magFilter && createInfo.mipFilter == RHISamplerFilter::eNearest
-            && createInfo.minLod == 0 && createInfo.maxLod == 0 && !createInfo.useAnisotropy && !createInfo.enableCompare
-            && IsClampAddressMode(createInfo.repeatU) && IsClampAddressMode(createInfo.repeatV)
-            && IsClampAddressMode(createInfo.repeatW));
-    if ((!mirror || GVulkanRHI->QueryGPUInfo().supportSamplerMirrorClampToEdge) && unnormalized
-        && createInfo.maxLod >= createInfo.minLod
-        && std::abs(createInfo.lodBias) <= GVulkanRHI->GetDevice()->GetPhysicalDeviceProperties().limits.maxSamplerLodBias)
+    if (rule == nullptr
+        && std::abs(createInfo.lodBias) > pRHI->GetDevice()->GetPhysicalDeviceProperties().limits.maxSamplerLodBias)
     {
-        pSampler = VersatileResource::AllocMem<VulkanSampler>(GVulkanRHI->GetResourceAllocator());
-        new (pSampler) VulkanSampler(createInfo);
-
-        pSampler->Init();
-
-        if (pSampler->m_vkSampler == VK_NULL_HANDLE)
-        {
-            pSampler->ReleaseReference();
-
-            pSampler = nullptr;
-        }
+        rule = "LOD bias exceeds the device limit";
     }
-    else
+
+    if (rule != nullptr)
     {
-        ZEN_RHI_LOG_ERROR("Invalid sampler description: address mode, unnormalized coordinates or LOD limits");
+        ZEN_RHI_LOG_ERROR("Sampler description: {}", rule);
     }
-    return pSampler;
+
+    VulkanSampler* sampler = rule == nullptr ? NewVulkanResource<VulkanSampler>(pRHI, pRHI, createInfo) : nullptr;
+
+    return sampler != nullptr ? KeepIfInitialized(sampler, sampler->Init())
+                              : RejectDescription<VulkanSampler>(rule, __FILE__, __LINE__);
 }
 
-void VulkanSampler::Init()
+RHIError VulkanSampler::Init()
 {
+    RHIError error{};
+
     VkSamplerCreateInfo samplerCI;
 
     InitVkStruct(samplerCI, VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
@@ -248,10 +189,10 @@ void VulkanSampler::Init()
     samplerCI.mipLodBias   = m_baseInfo.lodBias;
 
     samplerCI.anisotropyEnable =
-        m_baseInfo.useAnisotropy && (GVulkanRHI->GetDevice()->GetPhysicalDeviceFeatures().samplerAnisotropy == VK_TRUE);
+        m_baseInfo.useAnisotropy && (m_pRHI->GetDevice()->GetPhysicalDeviceFeatures().samplerAnisotropy == VK_TRUE);
 
     samplerCI.maxAnisotropy = ClampSamplerAnisotropy(
-        m_baseInfo.maxAnisotropy, GVulkanRHI->GetDevice()->GetPhysicalDeviceProperties().limits.maxSamplerAnisotropy);
+        m_baseInfo.maxAnisotropy, m_pRHI->GetDevice()->GetPhysicalDeviceProperties().limits.maxSamplerAnisotropy);
 
     samplerCI.compareEnable           = m_baseInfo.enableCompare;
 
@@ -265,38 +206,33 @@ void VulkanSampler::Init()
 
     samplerCI.unnormalizedCoordinates = m_baseInfo.unnormalizedUVW;
 
-    const VkResult result             = vkCreateSampler(GVulkanRHI->GetVkDevice(), &samplerCI, nullptr, &m_vkSampler);
+    const VkResult result             = vkCreateSampler(m_pRHI->GetVkDevice(), &samplerCI, nullptr, &m_vkSampler);
 
     if (result != VK_SUCCESS)
     {
         m_vkSampler = VK_NULL_HANDLE;
 
-        ReportVulkanCreationFailure(result, "vkCreateSampler", __FILE__, __LINE__);
+        error       = m_pRHI->ReportCreationFailure(result, "vkCreateSampler", __FILE__, __LINE__);
 
         ZEN_RHI_LOG_ERROR("vkCreateSampler failed: {}", GetResultString(result));
     }
+
+    return error;
 }
 
 void VulkanSampler::Destroy()
 {
-    vkDestroySampler(GVulkanRHI->GetVkDevice(), m_vkSampler, nullptr);
+    vkDestroySampler(m_pRHI->GetVkDevice(), m_vkSampler, nullptr);
 
     this->~VulkanSampler();
 
-    VersatileResource::Free(GVulkanRHI->GetResourceAllocator(), this);
-}
-
-RHITexture* VulkanResourceFactory::CreateTexture(const RHITextureCreateInfo& createInfo)
-{
-    RHITexture* pTexture = GVulkanRHI->AreSubmissionsBlocked() ? nullptr : VulkanTexture::CreateObject(createInfo);
-
-    return pTexture;
+    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
 }
 
 RHITexture* VulkanRHI::CreateTexture(const RHITextureCreateInfo& createInfo)
 {
     RHIWorkerTimer timer(RHIWorkerTime::eResource);
-    return GVulkanRHI->GetResourceFactory()->CreateTexture(createInfo);
+    return AreSubmissionsBlocked() ? nullptr : VulkanTexture::CreateObject(this, createInfo).GetValueOr(nullptr);
 }
 
 RHITextureView* VulkanRHI::CreateTextureView(RHITexture* pBaseTexture, const RHITextureViewCreateInfo& createInfo)
@@ -308,7 +244,7 @@ RHITextureView* VulkanRHI::CreateTextureView(RHITexture* pBaseTexture, const RHI
     {
         ZEN_RHI_LOG_ERROR("Cannot create a view of a null texture");
     }
-    else
+    else if (!AreSubmissionsBlocked())
     {
         view = pBaseTexture->CreateView(createInfo);
     }
@@ -316,51 +252,29 @@ RHITextureView* VulkanRHI::CreateTextureView(RHITexture* pBaseTexture, const RHI
     return view;
 }
 
-void VulkanRHI::DestroyTexture(RHITexture* pTexture)
+RHIResult<VulkanTexture*> VulkanTexture::CreateObject(VulkanRHI* pRHI, const RHITextureCreateInfo& createInfo)
 {
-    pTexture->ReleaseReference();
-}
+    const char* rule = ValidateTextureDescription(*pRHI, createInfo);
 
-VulkanTexture* VulkanTexture::CreateObject(const RHITextureCreateInfo& createInfo)
-{
-    VulkanTexture* pTexture = nullptr;
-    const char*    error    = ValidateTextureDescription(createInfo);
-    if (error == nullptr)
+    if (rule != nullptr)
     {
-        pTexture = VersatileResource::AllocMem<VulkanTexture>(GVulkanRHI->GetResourceAllocator());
-
-        new (pTexture) VulkanTexture(createInfo);
-
-        pTexture->Init();
-
-        const bool needsAttachmentView = createInfo.type != RHITextureType::e3D
-                                      && (createInfo.usageFlags.HasFlag(RHITextureUsageFlagBits::eColorAttachment)
-                                          || createInfo.usageFlags.HasFlag(RHITextureUsageFlagBits::eDepthStencilAttachment));
-
-        if (pTexture->GetVkImage() == VK_NULL_HANDLE
-            || (ImageUsageAllowsViews(pTexture->GetVkImageUsage()) && pTexture->GetDefaultView() == nullptr)
-            || (needsAttachmentView && pTexture->GetAttachmentView() == nullptr))
-        {
-            pTexture->ReleaseReference();
-
-            pTexture = nullptr;
-        }
+        ZEN_RHI_LOG_ERROR("Texture '{}': {}", createInfo.tag.c_str(), rule);
     }
-    else
-    {
-        GVulkanRHI->SetCreationError(MakeRHIError(RHIErrorCode::eInvalidArgument, error, __FILE__, __LINE__));
 
-        ZEN_RHI_LOG_ERROR("Texture '{}': {}", createInfo.tag.c_str(), error);
-    }
-    return pTexture;
+    VulkanTexture* texture = rule == nullptr ? NewVulkanResource<VulkanTexture>(pRHI, pRHI, createInfo) : nullptr;
+
+    return texture != nullptr ? KeepIfInitialized(texture, texture->Init())
+                              : RejectDescription<VulkanTexture>(rule, __FILE__, __LINE__);
 }
 
 RHITextureView* VulkanTexture::CreateView(const RHITextureViewCreateInfo& createInfo)
 {
-    return GetRHIThread().Invoke(&VulkanTexture::CreateViewOnRHIThread, this, std::cref(createInfo));
+    return m_pRHI->GetRuntime()
+        .thread.Invoke(&VulkanTexture::CreateViewOnRHIThread, this, std::cref(createInfo))
+        .GetValueOr(nullptr);
 }
 
-RHITextureView* VulkanTexture::CreateViewOnRHIThread(const RHITextureViewCreateInfo& createInfo)
+RHIResult<VulkanTextureView*> VulkanTexture::CreateViewOnRHIThread(const RHITextureViewCreateInfo& createInfo)
 {
     const char* error = nullptr;
 
@@ -368,57 +282,29 @@ RHITextureView* VulkanTexture::CreateViewOnRHIThread(const RHITextureViewCreateI
     {
         error = "Texture usage does not permit image views";
     }
-    else if (!IsTextureViewFormatSupported(m_baseInfo, createInfo.format))
+    else if (!IsTextureViewFormatSupported(*m_pRHI, m_baseInfo, createInfo.format))
     {
         error = "Texture view format is incompatible or unsupported for the image usage";
     }
-    else if (createInfo.mipLevels == 0 || createInfo.baseMipLevel >= m_baseInfo.mipmaps
-             || createInfo.mipLevels > m_baseInfo.mipmaps - createInfo.baseMipLevel || createInfo.arrayLayers == 0
-             || createInfo.baseArrayLayer >= m_baseInfo.arrayLayers
-             || createInfo.arrayLayers > m_baseInfo.arrayLayers - createInfo.baseArrayLayer)
+    else
     {
-        error = "Texture view mip or array-layer range is outside its image";
+        error = ValidateTextureViewCreateInfo(m_baseInfo, createInfo, m_pRHI->QueryGPUInfo());
     }
-    else if (createInfo.type != m_baseInfo.type
-             && !(m_baseInfo.type == RHITextureType::eCube && createInfo.type == RHITextureType::e2D))
-    {
-        error = "Texture view type is incompatible with its image";
-    }
-    else if (createInfo.type == RHITextureType::eCube && createInfo.arrayLayers % 6 != 0)
-    {
-        error = "Cube views require a multiple of six array layers";
-    }
-    else if (createInfo.type == RHITextureType::e3D && createInfo.arrayView)
-    {
-        error = "3D texture views cannot be array views";
-    }
-    else if (createInfo.type == RHITextureType::eCube && (createInfo.arrayView || createInfo.arrayLayers > 6)
-             && !GVulkanRHI->QueryGPUInfo().supportImageCubeArray)
-    {
-        error = "Cube-array views require imageCubeArray";
-    }
-    else if ((int64_t(createInfo.aspect) & ~int64_t(GetTextureFormatAspects(createInfo.format))) != 0)
-    {
-        error = "Texture view aspects are incompatible with its format";
-    }
-
-    VulkanTextureView* pView = nullptr;
 
     if (error != nullptr)
     {
         ZEN_RHI_LOG_ERROR("{}", error);
     }
-    else
-    {
-        pView = VulkanTextureView::CreateObject(this, createInfo);
 
-        if (pView != nullptr)
-        {
-            RegisterOwnedView(pView);
-        }
+    RHIResult<VulkanTextureView*> view = error == nullptr ? VulkanTextureView::CreateObject(this, createInfo)
+                                                          : RejectDescription<VulkanTextureView>(error, __FILE__, __LINE__);
+
+    if (view)
+    {
+        RegisterOwnedView(view.GetValue());
     }
 
-    return pView;
+    return view;
 }
 
 RHITextureView* VulkanTexture::GetAttachmentView()
@@ -461,48 +347,29 @@ VkImageView VulkanTexture::GetVkImageView() const
     return imageView;
 }
 
-void VulkanTexture::Init()
+RHIError VulkanTexture::Init()
 {
-    VkImageCreateInfo imageCI          = BuildImageCreateInfo(m_baseInfo);
+    VkImageCreateInfo imageCI = BuildImageCreateInfo(m_baseInfo);
 
-    const uint32_t graphicsQueueFamily = GVulkanRHI->GetDevice()->GetGfxQueue()->GetFamilyIndex();
+    const bool transfer       = (imageCI.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) != 0;
 
-    const uint32_t computeQueueFamily  = GVulkanRHI->GetDevice()->GetComputeQueue()->GetFamilyIndex();
+    // Replaced by the allocation result once the queue-sharing setup runs the allocation.
+    RHIError error = MakeRHIError(RHIErrorCode::eBackendFailure, "Create texture", __FILE__, __LINE__);
 
-    const uint32_t transferQueueFamily = GVulkanRHI->GetDevice()->GetTransferQueue()->GetFamilyIndex();
+    AllocateWithQueueSharing(imageCI, m_pRHI->GetDevice()->GetQueueSharing(transfer), [this, &imageCI, &error] {
+        error = m_pRHI->GetMemoryAllocator()->AllocImage(&imageCI, m_baseInfo.cpuReadable, &m_vkImage, &m_memAlloc);
+    });
 
-    bool allocated                     = false;
-
-    AllocateWithQueueSharing(imageCI, graphicsQueueFamily, computeQueueFamily, transferQueueFamily,
-                             (imageCI.usage & (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) != 0,
-                             [this, &imageCI, &allocated] {
-                                 allocated =
-                                     GVkMemAllocator->AllocImage(&imageCI, m_baseInfo.cpuReadable, &m_vkImage, &m_memAlloc);
-                             });
-
-    if (allocated)
+    if (!error.IsFailure())
     {
         m_vkImageCI = imageCI;
 
         if (!m_baseInfo.tag.empty())
         {
-            GVulkanRHI->GetDevice()->SetObjectName(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(m_vkImage), m_baseInfo.tag);
+            m_pRHI->GetDevice()->SetObjectName(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(m_vkImage), m_baseInfo.tag);
         }
 
-        m_vkAspectFlags = VK_IMAGE_ASPECT_COLOR_BIT;
-
-        if (FormatIsDepthStencil(m_baseInfo.format))
-        {
-            m_vkAspectFlags = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-        }
-        else if (FormatIsDepthOnly(m_baseInfo.format))
-        {
-            m_vkAspectFlags = VK_IMAGE_ASPECT_DEPTH_BIT;
-        }
-        else if (FormatIsStencilOnly(m_baseInfo.format))
-        {
-            m_vkAspectFlags = VK_IMAGE_ASPECT_STENCIL_BIT;
-        }
+        m_vkAspectFlags = ToVkAspectFlags(GetTextureFormatAspects(m_baseInfo.format));
 
         if (ImageUsageAllowsViews(imageCI.usage))
         {
@@ -520,13 +387,29 @@ void VulkanTexture::Init()
 
             viewCI.tag          = m_baseInfo.tag;
 
-            m_pDefaultView      = CreateView(viewCI);
+            const RHIResult<VulkanTextureView*> view =
+                m_pRHI->GetRuntime().thread.Invoke(&VulkanTexture::CreateViewOnRHIThread, this, std::cref(viewCI));
+
+            m_pDefaultView = view.GetValueOr(nullptr);
+
+            error          = view.GetError();
+        }
+
+        const bool needsAttachmentView = m_baseInfo.type != RHITextureType::e3D
+                                      && (m_baseInfo.usageFlags.HasFlag(RHITextureUsageFlagBits::eColorAttachment)
+                                          || m_baseInfo.usageFlags.HasFlag(RHITextureUsageFlagBits::eDepthStencilAttachment));
+
+        if (!error.IsFailure() && needsAttachmentView && GetAttachmentView() == nullptr)
+        {
+            error = MakeRHIError(RHIErrorCode::eBackendFailure, "Create texture attachment view", __FILE__, __LINE__);
         }
     }
     else
     {
         ZEN_RHI_LOG_ERROR("Texture '{}' allocation failed", m_baseInfo.tag.c_str());
     }
+
+    return error;
 }
 
 void VulkanTexture::Destroy()
@@ -535,37 +418,29 @@ void VulkanTexture::Destroy()
 
     if (m_vkImage != VK_NULL_HANDLE)
     {
-        GVkMemAllocator->FreeImage(m_vkImage, m_memAlloc);
+        m_pRHI->GetMemoryAllocator()->FreeImage(m_vkImage, m_memAlloc);
     }
 
     this->~VulkanTexture();
 
-    VersatileResource::Free(GVulkanRHI->GetResourceAllocator(), this);
+    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
 }
 
-VulkanTextureView* VulkanTextureView::CreateObject(VulkanTexture* pTexture, const RHITextureViewCreateInfo& createInfo)
+RHIResult<VulkanTextureView*> VulkanTextureView::CreateObject(VulkanTexture*                  pTexture,
+                                                              const RHITextureViewCreateInfo& createInfo)
 {
-    VulkanTextureView* pView = VersatileResource::AllocMem<VulkanTextureView>(GVulkanRHI->GetResourceAllocator());
+    VulkanTextureView* view = NewVulkanResource<VulkanTextureView>(pTexture->GetRHI(), pTexture, createInfo);
 
-    new (pView) VulkanTextureView(pTexture, createInfo);
-
-    pView->Init();
-
-    if (pView->m_vkImageView == VK_NULL_HANDLE)
-    {
-        pView->ReleaseReference();
-
-        pView = nullptr;
-    }
-
-    return pView;
+    return KeepIfInitialized(view, view->Init());
 }
 
-void VulkanTextureView::Init()
+RHIError VulkanTextureView::Init()
 {
+    RHIError error{};
+
     VulkanTexture* pVkTexture        = TO_VK_TEXTURE(m_pTexture);
 
-    RHITextureSubResourceRange range = m_subResourceRange;
+    RHITextureSubresourceRange range = m_subResourceRange;
 
     // Combined depth/stencil formats use the existing depth-sampling default.
     if (FormatIsDepthStencil(m_viewInfo.format) && m_viewInfo.aspect.IsEmpty())
@@ -576,7 +451,7 @@ void VulkanTextureView::Init()
     const VkImageViewCreateInfo imageViewCI =
         MakeVkImageViewCreateInfo(m_viewInfo.type, m_viewInfo.format, pVkTexture->GetVkImage(), range, m_viewInfo.arrayView);
 
-    const VkResult result = vkCreateImageView(GVulkanRHI->GetVkDevice(), &imageViewCI, nullptr, &m_vkImageView);
+    const VkResult result = vkCreateImageView(m_pRHI->GetVkDevice(), &imageViewCI, nullptr, &m_vkImageView);
 
     m_vkImageViewType     = result == VK_SUCCESS ? imageViewCI.viewType : VK_IMAGE_VIEW_TYPE_MAX_ENUM;
 
@@ -584,29 +459,31 @@ void VulkanTextureView::Init()
     {
         m_vkImageView = VK_NULL_HANDLE;
 
-        ReportVulkanCreationFailure(result, "vkCreateImageView", __FILE__, __LINE__);
+        error         = m_pRHI->ReportCreationFailure(result, "vkCreateImageView", __FILE__, __LINE__);
 
         ZEN_RHI_LOG_ERROR("Texture view '{}' creation failed: {}", m_viewInfo.tag.c_str(), GetResultString(result));
     }
     else if (!m_viewInfo.tag.empty())
     {
-        GVulkanRHI->GetDevice()->SetObjectName(VK_OBJECT_TYPE_IMAGE_VIEW, reinterpret_cast<uint64_t>(m_vkImageView),
-                                               m_viewInfo.tag);
+        m_pRHI->GetDevice()->SetObjectName(VK_OBJECT_TYPE_IMAGE_VIEW, reinterpret_cast<uint64_t>(m_vkImageView),
+                                           m_viewInfo.tag);
     }
+
+    return error;
 }
 
 void VulkanTextureView::Destroy()
 {
     if (m_vkImageView != VK_NULL_HANDLE)
     {
-        vkDestroyImageView(GVulkanRHI->GetVkDevice(), m_vkImageView, nullptr);
+        vkDestroyImageView(m_pRHI->GetVkDevice(), m_vkImageView, nullptr);
 
         m_vkImageView = nullptr;
     }
 
     this->~VulkanTextureView();
 
-    VersatileResource::Free(GVulkanRHI->GetResourceAllocator(), this);
+    VersatileResource::Free(m_pRHI->GetResourceAllocator(), this);
 }
 
 } // namespace zen

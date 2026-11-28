@@ -1,7 +1,8 @@
 #include "VulkanIntegrationFixture.h"
 #include "ZenRHI/TestSupport/ScopedVulkanCall.h"
 #include "Vulkan/VulkanDevice.h"
-#include "Vulkan/VulkanDescriptorPool.h"
+#include "Vulkan/VulkanDescriptorAllocator.h"
+#include "Vulkan/VulkanBindlessHeap.h"
 #include "Vulkan/VulkanPipeline.h"
 #include <gtest/gtest.h>
 #include <limits>
@@ -265,7 +266,7 @@ TEST(VulkanShaderLayoutIntegrationTest, FragmentColorAttachmentCountsBeforeNativ
     RHIShader* shader = session.rhi.CreateShader(shaderInfo);
     ASSERT_NE(shader, nullptr);
     const VulkanDevice*              device       = session.rhi.GetDevice();
-    const RHIBindlessHeapCapacities& capacities   = session.rhi.GetBindlessDescriptorPoolManager()->GetCapacities();
+    const RHIBindlessHeapCapacities& capacities   = session.rhi.GetBindlessHeap()->GetCapacities();
     const uint64_t                   globalImages = capacities.GetImageSlots();
     const uint32_t aggregateLimit = device->GetDescriptorIndexingProperties().maxPerStageUpdateAfterBindResources;
     ASSERT_GT(aggregateLimit, globalImages);

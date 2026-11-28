@@ -1,4 +1,5 @@
 #include <span>
+#include "ZenRHI/RHIDeviceDesc.h"
 #include "TestShaderModule.h"
 #include "ZenRHI/RHICommandListExecutor.h"
 #include "Vulkan/VulkanDevice.h"
@@ -17,7 +18,7 @@ namespace
 {
 using namespace zen;
 
-class VulkanUploadIntegrationTest : public testing::TestWithParam<std::tuple<RHIExecutionMode, bool>>
+class VulkanUploadIntegrationTest : public testing::TestWithParam<RHIExecutionMode>
 {
 protected:
     static VKAPI_ATTR VkBool32 VKAPI_CALL Validation(VkDebugUtilsMessageSeverityFlagBitsEXT,
@@ -113,20 +114,11 @@ protected:
 
     void SetUp() override
     {
-        countersWereEnabled = RHIOptions::GetInstance().ExecutionCountersEnabled();
+        RHIDeviceDesc desc = test::MakeTestDeviceDesc();
 
-        RHIOptions::GetInstance().SetExecutionCountersEnabled(true);
+        desc.SetExecutionCountersEnabled(true);
 
-        backend = static_cast<VulkanRHI*>(DynamicRHI::Create(RHIAPIType::eVulkan));
-
-        if (std::get<1>(GetParam()))
-        {
-            ASSERT_TRUE(backend->SupportsAsyncSubmissionDependencies());
-        }
-        else
-        {
-            backend->GetDevice()->GetExtensionFlags().hasTimelineSemaphore = 0;
-        }
+        backend = static_cast<VulkanRHI*>(CreateRHI(desc));
 
         VkDebugUtilsMessengerCreateInfoEXT info{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
 
@@ -138,11 +130,7 @@ protected:
 
         ASSERT_EQ(vkCreateDebugUtilsMessengerEXT(backend->GetInstance(), &info, nullptr, &messenger), VK_SUCCESS);
 
-        executor    = ZEN_NEW() RHICommandListExecutor(backend, std::get<0>(GetParam()));
-
-        GDynamicRHI = executor;
-
-        GetRHIThread().Invoke(&RHIFrameState::Init, &GRHIFrameState, 3);
+        executor    = ZEN_NEW() RHICommandListExecutor(backend, GetParam());
 
         source      = Buffer(RHIBufferAllocateType::eCPUWrite);
 
@@ -215,18 +203,12 @@ protected:
             ZEN_DELETE(backend);
         }
 
-        GDynamicRHI = nullptr;
-
-        GVulkanRHI  = nullptr;
-
         // Release the static capture buffer before the allocator's shutdown report.
         waitValues        = {};
 
         submitBatchCounts = {};
 
         batchWaitCounts   = {};
-
-        RHIOptions::GetInstance().SetExecutionCountersEnabled(countersWereEnabled);
     }
 
     RHIBuffer* Buffer(RHIBufferAllocateType allocation, bool storage = false)
@@ -251,7 +233,7 @@ protected:
     {
         RHICommandList* list = &commands;
 
-        return executor->SubmitBatch(MakeVecView(&list, 1));
+        return executor->SubmitCommandLists(MakeVecView(&list, 1));
     }
 
     uint64_t CompletedSerial(RHICommandContextType queue) const
@@ -283,8 +265,9 @@ protected:
             }
             else
             {
-                EXPECT_GE(GetRHIThread().Invoke(&VulkanUploadIntegrationTest::CompletedSerial, this, producer.queue),
-                          producer.serial);
+                EXPECT_GE(
+                    executor->GetRuntime().thread.Invoke(&VulkanUploadIntegrationTest::CompletedSerial, this, producer.queue),
+                    producer.serial);
             }
         }
 
@@ -299,7 +282,6 @@ protected:
     RHIBuffer*                             destination{nullptr};
     RHIBuffer*                             readback{nullptr};
     std::array<uint8_t, 64>                bytes{};
-    bool                                   countersWereEnabled{false};
     static inline PFN_vkQueueSubmit        originalSubmit;
     static inline PFN_vkWaitSemaphores     originalWait;
     static inline PFN_vkEndCommandBuffer   originalEnd;
@@ -347,11 +329,6 @@ TEST_P(VulkanUploadIntegrationTest, ReadbackCopyMakesOnlyWrittenRangeHostAvailab
 
 TEST_P(VulkanUploadIntegrationTest, PackedRunRejectsAtomicallyAndRetriesAfterNativeOrRecordingFailure)
 {
-    if (!std::get<1>(GetParam()))
-    {
-        GTEST_SKIP() << "Packing requires timeline submissions";
-    }
-
     const RHICommandContextType queues[] = {RHICommandContextType::eGraphics, RHICommandContextType::eGraphics};
 
     RHICommandListPtr first(RHICommandList::Create(executor->GetCommandContext(queues[0])));
@@ -468,7 +445,7 @@ TEST_P(VulkanUploadIntegrationTest, RejectedPackedRunKeepsAcceptedPrefixAndNever
 {
     const RHIQueueCapabilities capabilities = executor->GetQueueCapabilities();
 
-    if (!std::get<1>(GetParam()) || !capabilities.computeSupported
+    if (!capabilities.computeSupported
         || capabilities.AreQueuesShared(RHICommandContextType::eGraphics, RHICommandContextType::eAsyncCompute))
     {
         GTEST_SKIP() << "Requires timeline submissions and distinct graphics/compute queues";
@@ -624,32 +601,27 @@ TEST_P(VulkanUploadIntegrationTest, PackedRunsKeepDistinctSignalsAndLaterWaitsOn
         EXPECT_EQ(result.groups[i].accepted.serial, serials[i]);
     }
 
-    const bool timeline = std::get<1>(GetParam());
+    EXPECT_EQ(backend->GetExecutionCounters().submissions - beforeCalls, 3u);
 
-    EXPECT_EQ(backend->GetExecutionCounters().submissions - beforeCalls, timeline ? 3u : 5u);
-
-    ASSERT_EQ(submitBatchCounts.size(), timeline ? 3u : 5u);
+    ASSERT_EQ(submitBatchCounts.size(), 3u);
 
     ASSERT_EQ(batchWaitCounts.size(), 5u);
 
-    if (timeline)
-    {
-        EXPECT_EQ(submitBatchCounts[0], 2u);
+    EXPECT_EQ(submitBatchCounts[0], 2u);
 
-        EXPECT_EQ(submitBatchCounts[1], 1u);
+    EXPECT_EQ(submitBatchCounts[1], 1u);
 
-        EXPECT_EQ(submitBatchCounts[2], 2u);
+    EXPECT_EQ(submitBatchCounts[2], 2u);
 
-        ASSERT_EQ(waitValues.size(), 2u);
+    ASSERT_EQ(waitValues.size(), 2u);
 
-        EXPECT_EQ(waitValues[0], result.groups[0].accepted.serial);
+    EXPECT_EQ(waitValues[0], result.groups[0].accepted.serial);
 
-        EXPECT_EQ(waitValues[1], result.groups[2].accepted.serial);
-    }
+    EXPECT_EQ(waitValues[1], result.groups[2].accepted.serial);
 
     for (uint32_t i = 0; i < 5; ++i)
     {
-        EXPECT_EQ(batchWaitCounts[i], timeline && (i == 2 || i == 4) ? 1u : 0u);
+        EXPECT_EQ(batchWaitCounts[i], (i == 2 || i == 4) ? 1u : 0u);
     }
 
     ASSERT_TRUE(executor->WaitForCompletion(RHICommandContextType::eGraphics, serials[4]));
@@ -714,18 +686,13 @@ TEST_P(VulkanUploadIntegrationTest, EmptyGroupRelaysItsSameQueueProducerToAnothe
 
     EXPECT_EQ(result.groups[1].accepted.serial, before + 2);
 
-    const bool timeline = std::get<1>(GetParam());
-
-    EXPECT_EQ(submitBatchCounts.size(), timeline ? 2u : 3u);
+    EXPECT_EQ(submitBatchCounts.size(), 2u);
 
     EXPECT_EQ(emptyBatchCount, 1u);
 
-    if (timeline)
-    {
-        ASSERT_EQ(waitValues.size(), 1u);
+    ASSERT_EQ(waitValues.size(), 1u);
 
-        EXPECT_EQ(waitValues[0], result.groups[1].accepted.serial);
-    }
+    EXPECT_EQ(waitValues[0], result.groups[1].accepted.serial);
 
     ASSERT_TRUE(executor->WaitForCompletion(queues[2], result.groups[2].accepted.serial));
 
@@ -742,7 +709,7 @@ TEST_P(VulkanUploadIntegrationTest, TransferContextsCanBeDestroyedAndRecreated)
 {
     for (uint32_t iteration = 0; iteration < 2; ++iteration)
     {
-        RHICommandListPtr upload(RHICommandList::Create(executor->GetTransferCommandContext()));
+        RHICommandListPtr upload(RHICommandList::Create(executor->GetCommandContext(RHICommandContextType::eTransfer)));
 
         upload->CopyBuffer(source, destination, {0, 0, bytes.size()});
 
@@ -755,7 +722,7 @@ TEST_P(VulkanUploadIntegrationTest, TransferContextsCanBeDestroyedAndRecreated)
 
 TEST_P(VulkanUploadIntegrationTest, TransferFeedsGraphicsThroughSubmissionDependency)
 {
-    RHICommandListPtr upload(RHICommandList::Create(executor->GetTransferCommandContext()));
+    RHICommandListPtr upload(RHICommandList::Create(executor->GetCommandContext(RHICommandContextType::eTransfer)));
 
     upload->CopyBuffer(source, destination, {0, 0, bytes.size()});
 
@@ -787,7 +754,8 @@ TEST_P(VulkanUploadIntegrationTest, TransferFeedsGraphicsThroughSubmissionDepend
 
     ASSERT_EQ(result.submission, RHISubmissionResult::eSuccess);
 
-    const bool async = std::get<1>(GetParam()) && !executor->IsTransferQueueSharedWithGraphics();
+    const bool async =
+        !executor->GetQueueCapabilities().AreQueuesShared(RHICommandContextType::eTransfer, RHICommandContextType::eGraphics);
 
     if (async)
     {
@@ -862,18 +830,9 @@ TEST_P(VulkanUploadIntegrationTest, ExactComputeProducerSurvivesInterveningCompu
 
     ASSERT_EQ(result.submission, RHISubmissionResult::eSuccess);
 
-    const bool timeline = std::get<1>(GetParam());
+    const ProducerWait producerWait{queue, accepted.serial};
 
-    if (timeline)
-    {
-        const ProducerWait producer{queue, accepted.serial};
-
-        ExpectExactWaitsOrCompletedProducers(MakeVecView(producer));
-    }
-    else
-    {
-        EXPECT_EQ(gpuWaitCount, 0u);
-    }
+    ExpectExactWaitsOrCompletedProducers(MakeVecView(producerWait));
 
     ASSERT_TRUE(executor->WaitForCompletion(RHICommandContextType::eGraphics,
                                             result.requiredSerials.Get(RHICommandContextType::eGraphics)));
@@ -905,7 +864,7 @@ TEST_P(VulkanUploadIntegrationTest, OwnedScheduleDispatchesBetweenProducerAndGra
     shaderInfo.stageFlags.SetFlag(RHIShaderStageFlagBits::eCompute);
 
     zen::test::LoadShaderModule(shaderInfo, RHIShaderStage::eCompute,
-                                std::filesystem::path(RDG_REFLECTION_TEST_PATH) / "async_resources.comp.spv");
+                                std::filesystem::path(ZENRHI_TEST_SHADER_DIR) / "async_resources.comp.spv");
 
     RHIResourcePtr<RHIShader> shader(executor->CreateShader(shaderInfo), false);
 
@@ -952,7 +911,7 @@ TEST_P(VulkanUploadIntegrationTest, OwnedScheduleDispatchesBetweenProducerAndGra
 
         lists[1]->CopyBuffer(source, data.Get(), {0, 0, bytes.size()});
 
-        const RHITextureSubResourceRange range = texture->GetSubResourceRange();
+        const RHITextureSubresourceRange range = texture->GetSubResourceRange();
 
         RHITextureTransition clear{};
 
@@ -1010,7 +969,7 @@ TEST_P(VulkanUploadIntegrationTest, OwnedScheduleDispatchesBetweenProducerAndGra
                                  RHIFlags<RHIPipelineStageFlagBits>(RHIPipelineStageFlagBits::eComputeShader), {}, buffers,
                                  MakeVecView(storage));
 
-        lists[2]->BindPipeline(RHIPipelineType::eCompute, pipeline.Get());
+        lists[2]->BindPipeline(pipeline.Get());
 
         RHIBatchedShaderParameters parameters;
 
@@ -1047,19 +1006,16 @@ TEST_P(VulkanUploadIntegrationTest, OwnedScheduleDispatchesBetweenProducerAndGra
 
         ASSERT_EQ(result.groups.size(), 4u);
 
-        if (std::get<1>(GetParam()))
+        HeapVector<ProducerWait> producers;
+
+        if (!alias)
         {
-            HeapVector<ProducerWait> producers;
-
-            if (!alias)
-            {
-                producers.push_back({producerQueue, result.groups[1].accepted.serial});
-            }
-
-            producers.push_back({RHICommandContextType::eAsyncCompute, result.groups[2].accepted.serial});
-
-            ExpectExactWaitsOrCompletedProducers(MakeVecView(producers));
+            producers.push_back({producerQueue, result.groups[1].accepted.serial});
         }
+
+        producers.push_back({RHICommandContextType::eAsyncCompute, result.groups[2].accepted.serial});
+
+        ExpectExactWaitsOrCompletedProducers(MakeVecView(producers));
 
         ASSERT_TRUE(executor->WaitForCompletion(RHICommandContextType::eGraphics, result.groups[3].accepted.serial));
 
@@ -1140,6 +1096,5 @@ TEST_P(VulkanUploadIntegrationTest, CompletedCrossQueueDependencyWaitCount)
 
 INSTANTIATE_TEST_SUITE_P(ExecutionModes,
                          VulkanUploadIntegrationTest,
-                         testing::Combine(testing::Values(RHIExecutionMode::eInline, RHIExecutionMode::eThreaded),
-                                          testing::Bool()));
+                         testing::Values(RHIExecutionMode::eInline, RHIExecutionMode::eThreaded));
 } // namespace
